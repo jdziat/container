@@ -1,0 +1,3 @@
+abstract = "Optional Docker Engine API compatibility bridge (plugin path; not in-core). See README."
+author = "container parity"
+version = 0.1

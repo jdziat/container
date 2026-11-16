@@ -80,7 +80,8 @@ extension RuntimeClient {
     public func bootstrap(
         stdio: [FileHandle?],
         networkBootstrapInfos: [NetworkBootstrapInfo],
-        dynamicEnv: [String: String] = [:]
+        dynamicEnv: [String: String] = [:],
+        peerHosts: [PeerHostEntry] = []
     ) async throws {
         let request = XPCMessage(route: RuntimeRoutes.bootstrap.rawValue)
 
@@ -106,6 +107,11 @@ extension RuntimeClient {
 
             let infosData = try JSONEncoder().encode(networkBootstrapInfos)
             request.set(key: RuntimeKeys.networkBootstrapInfos.rawValue, value: infosData)
+
+            if !peerHosts.isEmpty {
+                let peersData = try JSONEncoder().encode(peerHosts)
+                request.set(key: RuntimeKeys.peerHosts.rawValue, value: peersData)
+            }
             try await self.client.send(request)
         } catch {
             throw ContainerizationError(
@@ -403,5 +409,12 @@ extension XPCMessage {
             throw ContainerizationError(.invalidArgument, message: "missing networkBootstrapInfos in bootstrap message")
         }
         return try JSONDecoder().decode([NetworkBootstrapInfo].self, from: data)
+    }
+
+    public func peerHosts() throws -> [PeerHostEntry] {
+        guard let data = self.dataNoCopy(key: RuntimeKeys.peerHosts.rawValue) else {
+            return []
+        }
+        return try JSONDecoder().decode([PeerHostEntry].self, from: data)
     }
 }

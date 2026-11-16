@@ -15,8 +15,28 @@
 //===----------------------------------------------------------------------===//
 
 import ArgumentParser
+import ContainerResource
 import ContainerizationError
 import Foundation
+
+/// CLI value for `--restart`, including optional `on-failure:<max>` retries.
+public struct RestartFlag: ExpressibleByArgument, Sendable, Equatable {
+    public let policy: RestartPolicy
+    public let maximumRetryCount: UInt64?
+
+    public init(policy: RestartPolicy, maximumRetryCount: UInt64? = nil) {
+        self.policy = policy
+        self.maximumRetryCount = maximumRetryCount
+    }
+
+    public init?(argument: String) {
+        guard let parsed = try? RestartPolicy.parseDetailed(argument) else {
+            return nil
+        }
+        self.policy = parsed.policy
+        self.maximumRetryCount = parsed.maximumRetryCount
+    }
+}
 
 public struct Flags {
     public struct Logging: ParsableArguments {
@@ -196,7 +216,13 @@ public struct Flags {
             tmpFs: [String],
             useInit: Bool,
             virtualization: Bool,
-            volumes: [String]
+            volumes: [String],
+            restart: RestartFlag? = nil,
+            healthCmd: String? = nil,
+            healthInterval: UInt64? = nil,
+            healthTimeout: UInt64? = nil,
+            healthStartPeriod: UInt64? = nil,
+            healthRetries: UInt64? = nil
         ) {
             self.arch = arch
             self.capAdd = capAdd
@@ -229,6 +255,12 @@ public struct Flags {
             self.useInit = useInit
             self.virtualization = virtualization
             self.volumes = volumes
+            self.restart = restart
+            self.healthCmd = healthCmd
+            self.healthInterval = healthInterval
+            self.healthTimeout = healthTimeout
+            self.healthStartPeriod = healthStartPeriod
+            self.healthRetries = healthRetries
         }
 
         @Option(name: .shortAndLong, help: "Set arch if image can target multiple architectures (default: from image, else host architecture)")
@@ -382,6 +414,36 @@ public struct Flags {
         @Option(name: [.customLong("volume"), .short], help: "Bind mount a volume into the container")
         public var volumes: [String] = []
 
+        @Option(
+            name: .customLong("restart"),
+            help: .init(
+                "Restart policy when the container exits (no|on-failure[:max]|always|unless-stopped)",
+                valueName: "policy"
+            )
+        )
+        public var restart: RestartFlag?
+
+        @Option(
+            name: .customLong("health-cmd"),
+            help: .init(
+                "Command to run to check container health (shell form, or JSON argv array starting with CMD or CMD-SHELL)",
+                valueName: "command"
+            )
+        )
+        public var healthCmd: String?
+
+        @Option(name: .customLong("health-interval"), help: "Time between health checks in seconds (default: 30 when --health-cmd is set)")
+        public var healthInterval: UInt64?
+
+        @Option(name: .customLong("health-timeout"), help: "Maximum time to allow one health check to run in seconds (default: 30 when --health-cmd is set)")
+        public var healthTimeout: UInt64?
+
+        @Option(name: .customLong("health-start-period"), help: "Start period before failed health checks count toward retries (default: 0 when --health-cmd is set)")
+        public var healthStartPeriod: UInt64?
+
+        @Option(name: .customLong("health-retries"), help: "Consecutive failures needed to report unhealthy (default: 3 when --health-cmd is set; must be >= 1)")
+        public var healthRetries: UInt64?
+
         public func validate() throws {
             if dnsDisabled {
                 let hasDNSConfig =
@@ -394,6 +456,16 @@ public struct Flags {
                         "`--no-dns` cannot be used with DNS configuration flags (`--dns`, `--dns-domain`, `--dns-option`, `--dns-search`)"
                     )
                 }
+            }
+            let healthTuningSet =
+                healthInterval != nil || healthTimeout != nil || healthStartPeriod != nil || healthRetries != nil
+            if healthTuningSet, healthCmd == nil {
+                throw ValidationError(
+                    "`--health-interval`, `--health-timeout`, `--health-start-period`, and `--health-retries` require `--health-cmd`"
+                )
+            }
+            if let healthRetries, healthRetries == 0 {
+                throw ValidationError("`--health-retries` must be at least 1")
             }
         }
     }

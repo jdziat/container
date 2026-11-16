@@ -61,17 +61,30 @@ extension Application {
             let container = try await client.findContainer(id: containerId, filters: filters)
 
             // Bootstrap and process start are both idempotent and don't fail the second time
-            // around, however not doing an rpc is always faster :). The other bit is we don't
-            // support attach currently, so we can't do `start -a` a second time and have it succeed.
+            // around, however not doing an rpc is always faster :).
             if container.status == .running {
-                if !detach {
+                if detach {
+                    print(containerId)
+                    return
+                }
+                // `-i` alone would block on a log follow without binding stdin (init stdio is
+                // fixed at bootstrap). Require `-a` for the attach-to-running path.
+                guard attach else {
                     throw ContainerizationError(
                         .invalidArgument,
-                        message: "attach is currently unsupported on already running containers"
+                        message:
+                            "cannot attach stdin to an already-running init process; use `container start -a` (logs + wait) or `container exec -it` (interactive)"
                     )
                 }
-                print(containerId)
-                return
+                if interactive {
+                    log.warning(
+                        "stdin attach to an already-running init process is not supported; streaming logs and waiting for exit. Use `container exec -it` for a new interactive process."
+                    )
+                }
+                // Let `defer { progress.finish() }` run once via ExitCode unwind; do not
+                // finish the progress bar here or it may restore the cursor twice.
+                exitCode = try await ContainerAttach.attachToRunning(client: client, id: container.id, log: log)
+                throw ArgumentParser.ExitCode(exitCode)
             }
 
             for mount in container.configuration.mounts where mount.isVirtiofs {

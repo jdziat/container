@@ -35,14 +35,17 @@ trust that message when `container system status` also reports the service down.
 | `docker rm` | `container delete` (alias `rm`) |
 | `docker login` / `logout` | `container registry login` / `logout` |
 | `docker info` | `container system status` |
-| `docker compose` | no equivalent — see `references/docker-migration.md` |
+| `docker commit` | `container commit <id> <image>` |
+| `docker compose` | no equivalent in core — see `references/docker-migration.md` |
 
 `run`, `build`, `exec`, `logs`, `cp`, `inspect`, `stats`, `start`, `stop`, `kill`, `export`,
-`prune`, `volume *`, and `network *` match Docker, as do the common `run` flags: `-d`, `--rm`,
-`-i`, `-t`, `-e`, `-p`, `-v`, `-w`, `--name`, `--network`, `--entrypoint`.
+`commit`, `prune`, `volume *`, and `network *` match Docker, as do the common `run` flags: `-d`,
+`--rm`, `-i`, `-t`, `-e`, `-p`, `-v`, `-w`, `--name`, `--network`, `--entrypoint`.
 
-`restart`, `commit`, `attach`, `top`, `rename`, `pause`, `port`, and `--restart` have no
-equivalent. Check `references/docker-migration.md` before assuming anything else exists.
+`restart`, `wait`, `port`, and `attach` are available. `--restart` (including `on-failure:N`)
+and `--health-cmd` are create/run flags; probes update inspect `healthStatus`.
+`top`, `rename`, and `pause` still have no equivalent. The full status of every command is in
+`docs/parity-matrix.md`.
 
 ## Gotchas
 
@@ -52,7 +55,7 @@ equivalent. Check `references/docker-migration.md` before assuming anything else
   binds a host port; it is not needed for basic reachability. Get IPs from `container inspect`.
 - **Builds run in a builder container.** If a build fails oddly, check `container builder
   status`; `container builder start` takes `--cpus` and `--memory`.
-- **Name resolution takes three steps, and works only on the `default` network:**
+- **Name resolution on `default` takes three steps:**
 
   ```bash
   # 1. create ~/.config/container/config.toml containing:
@@ -62,14 +65,13 @@ equivalent. Check `references/docker-migration.md` before assuming anything else
   sudo container system dns create test             # 3. point macOS at container's resolver
   ```
 
-  Then use `db.test` — a bare `db` never resolves. That file does not exist until you create
-  it, and it is TOML, so edit the `[dns]` table in place rather than appending a second one;
-  verify with `container system property ls`. There is no `container system dns default`
-  subcommand.
+  Then use `db.test`. That file does not exist until you create it, and it is TOML, so edit
+  the `[dns]` table in place rather than appending a second one; verify with
+  `container system property ls`. There is no `container system dns default` subcommand.
 
-  Containers on a network from `container network create` cannot resolve each other by name at
-  all ([apple/container#1809](https://github.com/apple/container/issues/1809)) — reach them by
-  IP. Custom networks are for isolation, not service discovery.
+  On a **custom** network, bare peer names (hostname + `alias=`) are written into each guest's
+  `/etc/hosts` and refreshed when containers join or leave the network
+  ([apple/container#1809](https://github.com/apple/container/issues/1809) interim).
 
 ## Container machines
 

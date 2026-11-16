@@ -1221,4 +1221,46 @@ public struct Parser {
     public static func parseBool(string: String) -> Bool? {
         Parsers.parseBool(string: string)
     }
+
+    /// Parse a Docker-style health command into a `ContainerHealthcheck`.
+    ///
+    /// Accepts a JSON argv array (`["CMD","curl","-f","http://localhost/"]`) or a shell form string
+    /// which is stored as `["CMD-SHELL", <command>]`.
+    public static func healthcheck(
+        command: String,
+        intervalSeconds: UInt64,
+        timeoutSeconds: UInt64,
+        startPeriodSeconds: UInt64,
+        retries: UInt64
+    ) throws -> ContainerHealthcheck {
+        let trimmed = command.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else {
+            throw ContainerizationError(.invalidArgument, message: "--health-cmd must not be empty")
+        }
+        let test: [String]
+        // Docker-compatible HEALTHCHECK encoding:
+        // - JSON array starting with CMD / CMD-SHELL → use as-is
+        // - other JSON string arrays → wrap as CMD (exec form), matching Docker's
+        //   `["curl","-f","URL"]` shorthand
+        // - anything else (including `[ -f /tmp/healthy ]`) → CMD-SHELL
+        if trimmed.hasPrefix("["), trimmed.hasSuffix("]"),
+            let data = trimmed.data(using: .utf8),
+            let decoded = try? JSONDecoder().decode([String].self, from: data), !decoded.isEmpty
+        {
+            if decoded[0] == "CMD" || decoded[0] == "CMD-SHELL" {
+                test = decoded
+            } else {
+                test = ["CMD"] + decoded
+            }
+        } else {
+            test = ["CMD-SHELL", trimmed]
+        }
+        return ContainerHealthcheck(
+            test: test,
+            intervalSeconds: intervalSeconds,
+            timeoutSeconds: timeoutSeconds,
+            startPeriodSeconds: startPeriodSeconds,
+            retries: retries
+        )
+    }
 }

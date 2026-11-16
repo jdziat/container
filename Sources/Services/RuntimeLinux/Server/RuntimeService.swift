@@ -153,9 +153,27 @@ public actor RuntimeService {
             }
 
             let dynamicEnv = try message.dynamicEnv()
-
             let bundle = ContainerResource.Bundle(path: self.root)
+            // Create the log file before payload decode that can throw, so bootstrap
+            // failures still leave a bundle log for diagnosis.
             try bundle.createLogFile()
+            // Prefer the networkBootstrapInfos invalidArgument over a peerHosts decode
+            // error when both are wrong; peerHosts is optional adornment.
+            let networkBootstrapInfos = try message.networkBootstrapInfos()
+            // peerHosts is optional adornment; a bad payload must not fail bootstrap.
+            let peerHosts: [PeerHostEntry]
+            if message.dataNoCopy(key: RuntimeKeys.peerHosts.rawValue) != nil {
+                do {
+                    peerHosts = try message.peerHosts()
+                } catch {
+                    self.log.warning(
+                        "ignoring undecodable peerHosts payload during bootstrap",
+                        metadata: ["error": "\(error)"])
+                    peerHosts = []
+                }
+            } else {
+                peerHosts = []
+            }
 
             var config = try bundle.configuration
 
@@ -179,7 +197,6 @@ public actor RuntimeService {
                 logger: self.log
             )
 
-            let networkBootstrapInfos = try message.networkBootstrapInfos()
 
             var sessions: [XPCClientSession] = []
             var attachments: [Attachment] = []
@@ -276,8 +293,8 @@ public actor RuntimeService {
                 czConfig.process.stdout = stdout
                 czConfig.process.stderr = stderr
                 czConfig.process.stdin = stdin
-                // NOTE: We can support a user providing new entries eventually, but for now craft
-                // a default /etc/hosts.
+                // Craft a default /etc/hosts, then inject peers already running on shared
+                // networks so Compose-ordered stacks can resolve bare service names (#1809).
                 var hostsEntries = [Hosts.Entry.localHostIPV4()]
                 if !interfaces.isEmpty {
                     let primaryIfaceAddr = interfaces[0].ipv4Address
@@ -285,6 +302,24 @@ public actor RuntimeService {
                         Hosts.Entry(
                             ipAddress: primaryIfaceAddr.address.description,
                             hostnames: [czConfig.hostname ?? id],
+                        ))
+                }
+                // Skip peer hostnames already claimed by localhost/self so a peer
+                // cannot shadow this container's own name. Sort peers so duplicate
+                // hostnames resolve deterministically (lower IP / hostname wins).
+                var claimedHostnames = Set(
+                    hostsEntries.flatMap(\.hostnames).map { $0.lowercased() })
+                let orderedPeers = peerHosts.sorted { lhs, rhs in
+                    if lhs.ipAddress != rhs.ipAddress { return lhs.ipAddress < rhs.ipAddress }
+                    return lhs.hostnames.joined(separator: "\t") < rhs.hostnames.joined(separator: "\t")
+                }
+                for peer in orderedPeers where !peer.hostnames.isEmpty {
+                    let unique = peer.hostnames.filter { claimedHostnames.insert($0.lowercased()).inserted }
+                    guard !unique.isEmpty else { continue }
+                    hostsEntries.append(
+                        Hosts.Entry(
+                            ipAddress: peer.ipAddress,
+                            hostnames: unique
                         ))
                 }
                 czConfig.hosts = Hosts(entries: hostsEntries)

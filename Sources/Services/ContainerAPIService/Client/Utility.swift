@@ -264,6 +264,24 @@ public struct Utility {
         config.readonlyPaths = try Parser.readonlyPaths(management.readonlyPaths)
         config.stopSignal = imageConfig?.stopSignal
 
+        if let restart = management.restart {
+            config.restartPolicy = restart.policy
+            // Max retries are only meaningful for on-failure; clear for other policies.
+            config.restartMaxRetries = restart.policy == .onFailure ? restart.maximumRetryCount : nil
+        }
+
+        if let healthCmd = management.healthCmd {
+            config.healthcheck = try Parser.healthcheck(
+                command: healthCmd,
+                intervalSeconds: management.healthInterval ?? 30,
+                timeoutSeconds: management.healthTimeout ?? 30,
+                startPeriodSeconds: management.healthStartPeriod ?? 0,
+                retries: management.healthRetries ?? 3
+            )
+            // Probe loop updates this to healthy/unhealthy after the container starts.
+            config.healthStatus = .starting
+        }
+
         config.runtimeHandler = management.runtime ?? "\(runtimePrefix)\(requestedPlatform.os)"
 
         return (config, kernel, management.initImage)

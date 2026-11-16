@@ -99,11 +99,12 @@ extension Application {
             fflush(stdout)
             if follow {
                 setbuf(stdout, nil)
-                try await Self.followFile(fh: fh)
+                try await Self.followLogHandle(fh: fh)
             }
         }
 
-        private static func followFile(fh: FileHandle) async throws {
+        /// Follow a container log file handle, printing new lines until the stream ends.
+        static func followLogHandle(fh: FileHandle) async throws {
             _ = try fh.seekToEnd()
             let stream = AsyncStream<String> { cont in
                 fh.readabilityHandler = { handle in

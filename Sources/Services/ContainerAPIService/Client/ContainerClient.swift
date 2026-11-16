@@ -159,6 +159,15 @@ public struct ContainerClient: Sendable {
         }
     }
 
+    /// Get a handle to the init process of an existing container.
+    ///
+    /// The container's init process is identified by the container ID. This does not
+    /// contact the API server; use the returned process to `wait` for the container to exit
+    /// or to `kill` it.
+    public func initProcess(id: String) -> ClientProcess {
+        ClientProcessImpl(containerId: id, xpcClient: xpcClient)
+    }
+
     /// Send a signal to the container.
     public func kill(id: String, signal: String) async throws {
         do {

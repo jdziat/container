@@ -1,0 +1,6 @@
+# Nitpick policy for this repository's local and CI reviews.
+review:
+  fail_on: warning
+
+validation:
+  enabled: true
