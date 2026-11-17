@@ -1854,13 +1854,18 @@ public actor ContainersService {
             let install = rootUtility(
                 "/usr/bin/install", ["-o", "root", "-g", "root", "-m", "644", staged, "/etc/hosts"])
             let processID = "hosts-\(UUID().uuidString.lowercased())"
-            try await client.createProcess(processID, config: install, stdio: [nil, nil, nil])
             let removeStagedFile: () async -> Void = {
                 let cleanup = rootUtility("/bin/rm", ["-f", staged])
                 let cleanupID = "hosts-rm-\(UUID().uuidString.lowercased())"
                 try? await client.createProcess(cleanupID, config: cleanup, stdio: [nil, nil, nil])
                 try? await client.startProcess(cleanupID)
                 _ = try? await client.wait(cleanupID)
+            }
+            do {
+                try await client.createProcess(processID, config: install, stdio: [nil, nil, nil])
+            } catch {
+                await removeStagedFile()
+                throw error
             }
             // Re-check immediately before mutating /etc/hosts so a newer refresh wins.
             guard self.hostsRefreshGenerations[id] == generation,

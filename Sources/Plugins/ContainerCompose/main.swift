@@ -42,10 +42,14 @@ extension ContainerCompose {
 
         @OptionGroup var shared: SharedOptions
 
+        @Flag(name: .customLong("detach"), help: "Detached mode (always on; accepted for CLI compatibility)")
+        var detach = true
+
         func run() async throws {
             let plan = try ComposePlanner.plan(fileURL: URL(fileURLWithPath: shared.file), project: shared.project)
             try plan.reportUnsupported()
-            // Curated plugin always runs detached; attached/foreground stacks are out of scope.
+            // Curated plugin always runs detached; --detach is accepted for compatibility.
+            _ = detach
             try await plan.up(detach: true)
         }
     }

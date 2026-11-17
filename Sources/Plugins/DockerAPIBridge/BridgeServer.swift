@@ -338,12 +338,14 @@ struct DockerAPIBridgeServer: Sendable {
         id: String, force: Bool, outbound: NIOAsyncChannelOutboundWriter<HTTPServerResponsePart>
     ) async throws {
         let client = ContainerClient()
-        do {
-            try await client.delete(id: id, force: force)
-        } catch let error as ContainerizationError where error.code == .invalidState && !force {
+        // Pre-check so a running container without force always maps to 409, regardless of
+        // which ContainerizationError code delete would throw.
+        let snap = try await client.get(id: id)
+        if snap.status == .running, !force {
             throw BridgeHTTPError(
                 status: .conflict, message: "cannot remove a running container \(id); use force=1")
         }
+        try await client.delete(id: id, force: force)
         try await writeEmpty(status: .noContent, outbound: outbound)
     }
 
