@@ -75,7 +75,7 @@ extension Application {
             let container = try await client.findContainer(id: containerId, filters: filters)
             let filter = try privatePort.map { try PortFilter(parsing: $0) }
 
-            let lines = Self.formatPorts(container.configuration.publishedPorts, filter: filter)
+            let lines = try Self.formatPorts(container.configuration.publishedPorts, filter: filter)
             if let privatePort, lines.isEmpty {
                 throw ContainerizationError(
                     .notFound,
@@ -89,7 +89,7 @@ extension Application {
 
         /// Renders each published port as `<host address>:<host port>:<container port>/<proto>`,
         /// expanding port ranges into one line per port.
-        static func formatPorts(_ ports: [PublishPort], filter: PortFilter? = nil) -> [String] {
+        static func formatPorts(_ ports: [PublishPort], filter: PortFilter? = nil) throws -> [String] {
             var lines: [String] = []
             for published in ports {
                 if let proto = filter?.proto, proto != published.proto {
@@ -101,7 +101,11 @@ extension Application {
                     let containerWide = containerBase + UInt32(offset)
                     let hostWide = hostBase + UInt32(offset)
                     guard containerWide <= UInt32(UInt16.max), hostWide <= UInt32(UInt16.max) else {
-                        continue
+                        throw ContainerizationError(
+                            .invalidArgument,
+                            message:
+                                "published port range for \(published.hostAddress) exceeds 65535"
+                        )
                     }
                     let containerPort = UInt16(containerWide)
                     if let filter, filter.port != containerPort {

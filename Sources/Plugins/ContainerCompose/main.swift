@@ -239,7 +239,7 @@ struct ComposePlanner {
             }
             for key in body.keys {
                 let allowed: Set<String> = [
-                    "image", "command", "environment", "ports", "volumes",
+                    "image", "command", "entrypoint", "environment", "ports", "volumes",
                     "depends_on", "restart", "healthcheck", "build",
                 ]
                 if !allowed.contains(key) {

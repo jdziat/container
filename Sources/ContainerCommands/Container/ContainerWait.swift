@@ -52,7 +52,7 @@ extension Application {
             for container in found {
                 do {
                     // Never-started containers have no init process to wait on.
-                    if container.status == .stopped, container.startedDate == nil {
+                    if container.startedDate == nil {
                         throw ContainerizationError(
                             .invalidState,
                             message: "container \(container.id) was never started"
