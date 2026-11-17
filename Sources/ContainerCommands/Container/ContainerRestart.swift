@@ -53,24 +53,34 @@ extension Application {
         public mutating func run() async throws {
             let client = ContainerClient()
             var errors: [any Error] = []
-            let containers: [String]
+            let containers: [ContainerSnapshot]
             if self.all {
                 let filters = ContainerListFilters().withoutPlugins([ResourcePluginValues.machine, ResourcePluginValues.cluster])
-                containers = try await client.list(filters: filters).map(\.id)
+                containers = try await client.list(filters: filters).filter { $0.status == .running }
             } else {
                 let filters = ContainerListFilters().withoutPlugins([ResourcePluginValues.cluster])
                 let (found, notFoundErrors) = try await client.findContainers(named: containerIds, filters: filters)
-                containers = found.map(\.id)
+                containers = found
                 errors += notFoundErrors
             }
 
             let stopOptions = ContainerStopOptions(timeoutInSeconds: self.time, signal: nil)
-            for id in containers {
+            for container in containers {
+                let id = container.id
                 do {
-                    try await client.stop(id: id, opts: stopOptions)
-                    let container = try await client.get(id: id)
+                    // Validate start inputs before stopping so a failed restart does not
+                    // leave a previously-running container permanently stopped.
+                    let current = try await client.get(id: id)
+                    for mount in current.configuration.mounts where mount.isVirtiofs {
+                        if !FileManager.default.fileExists(atPath: mount.source) {
+                            throw ContainerizationError(
+                                .invalidState,
+                                message: "mount source path '\(mount.source)' does not exist"
+                            )
+                        }
+                    }
                     let io = try ProcessIO.create(
-                        tty: container.configuration.initProcess.terminal,
+                        tty: current.configuration.initProcess.terminal,
                         interactive: false,
                         detach: true
                     )
@@ -78,6 +88,9 @@ extension Application {
                     var env: [String: String] = [:]
                     if let sshAuthSock = ProcessInfo.processInfo.environment["SSH_AUTH_SOCK"] {
                         env["SSH_AUTH_SOCK"] = sshAuthSock
+                    }
+                    if current.status == .running {
+                        try await client.stop(id: id, opts: stopOptions)
                     }
                     let process = try await client.bootstrap(id: id, stdio: io.stdio, dynamicEnv: env)
                     try await process.start()

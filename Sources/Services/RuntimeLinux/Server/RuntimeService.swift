@@ -314,7 +314,11 @@ public actor RuntimeService {
                     return lhs.hostnames.joined(separator: "\t") < rhs.hostnames.joined(separator: "\t")
                 }
                 for peer in orderedPeers where !peer.hostnames.isEmpty {
-                    let unique = peer.hostnames.filter { claimedHostnames.insert($0.lowercased()).inserted }
+                    let unique = peer.hostnames.compactMap { name -> String? in
+                        let lower = name.lowercased()
+                        guard claimedHostnames.insert(lower).inserted else { return nil }
+                        return lower
+                    }
                     guard !unique.isEmpty else { continue }
                     hostsEntries.append(
                         Hosts.Entry(

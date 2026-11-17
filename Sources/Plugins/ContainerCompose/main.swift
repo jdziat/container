@@ -138,7 +138,17 @@ struct ComposePlanner {
         }
 
         func up(detach: Bool) async throws {
-            _ = try runContainer(["network", "create", network])
+            // Idempotent network create: reuse an existing project network.
+            let networkExists: Bool
+            do {
+                _ = try runContainer(["network", "inspect", network])
+                networkExists = true
+            } catch {
+                networkExists = false
+            }
+            if !networkExists {
+                _ = try runContainer(["network", "create", network])
+            }
             for service in services {
                 // Dependencies are started earlier by topo order; wait for healthy when requested.
                 for dep in service.dependsOn where dep.condition == .serviceHealthy {
@@ -184,11 +194,28 @@ struct ComposePlanner {
         }
 
         func down() async throws {
+            var failures: [String] = []
             for service in services.reversed() {
-                _ = try? runContainer(["stop", service.name])
-                _ = try? runContainer(["delete", "-f", service.name])
+                do {
+                    _ = try runContainer(["stop", service.name])
+                } catch {
+                    // Already stopped is fine; other failures are collected.
+                    failures.append("stop \(service.name): \(error)")
+                }
+                do {
+                    _ = try runContainer(["delete", "-f", service.name])
+                } catch {
+                    failures.append("delete \(service.name): \(error)")
+                }
             }
-            _ = try? runContainer(["network", "delete", network])
+            do {
+                _ = try runContainer(["network", "delete", network])
+            } catch {
+                failures.append("network delete \(network): \(error)")
+            }
+            if !failures.isEmpty {
+                throw ComposeError.commandFailed(failures.joined(separator: "; "))
+            }
         }
     }
 
@@ -219,8 +246,8 @@ struct ComposePlanner {
             }
             for key in body.keys {
                 let allowed: Set<String> = [
-                    "image", "command", "entrypoint", "environment", "ports", "volumes",
-                    "depends_on", "restart", "container_name", "healthcheck", "build",
+                    "image", "command", "environment", "ports", "volumes",
+                    "depends_on", "restart", "healthcheck", "build",
                 ]
                 if !allowed.contains(key) {
                     unsupported.append((name, key, "not implemented in curated compose plugin"))
@@ -271,16 +298,43 @@ struct ComposePlanner {
                 ))
         }
 
-        // Topological-ish order: dependencies first; stable by name otherwise.
-        services.sort { lhs, rhs in
-            let rhsNeedsLhs = rhs.dependsOn.contains { $0.service == lhs.name }
-            let lhsNeedsRhs = lhs.dependsOn.contains { $0.service == rhs.name }
-            if rhsNeedsLhs { return true }
-            if lhsNeedsRhs { return false }
-            return lhs.name < rhs.name
-        }
+        services = try topoSortServices(services)
 
         return Plan(project: projectName, network: network, services: services, unsupported: unsupported)
+    }
+
+    /// Kahn topological sort: dependencies before dependents. Cycles fail closed.
+    private static func topoSortServices(_ services: [Service]) throws -> [Service] {
+        var byName = Dictionary(uniqueKeysWithValues: services.map { ($0.name, $0) })
+        var indegree: [String: Int] = Dictionary(uniqueKeysWithValues: services.map { ($0.name, 0) })
+        var adjacency: [String: [String]] = Dictionary(uniqueKeysWithValues: services.map { ($0.name, []) })
+        for service in services {
+            for dep in service.dependsOn {
+                guard byName[dep.service] != nil else {
+                    throw ComposeError.invalid("service \(service.name): depends_on unknown service \"\(dep.service)\"")
+                }
+                adjacency[dep.service, default: []].append(service.name)
+                indegree[service.name, default: 0] += 1
+            }
+        }
+        var queue = indegree.filter { $0.value == 0 }.map(\.key).sorted()
+        var ordered: [Service] = []
+        while !queue.isEmpty {
+            let name = queue.removeFirst()
+            guard let service = byName.removeValue(forKey: name) else { continue }
+            ordered.append(service)
+            for next in adjacency[name, default: []].sorted() {
+                indegree[next, default: 0] -= 1
+                if indegree[next] == 0 {
+                    queue.append(next)
+                    queue.sort()
+                }
+            }
+        }
+        guard ordered.count == services.count else {
+            throw ComposeError.invalid("services have a depends_on cycle")
+        }
+        return ordered
     }
 
     private static func parseDependsOn(_ raw: Any?, service: String) throws -> [Dependency] {
@@ -320,9 +374,20 @@ struct ComposePlanner {
             return nil
         }
         let test: String
-        if let argv = body["test"] as? [String], !argv.isEmpty {
+        if let argvAny = body["test"] as? [Any], !argvAny.isEmpty {
+            // Pass Docker exec/shell JSON form through to `--health-cmd` (Parser accepts it).
+            let argv = argvAny.map { "\($0)" }
             let data = try JSONSerialization.data(withJSONObject: argv)
-            test = String(data: data, encoding: .utf8) ?? argv.joined(separator: " ")
+            guard let encoded = String(data: data, encoding: .utf8) else {
+                throw ComposeError.invalid("service \(service): healthcheck.test could not be encoded")
+            }
+            test = encoded
+        } else if let argv = body["test"] as? [String], !argv.isEmpty {
+            let data = try JSONSerialization.data(withJSONObject: argv)
+            guard let encoded = String(data: data, encoding: .utf8) else {
+                throw ComposeError.invalid("service \(service): healthcheck.test could not be encoded")
+            }
+            test = encoded
         } else if let shell = body["test"] as? String, !shell.isEmpty {
             test = shell
         } else {
@@ -440,9 +505,28 @@ func runContainer(_ args: [String]) throws -> String {
     process.standardOutput = out
     process.standardError = err
     try process.run()
+    // Drain pipes on background queues while waiting so a chatty child cannot fill
+    // the OS pipe buffer and deadlock before exit.
+    final class PipeBuffer: @unchecked Sendable {
+        var data = Data()
+    }
+    let stdoutBuf = PipeBuffer()
+    let stderrBuf = PipeBuffer()
+    let group = DispatchGroup()
+    group.enter()
+    DispatchQueue.global().async {
+        stdoutBuf.data = out.fileHandleForReading.readDataToEndOfFile()
+        group.leave()
+    }
+    group.enter()
+    DispatchQueue.global().async {
+        stderrBuf.data = err.fileHandleForReading.readDataToEndOfFile()
+        group.leave()
+    }
     process.waitUntilExit()
-    let stdout = String(data: out.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
-    let stderr = String(data: err.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
+    group.wait()
+    let stdout = String(data: stdoutBuf.data, encoding: .utf8) ?? ""
+    let stderr = String(data: stderrBuf.data, encoding: .utf8) ?? ""
     guard process.terminationStatus == 0 else {
         throw ComposeError.commandFailed("container \(args.joined(separator: " ")) failed: \(stderr)\(stdout)")
     }

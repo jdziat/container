@@ -163,8 +163,13 @@ struct DockerAPIBridgeServer: Sendable {
                 let id = containerID(from: p, suffix: "/wait")
                 try await handleContainerWait(id: id, outbound: outbound)
             case (.DELETE, let p) where p.hasPrefix("/containers/"):
-                let id = String(p.dropFirst("/containers/".count)).split(separator: "/").first.map(String.init) ?? ""
-                try await handleContainerDelete(id: id, outbound: outbound)
+                let rest = String(p.dropFirst("/containers/".count))
+                // Only exact `/containers/{id}` — subresources like `/json` must 501.
+                guard !rest.isEmpty, !rest.contains("/") else {
+                    try await writeUnsupported(method: method, path: path, outbound: outbound)
+                    break
+                }
+                try await handleContainerDelete(id: rest, outbound: outbound)
             case (.GET, "/images/json"):
                 try await handleImagesList(outbound: outbound)
             default:
@@ -261,7 +266,15 @@ struct DockerAPIBridgeServer: Sendable {
         let client = ContainerClient()
         _ = try await client.get(id: id)
         let handles = try await client.logs(id: id)
-        let data = (try? handles[0].readToEnd()) ?? Data()
+        guard !handles.isEmpty else {
+            throw BridgeHTTPError(status: .notFound, message: "No logs available for container: \(id)")
+        }
+        var data = Data()
+        for handle in handles {
+            if let chunk = try handle.readToEnd() {
+                data.append(chunk)
+            }
+        }
         try await writeData(data, contentType: "text/plain; charset=utf-8", outbound: outbound)
     }
 
@@ -273,7 +286,8 @@ struct DockerAPIBridgeServer: Sendable {
             return
         }
         _ = try await client.bootstrap(id: id, stdio: [nil, nil, nil])
-        try await client.initProcess(id: id).start()
+        let process = client.initProcess(id: id)
+        try await process.start()
         try await writeEmpty(status: .noContent, outbound: outbound)
     }
 

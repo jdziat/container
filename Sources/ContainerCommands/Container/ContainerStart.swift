@@ -67,14 +67,16 @@ extension Application {
                     print(containerId)
                     return
                 }
-                // `-i` alone would block on a log follow without binding stdin (init stdio is
-                // fixed at bootstrap). Require `-a` for the attach-to-running path.
+                // Already running: `-a` (optionally with `-i`) streams logs and waits.
+                // `-i` alone is a no-op success — init stdin cannot be rebound.
                 guard attach else {
-                    throw ContainerizationError(
-                        .invalidArgument,
-                        message:
-                            "cannot attach stdin to an already-running init process; use `container start -a` (logs + wait) or `container exec -it` (interactive)"
-                    )
+                    if interactive {
+                        log.warning(
+                            "stdin attach to an already-running init process is not supported; container is already running. Use `container start -a` or `container exec -it`."
+                        )
+                    }
+                    print(containerId)
+                    return
                 }
                 if interactive {
                     log.warning(

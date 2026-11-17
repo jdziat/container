@@ -26,7 +26,7 @@ extension Application {
 
         public static let configuration = CommandConfiguration(
             commandName: "wait",
-            abstract: "Block until one or more running containers stop, then print their exit codes")
+            abstract: "Block until one or more containers stop, then print their exit codes")
 
         @OptionGroup
         public var logOptions: Flags.Logging
@@ -45,20 +45,13 @@ extension Application {
 
             // Cluster nodes are managed by `container cluster`, so naming one reports it as not found.
             let filters = ContainerListFilters().withoutPlugins([ResourcePluginValues.cluster])
+            // `found` is already in the caller's id order.
             let (found, notFoundErrors) = try await client.findContainers(named: containerIds, filters: filters)
 
             var errors: [any Error] = notFoundErrors
-            // Like `docker wait`, containers are awaited in the order given and one exit code is printed per line.
             for container in found {
-                guard container.status == .running else {
-                    errors.append(
-                        ContainerizationError(
-                            .invalidState,
-                            message: "container \(container.id) is not running (status: \(container.status.rawValue))"
-                        ))
-                    continue
-                }
                 do {
+                    // Like `docker wait`, attempt wait even if the container already exited.
                     let exitCode = try await client.initProcess(id: container.id).wait()
                     print(exitCode)
                 } catch {

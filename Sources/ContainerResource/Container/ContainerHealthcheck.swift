@@ -68,11 +68,11 @@ public struct ContainerHealthcheck: Sendable, Codable, Equatable {
             }
             return (executable, Array(argv.dropFirst()))
         case "CMD-SHELL":
-            guard test.count >= 2 else {
+            // Docker stores the shell string as a single argv element after CMD-SHELL.
+            guard test.count == 2, !test[1].isEmpty else {
                 throw ContainerHealthcheckError.invalidTest(test)
             }
-            let shellCommand = test.dropFirst().joined(separator: " ")
-            return ("/bin/sh", ["-c", shellCommand])
+            return ("/bin/sh", ["-c", test[1]])
         default:
             // Bare argv without a CMD/CMD-SHELL prefix.
             return (kind, Array(test.dropFirst()))
