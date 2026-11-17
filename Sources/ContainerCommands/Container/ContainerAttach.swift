@@ -73,6 +73,7 @@ extension Application {
 
             let signals = AsyncSignalHandler.create(notify: [SIGTERM, SIGINT, SIGUSR1, SIGUSR2])
             return try await withThrowingTaskGroup(of: Int32?.self, returning: Int32.self) { group in
+                defer { group.cancelAll() }
                 _ = group.addTaskUnlessCancelled {
                     let code = try await process.wait()
                     return code
@@ -100,7 +101,6 @@ extension Application {
                 // Keep waiting until the init process reports an exit code.
                 while let result = try await group.next() {
                     if let code = result {
-                        group.cancelAll()
                         return code
                     }
                 }

@@ -152,9 +152,11 @@ public actor ContainersService {
                 try await self.bootstrap(id: candidate.id, stdio: [nil, nil, nil], dynamicEnv: [:])
                 guard self.containers[candidate.id] != nil else { continue }
                 // Leave a concurrent client start alone (status left `.stopped` only while
-                // we still own the sandbox). Abort only for an in-memory intentional stop.
+                // we still own the sandbox). Abort if a stop won (in-memory or on-disk).
                 guard self.containers[candidate.id]?.snapshot.status == .stopped else { continue }
-                if self.intentionalStops.contains(candidate.id) {
+                if self.intentionalStops.contains(candidate.id)
+                    || Self.isManuallyStopped(bundlePath: path)
+                {
                     try await self.abortBootstrappedRestart(id: candidate.id)
                     continue
                 }
@@ -798,6 +800,9 @@ public actor ContainersService {
         // crash mid-stop cannot lose unless-stopped semantics on the next boot.
         // Keep intentionalStops through handleContainerExit so a concurrent exit
         // monitor cannot schedule a crash restart during cleanup.
+        // Keep intentionalStops through handleContainerExit so a concurrent exit-monitor
+        // path cannot schedule a crash restart. Waiters intentionally resume only after
+        // exit cleanup finishes (status `.stopped`).
         self.intentionalStops.insert(id)
         defer {
             self.intentionalStops.remove(id)
@@ -1396,11 +1401,20 @@ public actor ContainersService {
         guard self.containers[id] != nil else { return }
         guard FileManager.default.fileExists(atPath: bundlePath.path) else { return }
         guard self.containers[id]?.snapshot.status == .stopped else { return }
-        if self.intentionalStops.contains(id) {
+        if self.intentionalStops.contains(id) || Self.isManuallyStopped(bundlePath: bundlePath) {
             try await self.abortBootstrappedRestart(id: id)
             return
         }
-        try await self.startProcess(id: id, processID: id, abortIfManuallyStopped: true)
+        do {
+            try await self.startProcess(id: id, processID: id, abortIfManuallyStopped: true)
+        } catch {
+            // Count failed starts too so on-failure:<max> can exhaust when bootstrap
+            // succeeds but startProcess throws in a crash loop.
+            if let attempt {
+                try? Self.setRestartFailureCount(bundlePath: bundlePath, value: attempt)
+            }
+            throw error
+        }
         // Count the attempt once startProcess returns without throwing — including when
         // a concurrent client start already moved status to `.running`.
         if let attempt {
@@ -1824,6 +1838,20 @@ public actor ContainersService {
             install.terminal = false
             let processID = "hosts-\(UUID().uuidString.lowercased())"
             try await client.createProcess(processID, config: install, stdio: [nil, nil, nil])
+            // Re-check immediately before mutating /etc/hosts so a newer refresh wins.
+            guard self.hostsRefreshGenerations[id] == generation,
+                self.containers[id]?.snapshot.status == .running
+            else {
+                var cleanup = state.snapshot.configuration.initProcess
+                cleanup.executable = "/bin/rm"
+                cleanup.arguments = ["-f", staged]
+                cleanup.terminal = false
+                let cleanupID = "hosts-cleanup-\(UUID().uuidString.lowercased())"
+                try? await client.createProcess(cleanupID, config: cleanup, stdio: [nil, nil, nil])
+                try? await client.startProcess(cleanupID)
+                _ = try? await client.wait(cleanupID)
+                return
+            }
             try await client.startProcess(processID)
             let status = try await client.wait(processID)
             guard status.exitCode == 0 else {

@@ -493,13 +493,20 @@ struct ComposePlanner {
                 throw ComposeError.invalid("service \(service): invalid healthcheck.\(field) duration \"\(raw)\"")
             }
             number = ""
+            let unitSeconds: UInt64
             switch ch {
-            case "s": total &+= value
-            case "m": total &+= value &* 60
-            case "h": total &+= value &* 3600
+            case "s": unitSeconds = 1
+            case "m": unitSeconds = 60
+            case "h": unitSeconds = 3600
             default:
                 throw ComposeError.invalid("service \(service): invalid healthcheck.\(field) duration \"\(raw)\"")
             }
+            let (scaled, scaleOverflow) = value.multipliedReportingOverflow(by: unitSeconds)
+            let (sum, addOverflow) = total.addingReportingOverflow(scaled)
+            if scaleOverflow || addOverflow {
+                throw ComposeError.invalid("service \(service): invalid healthcheck.\(field) duration \"\(raw)\"")
+            }
+            total = sum
         }
         if !number.isEmpty {
             throw ComposeError.invalid("service \(service): invalid healthcheck.\(field) duration \"\(raw)\"")

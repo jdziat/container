@@ -80,21 +80,29 @@ struct DockerAPIBridgeServer: Sendable {
     private static func bind(socketPath: String) async throws -> NIOAsyncChannel<
         NIOAsyncChannel<HTTPServerRequestPart, HTTPServerResponsePart>, Never
     > {
+        // Keep a restrictive umask through bind+chmod so a failed chmod cannot leave the
+        // socket at a wider creation mode for even a short window.
         let previousUmask = umask(0o177)
-        defer { umask(previousUmask) }
-        let server = try await ServerBootstrap(group: NIOSingletons.posixEventLoopGroup)
-            .bind(unixDomainSocketPath: socketPath, cleanupExistingSocketFile: true) { channel in
-                channel.eventLoop.makeCompletedFuture {
-                    try channel.pipeline.syncOperations.configureHTTPServerPipeline()
-                    return try NIOAsyncChannel<HTTPServerRequestPart, HTTPServerResponsePart>(
-                        wrappingChannelSynchronously: channel
-                    )
+        do {
+            let server = try await ServerBootstrap(group: NIOSingletons.posixEventLoopGroup)
+                .bind(unixDomainSocketPath: socketPath, cleanupExistingSocketFile: true) { channel in
+                    channel.eventLoop.makeCompletedFuture {
+                        try channel.pipeline.syncOperations.configureHTTPServerPipeline()
+                        return try NIOAsyncChannel<HTTPServerRequestPart, HTTPServerResponsePart>(
+                            wrappingChannelSynchronously: channel
+                        )
+                    }
                 }
+            guard chmod(socketPath, 0o600) == 0 else {
+                throw ContainerizationError(
+                    .internalError, message: "chmod \(socketPath): \(String(cString: strerror(errno)))")
             }
-        guard chmod(socketPath, 0o600) == 0 else {
-            throw ContainerizationError(.internalError, message: "chmod \(socketPath): \(String(cString: strerror(errno)))")
+            umask(previousUmask)
+            return server
+        } catch {
+            umask(previousUmask)
+            throw error
         }
-        return server
     }
 
     private func serve(
@@ -145,36 +153,45 @@ struct DockerAPIBridgeServer: Sendable {
             case (.GET, "/containers/json"):
                 try await handleContainersList(outbound: outbound)
             case (.GET, let p) where p.hasPrefix("/containers/") && p.hasSuffix("/json"):
-                let id = containerID(from: p, suffix: "/json")
-                try await handleContainerInspect(id: id, outbound: outbound)
-            case (.GET, let p) where p.hasPrefix("/containers/") && p.hasSuffix("/logs"):
-                let id = containerID(from: p, suffix: "/logs")
-                try await handleContainerLogs(id: id, outbound: outbound)
-            case (.POST, let p) where p.hasPrefix("/containers/") && p.hasSuffix("/start"):
-                let id = containerID(from: p, suffix: "/start")
-                try await handleContainerStart(id: id, outbound: outbound)
-            case (.POST, let p) where p.hasPrefix("/containers/") && p.hasSuffix("/stop"):
-                let id = containerID(from: p, suffix: "/stop")
-                try await handleContainerStop(id: id, outbound: outbound)
-            case (.POST, let p) where p.hasPrefix("/containers/") && p.hasSuffix("/kill"):
-                let id = containerID(from: p, suffix: "/kill")
-                try await handleContainerKill(id: id, outbound: outbound)
-            case (.POST, let p) where p.hasPrefix("/containers/") && p.hasSuffix("/wait"):
-                let id = containerID(from: p, suffix: "/wait")
-                try await handleContainerWait(id: id, outbound: outbound)
-            case (.DELETE, let p) where p.hasPrefix("/containers/"):
-                let rest = String(p.dropFirst("/containers/".count))
-                    .trimmingCharacters(in: CharacterSet(charactersIn: "/"))
-                // Only exact `/containers/{id}` — subresources (`/json`, `/start`, …) and
-                // empty ids must 501. Trailing slashes are stripped; encoded slashes in the
-                // id are rejected by the remaining `/` check after a single-segment take.
-                let id = rest.split(separator: "/", maxSplits: 1, omittingEmptySubsequences: false)
-                guard id.count == 1, !id[0].isEmpty, !id[0].contains("%2F"), !id[0].contains("%2f")
-                else {
+                guard let id = containerID(from: p, suffix: "/json") else {
                     try await writeUnsupported(method: method, path: path, outbound: outbound)
                     break
                 }
-                try await handleContainerDelete(id: String(id[0]), outbound: outbound)
+                try await handleContainerInspect(id: id, outbound: outbound)
+            case (.GET, let p) where p.hasPrefix("/containers/") && p.hasSuffix("/logs"):
+                guard let id = containerID(from: p, suffix: "/logs") else {
+                    try await writeUnsupported(method: method, path: path, outbound: outbound)
+                    break
+                }
+                try await handleContainerLogs(id: id, outbound: outbound)
+            case (.POST, let p) where p.hasPrefix("/containers/") && p.hasSuffix("/start"):
+                guard let id = containerID(from: p, suffix: "/start") else {
+                    try await writeUnsupported(method: method, path: path, outbound: outbound)
+                    break
+                }
+                try await handleContainerStart(id: id, outbound: outbound)
+            case (.POST, let p) where p.hasPrefix("/containers/") && p.hasSuffix("/stop"):
+                guard let id = containerID(from: p, suffix: "/stop") else {
+                    try await writeUnsupported(method: method, path: path, outbound: outbound)
+                    break
+                }
+                try await handleContainerStop(id: id, outbound: outbound)
+            case (.POST, let p) where p.hasPrefix("/containers/") && p.hasSuffix("/kill"):
+                guard let id = containerID(from: p, suffix: "/kill") else {
+                    try await writeUnsupported(method: method, path: path, outbound: outbound)
+                    break
+                }
+                try await handleContainerKill(id: id, outbound: outbound)
+            case (.POST, let p) where p.hasPrefix("/containers/") && p.hasSuffix("/wait"):
+                guard let id = containerID(from: p, suffix: "/wait") else {
+                    try await writeUnsupported(method: method, path: path, outbound: outbound)
+                    break
+                }
+                try await handleContainerWait(id: id, outbound: outbound)
+            case (.DELETE, let p) where Self.isExactContainerResourcePath(p):
+                // Exact `/containers/{id}` only — any extra path segment is a subresource (501).
+                let id = String(p.dropFirst("/containers/".count))
+                try await handleContainerDelete(id: id, outbound: outbound)
             case (.GET, "/images/json"):
                 try await handleImagesList(outbound: outbound)
             default:
@@ -375,12 +392,24 @@ struct DockerAPIBridgeServer: Sendable {
         return result
     }
 
-    private func containerID(from path: String, suffix: String) -> String {
+    /// `/containers/{id}` with a single non-empty id segment (no nested subresources).
+    private static func isExactContainerResourcePath(_ path: String) -> Bool {
+        guard path.hasPrefix("/containers/") else { return false }
+        let rest = String(path.dropFirst("/containers/".count))
+        guard !rest.isEmpty, !rest.contains("/") else { return false }
+        let lower = rest.lowercased()
+        return !lower.contains("%2f")
+    }
+
+    /// `{id}` from `/containers/{id}{suffix}` when `{id}` is a single path segment.
+    private func containerID(from path: String, suffix: String) -> String? {
         let trimmed = String(path.dropFirst("/containers/".count))
-        if trimmed.hasSuffix(suffix) {
-            return String(trimmed.dropLast(suffix.count))
-        }
-        return trimmed
+        guard trimmed.hasSuffix(suffix) else { return nil }
+        let id = String(trimmed.dropLast(suffix.count))
+        guard !id.isEmpty, !id.contains("/") else { return nil }
+        let lower = id.lowercased()
+        guard !lower.contains("%2f") else { return nil }
+        return id
     }
 
     // MARK: - HTTP helpers

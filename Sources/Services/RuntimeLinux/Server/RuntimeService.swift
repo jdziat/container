@@ -160,14 +160,9 @@ public actor RuntimeService {
             // Prefer the networkBootstrapInfos invalidArgument over a peerHosts decode
             // error when both are wrong; peerHosts is optional adornment.
             let networkBootstrapInfos = try message.networkBootstrapInfos()
-            // peerHosts is optional when absent; a present but undecodable payload is a
-            // sender regression and must fail bootstrap rather than boot with empty peers.
-            let peerHosts: [PeerHostEntry]
-            if message.dataNoCopy(key: RuntimeKeys.peerHosts.rawValue) != nil {
-                peerHosts = try message.peerHosts()
-            } else {
-                peerHosts = []
-            }
+            // peerHosts() returns [] when the key is absent and throws when present but
+            // undecodable — same RuntimeKeys.peerHosts key the sender writes.
+            let peerHosts = try message.peerHosts()
 
             var config = try bundle.configuration
 
@@ -311,7 +306,8 @@ public actor RuntimeService {
                     let unique = peer.hostnames.compactMap { name -> String? in
                         let lower = name.lowercased()
                         guard claimedHostnames.insert(lower).inserted else { return nil }
-                        return lower
+                        // Preserve registered case in /etc/hosts; match case-insensitively.
+                        return name
                     }
                     guard !unique.isEmpty else { continue }
                     hostsEntries.append(

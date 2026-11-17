@@ -158,7 +158,7 @@ container run -d --name db --network appnet \
 # during startup. Only treat stopped as fatal after we have observed running once.
 saw_running=0
 for _ in $(seq 1 60); do
-  status="$(container inspect db 2>/dev/null | python3 -c 'import json,sys; d=json.load(sys.stdin); print(d[0].get("status",{}).get("status",""))' 2>/dev/null || true)"
+  status="$(container inspect db 2>/dev/null | python3 -c 'import json,sys; d=json.load(sys.stdin); print(d[0].get("status",{}).get("state",""))' 2>/dev/null || true)"
   if [[ "${status}" == "running" ]]; then
     saw_running=1
   elif [[ "${saw_running}" -eq 1 && "${status}" == "stopped" ]]; then
