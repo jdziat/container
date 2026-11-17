@@ -434,9 +434,12 @@ struct DockerAPIBridgeServer: Sendable {
     }
 
     private static func queryBool(_ items: [URLQueryItem], name: String, default defaultValue: Bool) -> Bool {
-        guard let raw = items.first(where: { $0.name == name })?.value?.lowercased() else {
+        guard let item = items.first(where: { $0.name == name }) else {
             return defaultValue
         }
+        // Docker treats a present boolean flag with an empty value as true (`?force=`).
+        let raw = (item.value ?? "").lowercased()
+        if raw.isEmpty { return true }
         return raw == "1" || raw == "true" || raw == "yes"
     }
 

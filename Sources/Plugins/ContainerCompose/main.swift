@@ -367,8 +367,9 @@ struct ComposePlanner {
             for next in adjacency[name, default: []].sorted() {
                 indegree[next, default: 0] -= 1
                 if indegree[next] == 0 {
-                    queue.append(next)
-                    queue.sort()
+                    // Keep the ready queue sorted without a full re-sort each insert.
+                    let idx = queue.firstIndex { $0 > next } ?? queue.endIndex
+                    queue.insert(next, at: idx)
                 }
             }
         }
