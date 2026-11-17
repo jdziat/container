@@ -42,13 +42,11 @@ extension ContainerCompose {
 
         @OptionGroup var shared: SharedOptions
 
-        @Flag(name: .customLong("detach"), inversion: .prefixedNo, help: "Detached mode (default); use --no-detach for attached")
-        var detach = true
-
         func run() async throws {
             let plan = try ComposePlanner.plan(fileURL: URL(fileURLWithPath: shared.file), project: shared.project)
             try plan.reportUnsupported()
-            try await plan.up(detach: detach)
+            // Curated plugin always runs detached; attached/foreground stacks are out of scope.
+            try await plan.up(detach: true)
         }
     }
 
@@ -281,11 +279,15 @@ struct ComposePlanner {
                 for item in envList {
                     let parts = item.split(separator: "=", maxSplits: 1, omittingEmptySubsequences: false)
                         .map(String.init)
+                    guard let key = parts.first, !key.isEmpty else {
+                        throw ComposeError.invalid(
+                            "service \(name): environment list entries must have a non-empty key")
+                    }
                     if parts.count == 1 {
                         // Compose list form `FOO` (no `=`) → empty value.
-                        environment[parts[0]] = ""
+                        environment[key] = ""
                     } else {
-                        environment[parts[0]] = parts[1]
+                        environment[key] = parts[1]
                     }
                 }
             } else if body["environment"] != nil {
@@ -435,13 +437,14 @@ struct ComposePlanner {
         let test: String
         if let argvAny = body["test"] as? [Any], !argvAny.isEmpty {
             // Pass Docker exec/shell JSON form through to `--health-cmd` (Parser accepts it).
-            let argv = argvAny.map { "\($0)" }
-            let data = try JSONSerialization.data(withJSONObject: argv)
-            guard let encoded = String(data: data, encoding: .utf8) else {
-                throw ComposeError.invalid("service \(service): healthcheck.test could not be encoded")
+            var argv: [String] = []
+            for (idx, el) in argvAny.enumerated() {
+                guard let s = el as? String else {
+                    throw ComposeError.invalid(
+                        "service \(service): healthcheck.test[\(idx)] must be a string")
+                }
+                argv.append(s)
             }
-            test = encoded
-        } else if let argv = body["test"] as? [String], !argv.isEmpty {
             let data = try JSONSerialization.data(withJSONObject: argv)
             guard let encoded = String(data: data, encoding: .utf8) else {
                 throw ComposeError.invalid("service \(service): healthcheck.test could not be encoded")

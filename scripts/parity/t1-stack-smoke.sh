@@ -114,6 +114,7 @@ if [[ "${resolved:-0}" -ne 1 ]]; then
     warn "see https://github.com/apple/container/issues/1809; rerun with PARITY_STRICT_DNS=1 to make this fatal"
     # Soft failure: exit 0 so CI that treats non-zero as a failed tier stays green when
     # bare-name discovery has not landed yet (see header / PARITY_STRICT_DNS).
+    echo "T1 stack smoke: passed (name resolution: soft-fail)"
     exit 0
 fi
 

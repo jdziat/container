@@ -1838,36 +1838,37 @@ public actor ContainersService {
             install.terminal = false
             let processID = "hosts-\(UUID().uuidString.lowercased())"
             try await client.createProcess(processID, config: install, stdio: [nil, nil, nil])
-            // Re-check immediately before mutating /etc/hosts so a newer refresh wins.
-            guard self.hostsRefreshGenerations[id] == generation,
-                self.containers[id]?.snapshot.status == .running
-            else {
+            let removeStagedFile: () async -> Void = {
                 var cleanup = state.snapshot.configuration.initProcess
                 cleanup.executable = "/bin/rm"
                 cleanup.arguments = ["-f", staged]
                 cleanup.terminal = false
-                let cleanupID = "hosts-cleanup-\(UUID().uuidString.lowercased())"
+                let cleanupID = "hosts-rm-\(UUID().uuidString.lowercased())"
                 try? await client.createProcess(cleanupID, config: cleanup, stdio: [nil, nil, nil])
                 try? await client.startProcess(cleanupID)
                 _ = try? await client.wait(cleanupID)
+            }
+            // Re-check immediately before mutating /etc/hosts so a newer refresh wins.
+            guard self.hostsRefreshGenerations[id] == generation,
+                self.containers[id]?.snapshot.status == .running
+            else {
+                await removeStagedFile()
                 return
             }
-            try await client.startProcess(processID)
-            let status = try await client.wait(processID)
-            guard status.exitCode == 0 else {
-                throw ContainerizationError(
-                    .internalError,
-                    message: "install /etc/hosts failed with rc \(status.exitCode)"
-                )
+            do {
+                try await client.startProcess(processID)
+                let status = try await client.wait(processID)
+                await removeStagedFile()
+                guard status.exitCode == 0 else {
+                    throw ContainerizationError(
+                        .internalError,
+                        message: "install /etc/hosts failed with rc \(status.exitCode)"
+                    )
+                }
+            } catch {
+                await removeStagedFile()
+                throw error
             }
-            var removeStaged = state.snapshot.configuration.initProcess
-            removeStaged.executable = "/bin/rm"
-            removeStaged.arguments = ["-f", staged]
-            removeStaged.terminal = false
-            let removeID = "hosts-rm-\(UUID().uuidString.lowercased())"
-            try? await client.createProcess(removeID, config: removeStaged, stdio: [nil, nil, nil])
-            try? await client.startProcess(removeID)
-            _ = try? await client.wait(removeID)
             self.log.info("refreshed peer hosts", metadata: ["id": "\(id)"])
         } catch is CancellationError {
             return
