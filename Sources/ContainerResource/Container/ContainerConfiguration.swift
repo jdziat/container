@@ -114,37 +114,7 @@ public struct ContainerConfiguration: Sendable, Codable {
         // healthStatus is intentionally omitted from durable encode/decode.
     }
 
-    public func encode(to encoder: Encoder) throws {
-        var container = encoder.container(keyedBy: CodingKeys.self)
-        try container.encode(id, forKey: .id)
-        try container.encode(image, forKey: .image)
-        try container.encode(mounts, forKey: .mounts)
-        try container.encode(publishedPorts, forKey: .publishedPorts)
-        try container.encode(publishedSockets, forKey: .publishedSockets)
-        try container.encode(labels, forKey: .labels)
-        try container.encode(sysctls, forKey: .sysctls)
-        try container.encode(networks, forKey: .networks)
-        try container.encodeIfPresent(dns, forKey: .dns)
-        try container.encode(rosetta, forKey: .rosetta)
-        try container.encode(initProcess, forKey: .initProcess)
-        try container.encode(platform, forKey: .platform)
-        try container.encode(resources, forKey: .resources)
-        try container.encode(runtimeHandler, forKey: .runtimeHandler)
-        try container.encode(virtualization, forKey: .virtualization)
-        try container.encode(ssh, forKey: .ssh)
-        try container.encode(readOnly, forKey: .readOnly)
-        try container.encode(useInit, forKey: .useInit)
-        try container.encode(capAdd, forKey: .capAdd)
-        try container.encode(capDrop, forKey: .capDrop)
-        try container.encodeIfPresent(shmSize, forKey: .shmSize)
-        try container.encodeIfPresent(stopSignal, forKey: .stopSignal)
-        try container.encodeIfPresent(maskedPaths, forKey: .maskedPaths)
-        try container.encodeIfPresent(readonlyPaths, forKey: .readonlyPaths)
-        try container.encode(creationDate, forKey: .creationDate)
-        try container.encode(restartPolicy, forKey: .restartPolicy)
-        try container.encodeIfPresent(restartMaxRetries, forKey: .restartMaxRetries)
-        try container.encodeIfPresent(healthcheck, forKey: .healthcheck)
-    }
+    // Encoded via synthesized `encode(to:)` over CodingKeys (healthStatus omitted).
 
     /// Create a configuration from the supplied Decoder, initializing missing
     /// values where possible to reasonable defaults.

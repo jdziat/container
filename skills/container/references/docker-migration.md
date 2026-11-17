@@ -154,16 +154,30 @@ container run -d --name db --network appnet \
   postgres:16
 
 # Wait for db readiness before creating web (compose plugin can do service_healthy instead).
+# `container run -d` can return before inspect shows running; keep waiting on empty/stopped
+# during startup. Only treat stopped as fatal after we have observed running once.
+# Inspect encodes runtime status under status.state (ContainerStatus.state).
+saw_running=0
+ready=0
 for _ in $(seq 1 60); do
-  status="$(container inspect db 2>/dev/null | python3 -c 'import json,sys; d=json.load(sys.stdin); print(d[0].get("status",{}).get("status",""))' 2>/dev/null || true)"
-  if [[ "${status}" != "running" ]]; then
-    echo "db container is not running (status=${status:-missing})" >&2
+  status="$(container inspect db 2>/dev/null | python3 -c 'import json,sys; d=json.load(sys.stdin); s=d[0].get("status",{}); print(s.get("state") or s.get("status") or "")' 2>/dev/null || true)"
+  if [[ "${status}" == "running" ]]; then
+    saw_running=1
+  elif [[ "${saw_running}" -eq 1 && "${status}" == "stopped" ]]; then
+    echo "db container is not running (status=${status})" >&2
     exit 1
   fi
-  container exec db pg_isready -q && break
+  # Require two consecutive successes so a transient pg_isready blip does not pass.
+  if container exec db pg_isready -q 2>/dev/null; then
+    sleep 1
+    if container exec db pg_isready -q 2>/dev/null; then
+      ready=1
+      break
+    fi
+  fi
   sleep 1
 done
-if ! container exec db pg_isready -q; then
+if [[ "${ready}" -ne 1 ]]; then
   echo "db not ready after 60s" >&2
   exit 1
 fi

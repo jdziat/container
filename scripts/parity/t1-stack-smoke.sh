@@ -99,15 +99,12 @@ pass "${DB} has address ${db_ip}"
 "${CONTAINER_BIN}" exec "${APP}" ping -c 1 -W 2 "${db_ip}" >/dev/null || fail "${APP} cannot reach ${DB} by IP ${db_ip}"
 pass "${APP} reaches ${DB} by IP"
 
-# 4. name resolution: the T1 goal. May soft-fail until bare-name discovery lands (#1809).
-for name in "${DB}" "${DB}.test"; do
-    if "${CONTAINER_BIN}" exec "${APP}" getent hosts "${name}" >/dev/null 2>&1 ||
-        "${CONTAINER_BIN}" exec "${APP}" nslookup "${name}" >/dev/null 2>&1; then
-        pass "${APP} resolves '${name}'"
-        resolved=1
-        break
-    fi
-done
+# 4. bare-name resolution: the T1 goal (do not accept qualified names as a substitute).
+if "${CONTAINER_BIN}" exec "${APP}" getent hosts "${DB}" >/dev/null 2>&1 ||
+    "${CONTAINER_BIN}" exec "${APP}" nslookup "${DB}" >/dev/null 2>&1; then
+    pass "${APP} resolves '${DB}'"
+    resolved=1
+fi
 
 if [[ "${resolved:-0}" -ne 1 ]]; then
     if [[ "${STRICT_DNS}" == "1" ]]; then
@@ -117,4 +114,5 @@ if [[ "${resolved:-0}" -ne 1 ]]; then
     warn "see https://github.com/apple/container/issues/1809; rerun with PARITY_STRICT_DNS=1 to make this fatal"
 fi
 
+# Soft DNS failure falls through here and exits 0 (see PARITY_STRICT_DNS in the header).
 echo "T1 stack smoke: passed (name resolution: $([[ "${resolved:-0}" -eq 1 ]] && echo ok || echo soft-fail))"

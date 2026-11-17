@@ -80,21 +80,29 @@ struct DockerAPIBridgeServer: Sendable {
     private static func bind(socketPath: String) async throws -> NIOAsyncChannel<
         NIOAsyncChannel<HTTPServerRequestPart, HTTPServerResponsePart>, Never
     > {
+        // Keep a restrictive umask through bind+chmod so a failed chmod cannot leave the
+        // socket at a wider creation mode for even a short window.
         let previousUmask = umask(0o177)
-        defer { umask(previousUmask) }
-        let server = try await ServerBootstrap(group: NIOSingletons.posixEventLoopGroup)
-            .bind(unixDomainSocketPath: socketPath, cleanupExistingSocketFile: true) { channel in
-                channel.eventLoop.makeCompletedFuture {
-                    try channel.pipeline.syncOperations.configureHTTPServerPipeline()
-                    return try NIOAsyncChannel<HTTPServerRequestPart, HTTPServerResponsePart>(
-                        wrappingChannelSynchronously: channel
-                    )
+        do {
+            let server = try await ServerBootstrap(group: NIOSingletons.posixEventLoopGroup)
+                .bind(unixDomainSocketPath: socketPath, cleanupExistingSocketFile: true) { channel in
+                    channel.eventLoop.makeCompletedFuture {
+                        try channel.pipeline.syncOperations.configureHTTPServerPipeline()
+                        return try NIOAsyncChannel<HTTPServerRequestPart, HTTPServerResponsePart>(
+                            wrappingChannelSynchronously: channel
+                        )
+                    }
                 }
+            guard chmod(socketPath, 0o600) == 0 else {
+                throw ContainerizationError(
+                    .internalError, message: "chmod \(socketPath): \(String(cString: strerror(errno)))")
             }
-        guard chmod(socketPath, 0o600) == 0 else {
-            throw ContainerizationError(.internalError, message: "chmod \(socketPath): \(String(cString: strerror(errno)))")
+            umask(previousUmask)
+            return server
+        } catch {
+            umask(previousUmask)
+            throw error
         }
-        return server
     }
 
     private func serve(
@@ -131,6 +139,7 @@ struct DockerAPIBridgeServer: Sendable {
         outbound: NIOAsyncChannelOutboundWriter<HTTPServerResponsePart>
     ) async throws {
         let path = Self.stripAPIVersion(Self.path(from: request.uri))
+        let query = Self.queryItems(from: request.uri)
         let method = request.method
         log.debug("request", metadata: ["method": "\(method)", "path": "\(path)"])
 
@@ -145,26 +154,47 @@ struct DockerAPIBridgeServer: Sendable {
             case (.GET, "/containers/json"):
                 try await handleContainersList(outbound: outbound)
             case (.GET, let p) where p.hasPrefix("/containers/") && p.hasSuffix("/json"):
-                let id = containerID(from: p, suffix: "/json")
+                guard let id = containerID(from: p, suffix: "/json") else {
+                    try await writeUnsupported(method: method, path: path, outbound: outbound)
+                    break
+                }
                 try await handleContainerInspect(id: id, outbound: outbound)
             case (.GET, let p) where p.hasPrefix("/containers/") && p.hasSuffix("/logs"):
-                let id = containerID(from: p, suffix: "/logs")
+                guard let id = containerID(from: p, suffix: "/logs") else {
+                    try await writeUnsupported(method: method, path: path, outbound: outbound)
+                    break
+                }
                 try await handleContainerLogs(id: id, outbound: outbound)
             case (.POST, let p) where p.hasPrefix("/containers/") && p.hasSuffix("/start"):
-                let id = containerID(from: p, suffix: "/start")
+                guard let id = containerID(from: p, suffix: "/start") else {
+                    try await writeUnsupported(method: method, path: path, outbound: outbound)
+                    break
+                }
                 try await handleContainerStart(id: id, outbound: outbound)
             case (.POST, let p) where p.hasPrefix("/containers/") && p.hasSuffix("/stop"):
-                let id = containerID(from: p, suffix: "/stop")
+                guard let id = containerID(from: p, suffix: "/stop") else {
+                    try await writeUnsupported(method: method, path: path, outbound: outbound)
+                    break
+                }
                 try await handleContainerStop(id: id, outbound: outbound)
             case (.POST, let p) where p.hasPrefix("/containers/") && p.hasSuffix("/kill"):
-                let id = containerID(from: p, suffix: "/kill")
+                guard let id = containerID(from: p, suffix: "/kill") else {
+                    try await writeUnsupported(method: method, path: path, outbound: outbound)
+                    break
+                }
                 try await handleContainerKill(id: id, outbound: outbound)
             case (.POST, let p) where p.hasPrefix("/containers/") && p.hasSuffix("/wait"):
-                let id = containerID(from: p, suffix: "/wait")
+                guard let id = containerID(from: p, suffix: "/wait") else {
+                    try await writeUnsupported(method: method, path: path, outbound: outbound)
+                    break
+                }
                 try await handleContainerWait(id: id, outbound: outbound)
-            case (.DELETE, let p) where p.hasPrefix("/containers/"):
-                let id = String(p.dropFirst("/containers/".count)).split(separator: "/").first.map(String.init) ?? ""
-                try await handleContainerDelete(id: id, outbound: outbound)
+            case (.DELETE, let p) where Self.isExactContainerResourcePath(p):
+                // Exact `/containers/{id}` only — any extra path segment is a subresource (501).
+                let id = String(p.dropFirst("/containers/".count))
+                // Curated bridge defaults force=true (historical behavior). Pass force=0 for 409.
+                let force = Self.queryBool(query, name: "force", default: true)
+                try await handleContainerDelete(id: id, force: force, outbound: outbound)
             case (.GET, "/images/json"):
                 try await handleImagesList(outbound: outbound)
             default:
@@ -219,6 +249,8 @@ struct DockerAPIBridgeServer: Sendable {
                 "Status": snap.configuration.healthStatus.rawValue
             ]
         }()
+        // Pid is unavailable over this curated bridge. ExitCode is not persisted on the
+        // snapshot; report 0 here and use /containers/{id}/wait for the real code.
         var state: [String: Any] = [
             "Status": snap.status.rawValue,
             "Running": snap.status == .running,
@@ -261,7 +293,13 @@ struct DockerAPIBridgeServer: Sendable {
         let client = ContainerClient()
         _ = try await client.get(id: id)
         let handles = try await client.logs(id: id)
-        let data = (try? handles[0].readToEnd()) ?? Data()
+        // Empty log set is a successful empty body (Docker-compatible), not 404.
+        var data = Data()
+        for handle in handles {
+            if let chunk = try handle.readToEnd() {
+                data.append(chunk)
+            }
+        }
         try await writeData(data, contentType: "text/plain; charset=utf-8", outbound: outbound)
     }
 
@@ -273,7 +311,8 @@ struct DockerAPIBridgeServer: Sendable {
             return
         }
         _ = try await client.bootstrap(id: id, stdio: [nil, nil, nil])
-        try await client.initProcess(id: id).start()
+        let process = client.initProcess(id: id)
+        try await process.start()
         try await writeEmpty(status: .noContent, outbound: outbound)
     }
 
@@ -295,9 +334,21 @@ struct DockerAPIBridgeServer: Sendable {
         try await writeJSONObject(["StatusCode": code], outbound: outbound)
     }
 
-    private func handleContainerDelete(id: String, outbound: NIOAsyncChannelOutboundWriter<HTTPServerResponsePart>) async throws {
+    private func handleContainerDelete(
+        id: String, force: Bool, outbound: NIOAsyncChannelOutboundWriter<HTTPServerResponsePart>
+    ) async throws {
         let client = ContainerClient()
-        try await client.delete(id: id, force: true)
+        do {
+            try await client.delete(id: id, force: force)
+        } catch let error as ContainerizationError where !force {
+            // Map any refusal to delete a running container to Docker's 409.
+            if error.code == .invalidState || error.code == .invalidArgument {
+                throw BridgeHTTPError(
+                    status: .conflict,
+                    message: "cannot remove a running container \(id); use force=1")
+            }
+            throw error
+        }
         try await writeEmpty(status: .noContent, outbound: outbound)
     }
 
@@ -356,12 +407,25 @@ struct DockerAPIBridgeServer: Sendable {
         return result
     }
 
-    private func containerID(from path: String, suffix: String) -> String {
+    /// `/containers/{id}` with a single non-empty id segment (no nested subresources).
+    private static func isExactContainerResourcePath(_ path: String) -> Bool {
+        guard path.hasPrefix("/containers/") else { return false }
+        let rest = String(path.dropFirst("/containers/".count))
+        return isSafeContainerID(rest)
+    }
+
+    /// `{id}` from `/containers/{id}{suffix}` when `{id}` is a single path segment.
+    private func containerID(from path: String, suffix: String) -> String? {
         let trimmed = String(path.dropFirst("/containers/".count))
-        if trimmed.hasSuffix(suffix) {
-            return String(trimmed.dropLast(suffix.count))
-        }
-        return trimmed
+        guard trimmed.hasSuffix(suffix) else { return nil }
+        let id = String(trimmed.dropLast(suffix.count))
+        guard Self.isSafeContainerID(id) else { return nil }
+        return id
+    }
+
+    /// Reject empty ids, path separators, and any percent-encoding (including `%252f`).
+    private static func isSafeContainerID(_ id: String) -> Bool {
+        !id.isEmpty && !id.contains("/") && !id.contains("%")
     }
 
     // MARK: - HTTP helpers
@@ -370,13 +434,27 @@ struct DockerAPIBridgeServer: Sendable {
         URLComponents(string: uri)?.path ?? uri
     }
 
+    private static func queryItems(from uri: String) -> [URLQueryItem] {
+        URLComponents(string: uri)?.queryItems ?? []
+    }
+
+    private static func queryBool(_ items: [URLQueryItem], name: String, default defaultValue: Bool) -> Bool {
+        guard let item = items.first(where: { $0.name == name }) else {
+            return defaultValue
+        }
+        // Docker treats a present boolean flag with an empty value as true (`?force=`).
+        let raw = (item.value ?? "").lowercased()
+        if raw.isEmpty { return true }
+        return raw == "1" || raw == "true" || raw == "yes"
+    }
+
     private static func stripAPIVersion(_ path: String) -> String {
-        // /v1.43/containers/json → /containers/json
+        // /v1.43/containers/json → /containers/json. Require `v` + digits/dots only.
         guard path.hasPrefix("/v") else { return path }
         let rest = path.dropFirst(2)  // drop "/v"
         guard let slash = rest.firstIndex(of: "/") else { return path }
         let version = rest[..<slash]
-        guard version.contains(where: { $0.isNumber || $0 == "." }) else { return path }
+        guard !version.isEmpty, version.allSatisfy({ $0.isNumber || $0 == "." }) else { return path }
         return String(rest[slash...])
     }
 

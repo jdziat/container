@@ -42,13 +42,15 @@ extension ContainerCompose {
 
         @OptionGroup var shared: SharedOptions
 
-        @Flag(name: .customLong("detach"), help: "Detached mode")
+        @Flag(name: .customLong("detach"), help: "Detached mode (always on; accepted for CLI compatibility)")
         var detach = true
 
         func run() async throws {
             let plan = try ComposePlanner.plan(fileURL: URL(fileURLWithPath: shared.file), project: shared.project)
             try plan.reportUnsupported()
-            try await plan.up(detach: detach)
+            // Curated plugin always runs detached; --detach is accepted for compatibility.
+            _ = detach
+            try await plan.up(detach: true)
         }
     }
 
@@ -138,7 +140,21 @@ struct ComposePlanner {
         }
 
         func up(detach: Bool) async throws {
-            _ = try runContainer(["network", "create", network])
+            // Idempotent network create: reuse an existing project network.
+            do {
+                _ = try runContainer(["network", "inspect", network])
+            } catch {
+                do {
+                    _ = try runContainer(["network", "create", network])
+                } catch let createError {
+                    // Only swallow create when the network is already present (inspect race).
+                    do {
+                        _ = try runContainer(["network", "inspect", network])
+                    } catch {
+                        throw createError
+                    }
+                }
+            }
             for service in services {
                 // Dependencies are started earlier by topo order; wait for healthy when requested.
                 for dep in service.dependsOn where dep.condition == .serviceHealthy {
@@ -185,9 +201,11 @@ struct ComposePlanner {
 
         func down() async throws {
             for service in services.reversed() {
+                // Idempotent: ignore stop/delete failures for missing or already-stopped containers.
                 _ = try? runContainer(["stop", service.name])
                 _ = try? runContainer(["delete", "-f", service.name])
             }
+            // Idempotent: missing or already-deleted networks are fine on a second down.
             _ = try? runContainer(["network", "delete", network])
         }
     }
@@ -199,6 +217,8 @@ struct ComposePlanner {
         }
         var unsupported: [(service: String?, key: String, reason: String)] = []
         for key in root.keys where !["services", "networks", "volumes", "name", "version"].contains(key) {
+            // Compose extension fields (`x-…`) are ignored by design.
+            if key.hasPrefix("x-") || key.hasPrefix("X-") { continue }
             unsupported.append((nil, key, "top-level key is not supported in this curated subset"))
         }
 
@@ -235,25 +255,72 @@ struct ComposePlanner {
             var environment: [String: String] = [:]
             if let envMap = body["environment"] as? [String: Any] {
                 for (k, v) in envMap {
-                    environment[k] = "\(v)"
+                    guard !k.isEmpty else {
+                        throw ComposeError.invalid(
+                            "service \(name): environment keys must be non-empty")
+                    }
+                    if v is NSNull {
+                        environment[k] = ""
+                    } else if let s = v as? String {
+                        environment[k] = s
+                    } else if let n = v as? Int {
+                        environment[k] = String(n)
+                    } else if let n = v as? Double {
+                        environment[k] = String(n)
+                    } else if let n = v as? Bool {
+                        environment[k] = n ? "true" : "false"
+                    } else {
+                        throw ComposeError.invalid(
+                            "service \(name): environment.\(k) must be a string, number, bool, or null")
+                    }
                 }
             } else if let envList = body["environment"] as? [String] {
                 for item in envList {
-                    let parts = item.split(separator: "=", maxSplits: 1).map(String.init)
-                    if parts.count == 2 {
-                        environment[parts[0]] = parts[1]
+                    let parts = item.split(separator: "=", maxSplits: 1, omittingEmptySubsequences: false)
+                        .map(String.init)
+                    guard let key = parts.first, !key.isEmpty else {
+                        throw ComposeError.invalid(
+                            "service \(name): environment list entries must have a non-empty key")
+                    }
+                    if parts.count == 1 {
+                        // Compose list form `FOO` (no `=`) → empty value.
+                        environment[key] = ""
+                    } else {
+                        environment[key] = parts[1]
                     }
                 }
+            } else if body["environment"] != nil {
+                throw ComposeError.invalid("service \(name): environment must be a mapping or list")
             }
-            let ports = (body["ports"] as? [Any] ?? []).map { "\($0)" }
-            let volumes = (body["volumes"] as? [Any] ?? []).map { "\($0)" }
+            let ports = try parseStringOrRejectLongForm(
+                body["ports"], field: "ports", service: name)
+            let volumes = try parseStringOrRejectLongForm(
+                body["volumes"], field: "volumes", service: name)
             let dependsOn = try parseDependsOn(body["depends_on"], service: name)
             let healthcheck = try parseHealthcheck(body["healthcheck"], service: name)
             let command: [String]
-            if let cmd = body["command"] as? [String] {
-                command = cmd
+            if let cmdAny = body["command"] as? [Any] {
+                var parsed: [String] = []
+                for (idx, el) in cmdAny.enumerated() {
+                    if let s = el as? String {
+                        parsed.append(s)
+                    } else if let n = el as? Int {
+                        // Yams leaves unquoted scalars as numbers; coerce like Docker Compose.
+                        parsed.append(String(n))
+                    } else if let n = el as? Double {
+                        parsed.append(String(n))
+                    } else if let b = el as? Bool {
+                        parsed.append(b ? "true" : "false")
+                    } else {
+                        throw ComposeError.invalid(
+                            "service \(name): command[\(idx)] must be a string or number")
+                    }
+                }
+                command = parsed
             } else if let cmd = body["command"] as? String {
                 command = ["sh", "-c", cmd]
+            } else if body["command"] != nil {
+                throw ComposeError.invalid("service \(name): command must be a string or list of strings")
             } else {
                 command = []
             }
@@ -271,16 +338,70 @@ struct ComposePlanner {
                 ))
         }
 
-        // Topological-ish order: dependencies first; stable by name otherwise.
-        services.sort { lhs, rhs in
-            let rhsNeedsLhs = rhs.dependsOn.contains { $0.service == lhs.name }
-            let lhsNeedsRhs = lhs.dependsOn.contains { $0.service == rhs.name }
-            if rhsNeedsLhs { return true }
-            if lhsNeedsRhs { return false }
-            return lhs.name < rhs.name
-        }
+        services = try topoSortServices(services)
 
         return Plan(project: projectName, network: network, services: services, unsupported: unsupported)
+    }
+
+    /// Kahn topological sort: dependencies before dependents. Cycles fail closed.
+    private static func topoSortServices(_ services: [Service]) throws -> [Service] {
+        var byName = Dictionary(uniqueKeysWithValues: services.map { ($0.name, $0) })
+        var indegree: [String: Int] = Dictionary(uniqueKeysWithValues: services.map { ($0.name, 0) })
+        var adjacency: [String: [String]] = Dictionary(uniqueKeysWithValues: services.map { ($0.name, []) })
+        for service in services {
+            for dep in service.dependsOn {
+                guard byName[dep.service] != nil else {
+                    throw ComposeError.invalid("service \(service.name): depends_on unknown service \"\(dep.service)\"")
+                }
+                adjacency[dep.service, default: []].append(service.name)
+                indegree[service.name, default: 0] += 1
+            }
+        }
+        var queue = indegree.filter { $0.value == 0 }.map(\.key).sorted()
+        var ordered: [Service] = []
+        while !queue.isEmpty {
+            let name = queue.removeFirst()
+            guard let service = byName.removeValue(forKey: name) else { continue }
+            ordered.append(service)
+            for next in adjacency[name, default: []].sorted() {
+                indegree[next, default: 0] -= 1
+                if indegree[next] == 0 {
+                    // Keep the ready queue sorted without a full re-sort each insert.
+                    let idx = queue.firstIndex { $0 > next } ?? queue.endIndex
+                    queue.insert(next, at: idx)
+                }
+            }
+        }
+        guard ordered.count == services.count else {
+            throw ComposeError.invalid("services have a depends_on cycle")
+        }
+        return ordered
+    }
+
+    /// Short-form `ports`/`volumes` strings only. Long-form mappings are rejected so we
+    /// never stringify a Swift dictionary into `-p`/`-v` arguments.
+    private static func parseStringOrRejectLongForm(_ raw: Any?, field: String, service: String)
+        throws -> [String]
+    {
+        guard let raw else { return [] }
+        guard let list = raw as? [Any] else {
+            throw ComposeError.invalid("service \(service): \(field) must be a list")
+        }
+        var result: [String] = []
+        for (idx, item) in list.enumerated() {
+            if let s = item as? String {
+                result.append(s)
+                continue
+            }
+            if item is [String: Any] {
+                throw ComposeError.invalid(
+                    "service \(service): \(field)[\(idx)] long-form mapping is not supported; use short-form strings"
+                )
+            }
+            throw ComposeError.invalid(
+                "service \(service): \(field)[\(idx)] must be a string")
+        }
+        return result
     }
 
     private static func parseDependsOn(_ raw: Any?, service: String) throws -> [Dependency] {
@@ -320,9 +441,21 @@ struct ComposePlanner {
             return nil
         }
         let test: String
-        if let argv = body["test"] as? [String], !argv.isEmpty {
+        if let argvAny = body["test"] as? [Any], !argvAny.isEmpty {
+            // Pass Docker exec/shell JSON form through to `--health-cmd` (Parser accepts it).
+            var argv: [String] = []
+            for (idx, el) in argvAny.enumerated() {
+                guard let s = el as? String else {
+                    throw ComposeError.invalid(
+                        "service \(service): healthcheck.test[\(idx)] must be a string")
+                }
+                argv.append(s)
+            }
             let data = try JSONSerialization.data(withJSONObject: argv)
-            test = String(data: data, encoding: .utf8) ?? argv.joined(separator: " ")
+            guard let encoded = String(data: data, encoding: .utf8) else {
+                throw ComposeError.invalid("service \(service): healthcheck.test could not be encoded")
+            }
+            test = encoded
         } else if let shell = body["test"] as? String, !shell.isEmpty {
             test = shell
         } else {
@@ -333,15 +466,26 @@ struct ComposePlanner {
             intervalSeconds: try optionalDurationSeconds(body["interval"], field: "interval", service: service),
             timeoutSeconds: try optionalDurationSeconds(body["timeout"], field: "timeout", service: service),
             startPeriodSeconds: try optionalDurationSeconds(body["start_period"], field: "start_period", service: service),
-            retries: optionalUInt64(body["retries"])
+            retries: try optionalUInt64(body["retries"], field: "retries", service: service)
         )
     }
 
-    private static func optionalUInt64(_ raw: Any?) -> UInt64? {
+    private static func optionalUInt64(_ raw: Any?, field: String, service: String) throws -> UInt64? {
+        guard let raw else { return nil }
         if let n = raw as? UInt64 { return n }
-        if let n = raw as? Int, n >= 0 { return UInt64(n) }
-        if let s = raw as? String { return UInt64(s) }
-        return nil
+        if let n = raw as? Int {
+            guard n >= 0 else {
+                throw ComposeError.invalid("service \(service): healthcheck.\(field) must be >= 0")
+            }
+            return UInt64(n)
+        }
+        if let s = raw as? String {
+            guard let n = UInt64(s) else {
+                throw ComposeError.invalid("service \(service): healthcheck.\(field) must be an integer")
+            }
+            return n
+        }
+        throw ComposeError.invalid("service \(service): healthcheck.\(field) must be an integer")
     }
 
     private static func optionalDurationSeconds(_ raw: Any?, field: String, service: String) throws -> UInt64? {
@@ -369,13 +513,20 @@ struct ComposePlanner {
                 throw ComposeError.invalid("service \(service): invalid healthcheck.\(field) duration \"\(raw)\"")
             }
             number = ""
+            let unitSeconds: UInt64
             switch ch {
-            case "s": total &+= value
-            case "m": total &+= value &* 60
-            case "h": total &+= value &* 3600
+            case "s": unitSeconds = 1
+            case "m": unitSeconds = 60
+            case "h": unitSeconds = 3600
             default:
                 throw ComposeError.invalid("service \(service): invalid healthcheck.\(field) duration \"\(raw)\"")
             }
+            let (scaled, scaleOverflow) = value.multipliedReportingOverflow(by: unitSeconds)
+            let (sum, addOverflow) = total.addingReportingOverflow(scaled)
+            if scaleOverflow || addOverflow {
+                throw ComposeError.invalid("service \(service): invalid healthcheck.\(field) duration \"\(raw)\"")
+            }
+            total = sum
         }
         if !number.isEmpty {
             throw ComposeError.invalid("service \(service): invalid healthcheck.\(field) duration \"\(raw)\"")
@@ -387,6 +538,7 @@ struct ComposePlanner {
 func waitUntilHealthy(_ containerId: String, timeoutSeconds: UInt64 = 300) async throws {
     let deadline = Date().addingTimeInterval(TimeInterval(timeoutSeconds))
     while Date() < deadline {
+        try Task.checkCancellation()
         let json = try runContainer(["inspect", containerId])
         if let status = healthStatus(fromInspectJSON: json) {
             if status == "healthy" { return }
@@ -440,9 +592,28 @@ func runContainer(_ args: [String]) throws -> String {
     process.standardOutput = out
     process.standardError = err
     try process.run()
+    // Drain pipes on background queues while waiting so a chatty child cannot fill
+    // the OS pipe buffer and deadlock before exit.
+    final class PipeBuffer: @unchecked Sendable {
+        var data = Data()
+    }
+    let stdoutBuf = PipeBuffer()
+    let stderrBuf = PipeBuffer()
+    let group = DispatchGroup()
+    group.enter()
+    DispatchQueue.global().async {
+        stdoutBuf.data = out.fileHandleForReading.readDataToEndOfFile()
+        group.leave()
+    }
+    group.enter()
+    DispatchQueue.global().async {
+        stderrBuf.data = err.fileHandleForReading.readDataToEndOfFile()
+        group.leave()
+    }
     process.waitUntilExit()
-    let stdout = String(data: out.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
-    let stderr = String(data: err.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
+    group.wait()
+    let stdout = String(data: stdoutBuf.data, encoding: .utf8) ?? ""
+    let stderr = String(data: stderrBuf.data, encoding: .utf8) ?? ""
     guard process.terminationStatus == 0 else {
         throw ComposeError.commandFailed("container \(args.joined(separator: " ")) failed: \(stderr)\(stdout)")
     }

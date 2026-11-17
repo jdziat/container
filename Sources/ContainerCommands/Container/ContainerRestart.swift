@@ -28,7 +28,7 @@ extension Application {
             commandName: "restart",
             abstract: "Restart one or more containers")
 
-        @Flag(name: .shortAndLong, help: "Restart all running containers")
+        @Flag(name: .shortAndLong, help: "Restart all containers (stopped containers are started)")
         var all = false
 
         @Option(name: .shortAndLong, help: "Seconds to wait before killing the containers on stop")
@@ -53,24 +53,27 @@ extension Application {
         public mutating func run() async throws {
             let client = ContainerClient()
             var errors: [any Error] = []
-            let containers: [String]
+            let containers: [ContainerSnapshot]
             if self.all {
                 let filters = ContainerListFilters().withoutPlugins([ResourcePluginValues.machine, ResourcePluginValues.cluster])
-                containers = try await client.list(filters: filters).map(\.id)
+                containers = try await client.list(filters: filters)
             } else {
                 let filters = ContainerListFilters().withoutPlugins([ResourcePluginValues.cluster])
                 let (found, notFoundErrors) = try await client.findContainers(named: containerIds, filters: filters)
-                containers = found.map(\.id)
+                containers = found
                 errors += notFoundErrors
             }
 
             let stopOptions = ContainerStopOptions(timeoutInSeconds: self.time, signal: nil)
-            for id in containers {
+            for container in containers {
+                let id = container.id
                 do {
+                    // Stop then bootstrap. A bootstrap failure leaves the container stopped,
+                    // matching `docker restart` when start fails after stop.
                     try await client.stop(id: id, opts: stopOptions)
-                    let container = try await client.get(id: id)
+                    let current = try await client.get(id: id)
                     let io = try ProcessIO.create(
-                        tty: container.configuration.initProcess.terminal,
+                        tty: current.configuration.initProcess.terminal,
                         interactive: false,
                         detach: true
                     )

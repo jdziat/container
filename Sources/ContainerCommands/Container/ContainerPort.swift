@@ -43,8 +43,12 @@ extension Application {
             let proto: PublishProtocol?
 
             init(parsing value: String) throws {
-                let parts = value.split(separator: "/", maxSplits: 1, omittingEmptySubsequences: false)
-                guard let port = UInt16(parts[0]) else {
+                let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+                guard !trimmed.isEmpty else {
+                    throw ContainerizationError(.invalidArgument, message: "invalid container port \"\(value)\": expected <port> or <port>/<proto>")
+                }
+                let parts = trimmed.split(separator: "/", maxSplits: 1, omittingEmptySubsequences: false)
+                guard let portToken = parts.first, let port = UInt16(portToken) else {
                     throw ContainerizationError(.invalidArgument, message: "invalid container port \"\(value)\": expected <port> or <port>/<proto>")
                 }
                 self.port = port
@@ -92,11 +96,19 @@ extension Application {
                     continue
                 }
                 for offset in 0..<published.count {
-                    let containerPort = published.containerPort + offset
+                    let containerBase = UInt32(published.containerPort)
+                    let hostBase = UInt32(published.hostPort)
+                    let containerWide = containerBase + UInt32(offset)
+                    let hostWide = hostBase + UInt32(offset)
+                    // Skip offsets that would wrap past UInt16; keep listing other ports.
+                    guard containerWide <= UInt32(UInt16.max), hostWide <= UInt32(UInt16.max) else {
+                        continue
+                    }
+                    let containerPort = UInt16(containerWide)
                     if let filter, filter.port != containerPort {
                         continue
                     }
-                    let hostPort = published.hostPort + offset
+                    let hostPort = UInt16(hostWide)
                     lines.append("\(published.hostAddress):\(hostPort):\(containerPort)/\(published.proto.rawValue)")
                 }
             }

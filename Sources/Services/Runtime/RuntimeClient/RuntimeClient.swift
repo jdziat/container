@@ -411,6 +411,7 @@ extension XPCMessage {
         return try JSONDecoder().decode([NetworkBootstrapInfo].self, from: data)
     }
 
+    /// Decodes peer `/etc/hosts` entries. Missing key → `[]`; present but undecodable → throws.
     public func peerHosts() throws -> [PeerHostEntry] {
         guard let data = self.dataNoCopy(key: RuntimeKeys.peerHosts.rawValue) else {
             return []

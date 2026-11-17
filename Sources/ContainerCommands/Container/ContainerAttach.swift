@@ -64,7 +64,10 @@ extension Application {
         static func attachToRunning(client: ContainerClient, id: String, log: Logger) async throws -> Int32 {
             let process = try await client.initProcess(id: id)
             let logHandles = try await client.logs(id: id)
-            let stdioLog = logHandles[0]
+            guard let stdioLog = logHandles.first else {
+                throw ContainerizationError(
+                    .notFound, message: "no stdio log handle available for container \(id)")
+            }
             _ = try stdioLog.seekToEnd()
             setbuf(stdout, nil)
 
@@ -94,15 +97,19 @@ extension Application {
                     return nil
                 }
 
-                while true {
-                    guard let result = try await group.next() else {
-                        return -1
-                    }
+                // Wait for the init exit code. Nil results from follow/signal tasks are
+                // ignored so we keep waiting on process.wait(). cancelAll stops siblings
+                // after the code is known (tail bytes still in the follow task may drop).
+                while let result = try await group.next() {
                     if let code = result {
                         group.cancelAll()
                         return code
                     }
                 }
+                throw ContainerizationError(
+                    .invalidState,
+                    message: "attach ended without an exit code from container \(id)"
+                )
             }
         }
     }
