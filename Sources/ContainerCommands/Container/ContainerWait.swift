@@ -51,6 +51,13 @@ extension Application {
             var errors: [any Error] = notFoundErrors
             for container in found {
                 do {
+                    // Never-started containers have no init process to wait on.
+                    if container.status == .stopped, container.startedDate == nil {
+                        throw ContainerizationError(
+                            .invalidState,
+                            message: "container \(container.id) was never started"
+                        )
+                    }
                     // Like `docker wait`, attempt wait even if the container already exited.
                     let exitCode = try await client.initProcess(id: container.id).wait()
                     print(exitCode)

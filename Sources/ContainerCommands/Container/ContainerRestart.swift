@@ -28,7 +28,7 @@ extension Application {
             commandName: "restart",
             abstract: "Restart one or more containers")
 
-        @Flag(name: .shortAndLong, help: "Restart all running containers")
+        @Flag(name: .shortAndLong, help: "Restart all containers (stopped containers are started)")
         var all = false
 
         @Option(name: .shortAndLong, help: "Seconds to wait before killing the containers on stop")
@@ -56,7 +56,7 @@ extension Application {
             let containers: [ContainerSnapshot]
             if self.all {
                 let filters = ContainerListFilters().withoutPlugins([ResourcePluginValues.machine, ResourcePluginValues.cluster])
-                containers = try await client.list(filters: filters).filter { $0.status == .running }
+                containers = try await client.list(filters: filters)
             } else {
                 let filters = ContainerListFilters().withoutPlugins([ResourcePluginValues.cluster])
                 let (found, notFoundErrors) = try await client.findContainers(named: containerIds, filters: filters)
@@ -83,15 +83,15 @@ extension Application {
                     if let sshAuthSock = ProcessInfo.processInfo.environment["SSH_AUTH_SOCK"] {
                         env["SSH_AUTH_SOCK"] = sshAuthSock
                     }
-                    // Always stop (idempotent) so a container that exited between list and
-                    // now still goes through teardown before bootstrap.
-                    try await client.stop(id: id, opts: stopOptions)
+                    // Allocate stdio before stop so a ProcessIO failure leaves a running
+                    // container running. Stop is idempotent for already-stopped targets.
                     let io = try ProcessIO.create(
                         tty: current.configuration.initProcess.terminal,
                         interactive: false,
                         detach: true
                     )
                     defer { try? io.close() }
+                    try await client.stop(id: id, opts: stopOptions)
                     let process = try await client.bootstrap(id: id, stdio: io.stdio, dynamicEnv: env)
                     try await process.start()
                     try io.closeAfterStart()

@@ -142,9 +142,13 @@ struct ComposePlanner {
             } catch {
                 do {
                     _ = try runContainer(["network", "create", network])
-                } catch {
-                    // Inspect may have false-negatived or raced; reuse if it exists now.
-                    _ = try runContainer(["network", "inspect", network])
+                } catch let createError {
+                    // Only swallow create when the network is already present (inspect race).
+                    do {
+                        _ = try runContainer(["network", "inspect", network])
+                    } catch {
+                        throw createError
+                    }
                 }
             }
             for service in services {
@@ -314,8 +318,6 @@ struct ComposePlanner {
                     parsed.append(s)
                 }
                 command = parsed
-            } else if let cmd = body["command"] as? [String] {
-                command = cmd
             } else if let cmd = body["command"] as? String {
                 command = ["sh", "-c", cmd]
             } else if body["command"] != nil {
