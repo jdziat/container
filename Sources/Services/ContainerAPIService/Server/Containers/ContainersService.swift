@@ -772,9 +772,11 @@ public actor ContainersService {
             throw ContainerizationError(.notFound, message: "container \(id) not found")
         }
         guard state.snapshot.status != .stopped else {
+            // Only persist a marker when cancelling an in-flight crash-restart. A plain
+            // no-op stop on an already-stopped container must not change unless-stopped boot.
             let hadRestart = self.restartTasks[id] != nil
             self.cancelRestartTask(id: id)
-            if hadRestart || state.snapshot.startedDate != nil {
+            if hadRestart {
                 try? Self.setManuallyStopped(bundlePath: path, value: true)
             }
             return

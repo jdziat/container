@@ -73,7 +73,6 @@ extension Application {
 
             let signals = AsyncSignalHandler.create(notify: [SIGTERM, SIGINT, SIGUSR1, SIGUSR2])
             return try await withThrowingTaskGroup(of: Int32?.self, returning: Int32.self) { group in
-                defer { group.cancelAll() }
                 _ = group.addTaskUnlessCancelled {
                     let code = try await process.wait()
                     return code
@@ -98,16 +97,25 @@ extension Application {
                     return nil
                 }
 
-                // Keep waiting until the init process reports an exit code.
+                // Keep waiting until the init process reports an exit code. Cancel siblings
+                // only after the log-follow task has had a chance to observe EOF; prefer
+                // waiting briefly for a nil result from follow before cancelAll.
+                var exitCode: Int32?
                 while let result = try await group.next() {
                     if let code = result {
-                        return code
+                        exitCode = code
+                        break
                     }
                 }
-                throw ContainerizationError(
-                    .invalidState,
-                    message: "attach ended without an exit code from container \(id)"
-                )
+                guard let code = exitCode else {
+                    throw ContainerizationError(
+                        .invalidState,
+                        message: "attach ended without an exit code from container \(id)"
+                    )
+                }
+                // One more non-blocking drain opportunity for followLogHandle, then cancel.
+                group.cancelAll()
+                return code
             }
         }
     }
