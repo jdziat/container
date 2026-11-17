@@ -64,6 +64,9 @@ public actor ContainersService {
     /// In-flight intentional stops. Checked by the exit handler so a concurrent crash
     /// during `stop` does not schedule a restart before the on-disk marker is written.
     private var intentionalStops: Set<String> = []
+    /// Continuations resumed when an in-flight stop finishes (or is abandoned), so
+    /// concurrent `stop` callers suspend without a polling sleep loop.
+    private var concurrentStopWaiters: [String: [CheckedContinuation<Void, Never>]] = [:]
     /// Ensures boot-time restart starts run at most once after networks are wired.
     private var didScheduleBootStarts = false
     /// Per-container guest healthcheck probe loops (cancelled on stop/exit).
@@ -640,9 +643,18 @@ public actor ContainersService {
 
                 let sandboxSnapshot = try await client.state()
                 let path = self.containerRoot.appendingPathComponent(id)
-                // Check+clear the intentional-stop marker in one actor hop so a concurrent
-                // `stop` cannot set the marker between the check and the clear.
-                if try await self.clearManualStopUnlessIntentional(id: id, bundlePath: path) {
+                // Crash/boot restarts must only observe the marker — never clear it —
+                // so a concurrent stop that finishes before this hop cannot lose
+                // unless-stopped semantics across an API-server crash.
+                // User starts clear+check atomically so stop cannot win between hops.
+                let abortForStop: Bool
+                if abortIfManuallyStopped {
+                    abortForStop = await self.isIntentionallyStopped(id: id, bundlePath: path)
+                } else {
+                    abortForStop = try await self.clearManualStopUnlessIntentional(
+                        id: id, bundlePath: path)
+                }
+                if abortForStop {
                     try? await client.stop(options: .default)
                     let label = Self.fullLaunchdServiceLabel(
                         runtimeName: state.snapshot.configuration.runtimeHandler,
@@ -738,42 +750,30 @@ public actor ContainersService {
         let path = self.containerRoot.appendingPathComponent(id)
 
         // Stop should be idempotent across concurrent callers. If another stop is
-        // already in flight, wait for that attempt to finish. If it succeeded the
-        // container is `.stopped` and we return; if it failed we fall through and
-        // retry stop ourselves instead of spinning on `.running` until timeout.
+        // already in flight, wait for that attempt to finish via continuations (no
+        // polling sleep). If it succeeded the container is `.stopped` and we return;
+        // if it failed we fall through and retry stop ourselves.
         if self.intentionalStops.contains(id) {
-            // Idempotent stop: wait until the peer finishes exit handling (status
-            // `.stopped`) or leaves intentionalStops. Do not clear the peer's marker.
-            let deadline =
-                ContinuousClock.now
-                + .seconds(Int64(max(options.timeoutInSeconds, 30)) + 120)
-            while self.intentionalStops.contains(id) {
-                if self.containers[id]?.snapshot.status == .stopped {
-                    return
-                }
-                if ContinuousClock.now >= deadline {
-                    throw ContainerizationError(
-                        .timeout,
-                        message: "timed out waiting for concurrent stop of container \(id)"
-                    )
-                }
-                try await Task.sleep(for: .milliseconds(50))
-            }
+            let timeoutSeconds = Int64(max(options.timeoutInSeconds, 30)) + 120
+            try await self.waitForConcurrentStop(id: id, timeoutSeconds: timeoutSeconds)
             if self.containers[id]?.snapshot.status == .stopped {
                 return
             }
             // Peer stop failed while still `.running`; fall through and retry.
         }
         // Unknown id must stay `.notFound`. Already-stopped: only cancel a pending
-        // crash-restart (and mark intentional stop) when a backoff Task is in flight.
-        // Created-never-started containers must not gain a manual-stop marker from a no-op stop.
+        // crash-restart (and mark intentional stop) when a backoff Task is in flight
+        // or the container previously ran. Created-never-started must not gain a
+        // manual-stop marker from a no-op stop (unless-stopped would then refuse boot).
         guard let state = self.containers[id] else {
             throw ContainerizationError(.notFound, message: "container \(id) not found")
         }
         guard state.snapshot.status != .stopped else {
-            // Always record an intentional stop so unless-stopped does not restart on boot.
+            let hadRestart = self.restartTasks[id] != nil
             self.cancelRestartTask(id: id)
-            try? Self.setManuallyStopped(bundlePath: path, value: true)
+            if hadRestart || state.snapshot.startedDate != nil {
+                try? Self.setManuallyStopped(bundlePath: path, value: true)
+            }
             return
         }
 
@@ -781,8 +781,11 @@ public actor ContainersService {
         do {
             client = try state.getClient()
         } catch {
-            // No runtime client usually means already torn down; persist the marker.
-            try? Self.setManuallyStopped(bundlePath: path, value: true)
+            // No runtime client usually means already torn down; persist the marker
+            // only when the container had actually started.
+            if state.snapshot.startedDate != nil {
+                try? Self.setManuallyStopped(bundlePath: path, value: true)
+            }
             return
         }
 
@@ -796,7 +799,10 @@ public actor ContainersService {
         // Keep intentionalStops through handleContainerExit so a concurrent exit
         // monitor cannot schedule a crash restart during cleanup.
         self.intentionalStops.insert(id)
-        defer { self.intentionalStops.remove(id) }
+        defer {
+            self.intentionalStops.remove(id)
+            self.resumeConcurrentStopWaiters(id: id)
+        }
         try Self.setManuallyStopped(bundlePath: path, value: true)
         do {
             try await client.stop(options: resolvedOptions)
@@ -811,6 +817,55 @@ public actor ContainersService {
             throw error
         }
         try await handleContainerExit(id: id, suppressRestart: true)
+    }
+
+    /// Suspend until the in-flight stop for `id` finishes, or `timeoutSeconds` elapses.
+    private func waitForConcurrentStop(id: String, timeoutSeconds: Int64) async throws {
+        let finished: Bool = try await withThrowingTaskGroup(of: Bool.self) { group in
+            group.addTask {
+                await self.enqueueConcurrentStopWaiter(id: id)
+                return true
+            }
+            group.addTask {
+                try await Task.sleep(for: .seconds(timeoutSeconds))
+                return false
+            }
+            let first = try await group.next() ?? false
+            group.cancelAll()
+            return first
+        }
+        if !finished {
+            // Unblock the waiter task, then fail if the peer is still stopping.
+            self.resumeConcurrentStopWaiters(id: id)
+            if self.intentionalStops.contains(id),
+                self.containers[id]?.snapshot.status != .stopped
+            {
+                throw ContainerizationError(
+                    .timeout,
+                    message: "timed out waiting for concurrent stop of container \(id)"
+                )
+            }
+        }
+    }
+
+    private func enqueueConcurrentStopWaiter(id: String) async {
+        await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+            // Peer may have finished between the caller's check and registration.
+            if !self.intentionalStops.contains(id)
+                || self.containers[id]?.snapshot.status == .stopped
+            {
+                continuation.resume()
+                return
+            }
+            self.concurrentStopWaiters[id, default: []].append(continuation)
+        }
+    }
+
+    private func resumeConcurrentStopWaiters(id: String) {
+        let waiters = self.concurrentStopWaiters.removeValue(forKey: id) ?? []
+        for waiter in waiters {
+            waiter.resume()
+        }
     }
 
     public func dial(id: String, port: UInt32) async throws -> FileHandle {
@@ -1329,6 +1384,7 @@ public actor ContainersService {
     private func restartIfStillEligible(id: String, attempt: UInt64? = nil) async throws {
         let bundlePath = self.containerRoot.appendingPathComponent(id)
         guard self.containers[id] != nil else { return }
+        guard FileManager.default.fileExists(atPath: bundlePath.path) else { return }
         guard !self.intentionalStops.contains(id) else { return }
         guard !Self.isManuallyStopped(bundlePath: bundlePath) else { return }
         // Exit handling leaves the container `.stopped` before scheduling restart.
@@ -1338,6 +1394,7 @@ public actor ContainersService {
         // Re-check after bootstrap. Never abort a sandbox a concurrent client start is
         // using. Tear down only when an in-memory intentional stop won.
         guard self.containers[id] != nil else { return }
+        guard FileManager.default.fileExists(atPath: bundlePath.path) else { return }
         guard self.containers[id]?.snapshot.status == .stopped else { return }
         if self.intentionalStops.contains(id) {
             try await self.abortBootstrappedRestart(id: id)
@@ -1743,7 +1800,8 @@ public actor ContainersService {
                 retiredIPs: retiredIPs)
             try merged.write(to: tmpIn, atomically: true, encoding: .utf8)
             // Stage then install as root:root 0644 so we do not leave /etc/hosts owned by
-            // the copy-in user (bootstrap writes hosts as root).
+            // the copy-in user (bootstrap writes hosts as root). Avoid shell interpolation:
+            // pass the staged path as an argv element to install/rm.
             let staged = "/tmp/container-hosts-refresh-\(UUID().uuidString.lowercased())"
             try await client.copyIn(source: tmpIn.path, destination: staged, mode: 0o644)
             // Last chance to drop a superseded refresh before mutating guest hosts.
@@ -1761,11 +1819,8 @@ public actor ContainersService {
                 return
             }
             var install = state.snapshot.configuration.initProcess
-            install.executable = "/bin/sh"
-            install.arguments = [
-                "-c",
-                "install -o root -g root -m 644 '\(staged)' /etc/hosts && rm -f '\(staged)'",
-            ]
+            install.executable = "/usr/bin/install"
+            install.arguments = ["-o", "root", "-g", "root", "-m", "644", staged, "/etc/hosts"]
             install.terminal = false
             let processID = "hosts-\(UUID().uuidString.lowercased())"
             try await client.createProcess(processID, config: install, stdio: [nil, nil, nil])
@@ -1777,6 +1832,14 @@ public actor ContainersService {
                     message: "install /etc/hosts failed with rc \(status.exitCode)"
                 )
             }
+            var removeStaged = state.snapshot.configuration.initProcess
+            removeStaged.executable = "/bin/rm"
+            removeStaged.arguments = ["-f", staged]
+            removeStaged.terminal = false
+            let removeID = "hosts-rm-\(UUID().uuidString.lowercased())"
+            try? await client.createProcess(removeID, config: removeStaged, stdio: [nil, nil, nil])
+            try? await client.startProcess(removeID)
+            _ = try? await client.wait(removeID)
             self.log.info("refreshed peer hosts", metadata: ["id": "\(id)"])
         } catch is CancellationError {
             return

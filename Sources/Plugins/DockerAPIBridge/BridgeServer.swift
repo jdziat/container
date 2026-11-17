@@ -164,12 +164,17 @@ struct DockerAPIBridgeServer: Sendable {
                 try await handleContainerWait(id: id, outbound: outbound)
             case (.DELETE, let p) where p.hasPrefix("/containers/"):
                 let rest = String(p.dropFirst("/containers/".count))
-                // Only exact `/containers/{id}` — subresources like `/json` must 501.
-                guard !rest.isEmpty, !rest.contains("/") else {
+                    .trimmingCharacters(in: CharacterSet(charactersIn: "/"))
+                // Only exact `/containers/{id}` — subresources (`/json`, `/start`, …) and
+                // empty ids must 501. Trailing slashes are stripped; encoded slashes in the
+                // id are rejected by the remaining `/` check after a single-segment take.
+                let id = rest.split(separator: "/", maxSplits: 1, omittingEmptySubsequences: false)
+                guard id.count == 1, !id[0].isEmpty, !id[0].contains("%2F"), !id[0].contains("%2f")
+                else {
                     try await writeUnsupported(method: method, path: path, outbound: outbound)
                     break
                 }
-                try await handleContainerDelete(id: rest, outbound: outbound)
+                try await handleContainerDelete(id: String(id[0]), outbound: outbound)
             case (.GET, "/images/json"):
                 try await handleImagesList(outbound: outbound)
             default:

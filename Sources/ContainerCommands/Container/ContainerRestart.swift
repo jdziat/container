@@ -79,19 +79,19 @@ extension Application {
                             )
                         }
                     }
+                    var env: [String: String] = [:]
+                    if let sshAuthSock = ProcessInfo.processInfo.environment["SSH_AUTH_SOCK"] {
+                        env["SSH_AUTH_SOCK"] = sshAuthSock
+                    }
+                    // Always stop (idempotent) so a container that exited between list and
+                    // now still goes through teardown before bootstrap.
+                    try await client.stop(id: id, opts: stopOptions)
                     let io = try ProcessIO.create(
                         tty: current.configuration.initProcess.terminal,
                         interactive: false,
                         detach: true
                     )
                     defer { try? io.close() }
-                    var env: [String: String] = [:]
-                    if let sshAuthSock = ProcessInfo.processInfo.environment["SSH_AUTH_SOCK"] {
-                        env["SSH_AUTH_SOCK"] = sshAuthSock
-                    }
-                    if current.status == .running {
-                        try await client.stop(id: id, opts: stopOptions)
-                    }
                     let process = try await client.bootstrap(id: id, stdio: io.stdio, dynamicEnv: env)
                     try await process.start()
                     try io.closeAfterStart()

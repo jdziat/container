@@ -262,25 +262,58 @@ struct ComposePlanner {
             var environment: [String: String] = [:]
             if let envMap = body["environment"] as? [String: Any] {
                 for (k, v) in envMap {
-                    environment[k] = "\(v)"
+                    if v is NSNull {
+                        environment[k] = ""
+                    } else if let s = v as? String {
+                        environment[k] = s
+                    } else if let n = v as? Int {
+                        environment[k] = String(n)
+                    } else if let n = v as? Double {
+                        environment[k] = String(n)
+                    } else if let n = v as? Bool {
+                        environment[k] = n ? "true" : "false"
+                    } else {
+                        throw ComposeError.invalid(
+                            "service \(name): environment.\(k) must be a string, number, bool, or null")
+                    }
                 }
             } else if let envList = body["environment"] as? [String] {
                 for item in envList {
-                    let parts = item.split(separator: "=", maxSplits: 1).map(String.init)
-                    if parts.count == 2 {
+                    let parts = item.split(separator: "=", maxSplits: 1, omittingEmptySubsequences: false)
+                        .map(String.init)
+                    if parts.count == 1 {
+                        // Compose list form `FOO` (no `=`) → empty value.
+                        environment[parts[0]] = ""
+                    } else {
                         environment[parts[0]] = parts[1]
                     }
                 }
+            } else if body["environment"] != nil {
+                throw ComposeError.invalid("service \(name): environment must be a mapping or list")
             }
-            let ports = (body["ports"] as? [Any] ?? []).map { "\($0)" }
-            let volumes = (body["volumes"] as? [Any] ?? []).map { "\($0)" }
+            let ports = try parseStringOrRejectLongForm(
+                body["ports"], field: "ports", service: name)
+            let volumes = try parseStringOrRejectLongForm(
+                body["volumes"], field: "volumes", service: name)
             let dependsOn = try parseDependsOn(body["depends_on"], service: name)
             let healthcheck = try parseHealthcheck(body["healthcheck"], service: name)
             let command: [String]
-            if let cmd = body["command"] as? [String] {
+            if let cmdAny = body["command"] as? [Any] {
+                var parsed: [String] = []
+                for (idx, el) in cmdAny.enumerated() {
+                    guard let s = el as? String else {
+                        throw ComposeError.invalid(
+                            "service \(name): command[\(idx)] must be a string")
+                    }
+                    parsed.append(s)
+                }
+                command = parsed
+            } else if let cmd = body["command"] as? [String] {
                 command = cmd
             } else if let cmd = body["command"] as? String {
                 command = ["sh", "-c", cmd]
+            } else if body["command"] != nil {
+                throw ComposeError.invalid("service \(name): command must be a string or list of strings")
             } else {
                 command = []
             }
@@ -335,6 +368,32 @@ struct ComposePlanner {
             throw ComposeError.invalid("services have a depends_on cycle")
         }
         return ordered
+    }
+
+    /// Short-form `ports`/`volumes` strings only. Long-form mappings are rejected so we
+    /// never stringify a Swift dictionary into `-p`/`-v` arguments.
+    private static func parseStringOrRejectLongForm(_ raw: Any?, field: String, service: String)
+        throws -> [String]
+    {
+        guard let raw else { return [] }
+        guard let list = raw as? [Any] else {
+            throw ComposeError.invalid("service \(service): \(field) must be a list")
+        }
+        var result: [String] = []
+        for (idx, item) in list.enumerated() {
+            if let s = item as? String {
+                result.append(s)
+                continue
+            }
+            if item is [String: Any] {
+                throw ComposeError.invalid(
+                    "service \(service): \(field)[\(idx)] long-form mapping is not supported; use short-form strings"
+                )
+            }
+            throw ComposeError.invalid(
+                "service \(service): \(field)[\(idx)] must be a string")
+        }
+        return result
     }
 
     private static func parseDependsOn(_ raw: Any?, service: String) throws -> [Dependency] {

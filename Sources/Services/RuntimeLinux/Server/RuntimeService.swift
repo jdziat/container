@@ -160,17 +160,11 @@ public actor RuntimeService {
             // Prefer the networkBootstrapInfos invalidArgument over a peerHosts decode
             // error when both are wrong; peerHosts is optional adornment.
             let networkBootstrapInfos = try message.networkBootstrapInfos()
-            // peerHosts is optional adornment; a bad payload must not fail bootstrap.
+            // peerHosts is optional when absent; a present but undecodable payload is a
+            // sender regression and must fail bootstrap rather than boot with empty peers.
             let peerHosts: [PeerHostEntry]
             if message.dataNoCopy(key: RuntimeKeys.peerHosts.rawValue) != nil {
-                do {
-                    peerHosts = try message.peerHosts()
-                } catch {
-                    self.log.warning(
-                        "ignoring undecodable peerHosts payload during bootstrap",
-                        metadata: ["error": "\(error)"])
-                    peerHosts = []
-                }
+                peerHosts = try message.peerHosts()
             } else {
                 peerHosts = []
             }
