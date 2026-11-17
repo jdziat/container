@@ -139,6 +139,7 @@ struct DockerAPIBridgeServer: Sendable {
         outbound: NIOAsyncChannelOutboundWriter<HTTPServerResponsePart>
     ) async throws {
         let path = Self.stripAPIVersion(Self.path(from: request.uri))
+        let query = Self.queryItems(from: request.uri)
         let method = request.method
         log.debug("request", metadata: ["method": "\(method)", "path": "\(path)"])
 
@@ -191,7 +192,8 @@ struct DockerAPIBridgeServer: Sendable {
             case (.DELETE, let p) where Self.isExactContainerResourcePath(p):
                 // Exact `/containers/{id}` only — any extra path segment is a subresource (501).
                 let id = String(p.dropFirst("/containers/".count))
-                try await handleContainerDelete(id: id, outbound: outbound)
+                let force = Self.queryBool(query, name: "force", default: false)
+                try await handleContainerDelete(id: id, force: force, outbound: outbound)
             case (.GET, "/images/json"):
                 try await handleImagesList(outbound: outbound)
             default:
@@ -246,11 +248,14 @@ struct DockerAPIBridgeServer: Sendable {
                 "Status": snap.configuration.healthStatus.rawValue
             ]
         }()
+        // Pid is unavailable over this curated bridge. ExitCode is 0 while running;
+        // when stopped the runtime snapshot does not persist the last code, so report -1
+        // rather than claiming a successful exit (clients should use /wait for the real code).
         var state: [String: Any] = [
             "Status": snap.status.rawValue,
             "Running": snap.status == .running,
             "Pid": 0,
-            "ExitCode": 0,
+            "ExitCode": snap.status == .running ? 0 : -1,
         ]
         if let health { state["Health"] = health }
         let payload: [String: Any] = [
@@ -288,9 +293,7 @@ struct DockerAPIBridgeServer: Sendable {
         let client = ContainerClient()
         _ = try await client.get(id: id)
         let handles = try await client.logs(id: id)
-        guard !handles.isEmpty else {
-            throw BridgeHTTPError(status: .notFound, message: "No logs available for container: \(id)")
-        }
+        // Empty log set is a successful empty body (Docker-compatible), not 404.
         var data = Data()
         for handle in handles {
             if let chunk = try handle.readToEnd() {
@@ -331,9 +334,16 @@ struct DockerAPIBridgeServer: Sendable {
         try await writeJSONObject(["StatusCode": code], outbound: outbound)
     }
 
-    private func handleContainerDelete(id: String, outbound: NIOAsyncChannelOutboundWriter<HTTPServerResponsePart>) async throws {
+    private func handleContainerDelete(
+        id: String, force: Bool, outbound: NIOAsyncChannelOutboundWriter<HTTPServerResponsePart>
+    ) async throws {
         let client = ContainerClient()
-        try await client.delete(id: id, force: true)
+        do {
+            try await client.delete(id: id, force: force)
+        } catch let error as ContainerizationError where error.code == .invalidState && !force {
+            throw BridgeHTTPError(
+                status: .conflict, message: "cannot remove a running container \(id); use force=1")
+        }
         try await writeEmpty(status: .noContent, outbound: outbound)
     }
 
@@ -418,13 +428,24 @@ struct DockerAPIBridgeServer: Sendable {
         URLComponents(string: uri)?.path ?? uri
     }
 
+    private static func queryItems(from uri: String) -> [URLQueryItem] {
+        URLComponents(string: uri)?.queryItems ?? []
+    }
+
+    private static func queryBool(_ items: [URLQueryItem], name: String, default defaultValue: Bool) -> Bool {
+        guard let raw = items.first(where: { $0.name == name })?.value?.lowercased() else {
+            return defaultValue
+        }
+        return raw == "1" || raw == "true" || raw == "yes"
+    }
+
     private static func stripAPIVersion(_ path: String) -> String {
-        // /v1.43/containers/json → /containers/json
+        // /v1.43/containers/json → /containers/json. Require `v` + digits/dots only.
         guard path.hasPrefix("/v") else { return path }
         let rest = path.dropFirst(2)  // drop "/v"
         guard let slash = rest.firstIndex(of: "/") else { return path }
         let version = rest[..<slash]
-        guard version.contains(where: { $0.isNumber || $0 == "." }) else { return path }
+        guard !version.isEmpty, version.allSatisfy({ $0.isNumber || $0 == "." }) else { return path }
         return String(rest[slash...])
     }
 

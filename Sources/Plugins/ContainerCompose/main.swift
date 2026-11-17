@@ -42,7 +42,7 @@ extension ContainerCompose {
 
         @OptionGroup var shared: SharedOptions
 
-        @Flag(name: .customLong("detach"), help: "Detached mode")
+        @Flag(name: .customLong("detach"), inversion: .prefixedNo, help: "Detached mode (default); use --no-detach for attached")
         var detach = true
 
         func run() async throws {
@@ -196,22 +196,20 @@ struct ComposePlanner {
         func down() async throws {
             var failures: [String] = []
             for service in services.reversed() {
-                do {
-                    _ = try runContainer(["stop", service.name])
-                } catch {
-                    // Already stopped is fine; other failures are collected.
-                    failures.append("stop \(service.name): \(error)")
-                }
-                do {
-                    _ = try runContainer(["delete", "-f", service.name])
-                } catch {
-                    failures.append("delete \(service.name): \(error)")
-                }
+                // Idempotent: ignore stop/delete failures for missing or already-stopped containers.
+                _ = try? runContainer(["stop", service.name])
+                _ = try? runContainer(["delete", "-f", service.name])
             }
             do {
                 _ = try runContainer(["network", "delete", network])
             } catch {
-                failures.append("network delete \(network): \(error)")
+                // Missing network is fine on a second down.
+                let message = "\(error)"
+                if !message.localizedCaseInsensitiveContains("not found")
+                    && !message.localizedCaseInsensitiveContains("no such")
+                {
+                    failures.append("network delete \(network): \(error)")
+                }
             }
             if !failures.isEmpty {
                 throw ComposeError.commandFailed(failures.joined(separator: "; "))
@@ -226,6 +224,8 @@ struct ComposePlanner {
         }
         var unsupported: [(service: String?, key: String, reason: String)] = []
         for key in root.keys where !["services", "networks", "volumes", "name", "version"].contains(key) {
+            // Compose extension fields (`x-…`) are ignored by design.
+            if key.hasPrefix("x-") || key.hasPrefix("X-") { continue }
             unsupported.append((nil, key, "top-level key is not supported in this curated subset"))
         }
 
@@ -457,15 +457,26 @@ struct ComposePlanner {
             intervalSeconds: try optionalDurationSeconds(body["interval"], field: "interval", service: service),
             timeoutSeconds: try optionalDurationSeconds(body["timeout"], field: "timeout", service: service),
             startPeriodSeconds: try optionalDurationSeconds(body["start_period"], field: "start_period", service: service),
-            retries: optionalUInt64(body["retries"])
+            retries: try optionalUInt64(body["retries"], field: "retries", service: service)
         )
     }
 
-    private static func optionalUInt64(_ raw: Any?) -> UInt64? {
+    private static func optionalUInt64(_ raw: Any?, field: String, service: String) throws -> UInt64? {
+        guard let raw else { return nil }
         if let n = raw as? UInt64 { return n }
-        if let n = raw as? Int, n >= 0 { return UInt64(n) }
-        if let s = raw as? String { return UInt64(s) }
-        return nil
+        if let n = raw as? Int {
+            guard n >= 0 else {
+                throw ComposeError.invalid("service \(service): healthcheck.\(field) must be >= 0")
+            }
+            return UInt64(n)
+        }
+        if let s = raw as? String {
+            guard let n = UInt64(s) else {
+                throw ComposeError.invalid("service \(service): healthcheck.\(field) must be an integer")
+            }
+            return n
+        }
+        throw ComposeError.invalid("service \(service): healthcheck.\(field) must be an integer")
     }
 
     private static func optionalDurationSeconds(_ raw: Any?, field: String, service: String) throws -> UInt64? {
@@ -518,6 +529,7 @@ struct ComposePlanner {
 func waitUntilHealthy(_ containerId: String, timeoutSeconds: UInt64 = 300) async throws {
     let deadline = Date().addingTimeInterval(TimeInterval(timeoutSeconds))
     while Date() < deadline {
+        try Task.checkCancellation()
         let json = try runContainer(["inspect", containerId])
         if let status = healthStatus(fromInspectJSON: json) {
             if status == "healthy" { return }
