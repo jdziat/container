@@ -240,7 +240,7 @@ struct ComposePlanner {
             for key in body.keys {
                 let allowed: Set<String> = [
                     "image", "command", "entrypoint", "environment", "ports", "volumes",
-                    "depends_on", "restart", "healthcheck", "build",
+                    "depends_on", "restart", "container_name", "healthcheck", "build",
                 ]
                 if !allowed.contains(key) {
                     unsupported.append((name, key, "not implemented in curated compose plugin"))
@@ -302,11 +302,19 @@ struct ComposePlanner {
             if let cmdAny = body["command"] as? [Any] {
                 var parsed: [String] = []
                 for (idx, el) in cmdAny.enumerated() {
-                    guard let s = el as? String else {
+                    if let s = el as? String {
+                        parsed.append(s)
+                    } else if let n = el as? Int {
+                        // Yams leaves unquoted scalars as numbers; coerce like Docker Compose.
+                        parsed.append(String(n))
+                    } else if let n = el as? Double {
+                        parsed.append(String(n))
+                    } else if let b = el as? Bool {
+                        parsed.append(b ? "true" : "false")
+                    } else {
                         throw ComposeError.invalid(
-                            "service \(name): command[\(idx)] must be a string")
+                            "service \(name): command[\(idx)] must be a string or number")
                     }
-                    parsed.append(s)
                 }
                 command = parsed
             } else if let cmd = body["command"] as? String {
