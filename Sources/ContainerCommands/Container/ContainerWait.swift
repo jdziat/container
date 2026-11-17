@@ -50,15 +50,16 @@ extension Application {
 
             var errors: [any Error] = notFoundErrors
             for container in found {
-                do {
-                    // Never-started: clear error. Already exited: still wait (docker-like)
-                    // so initProcess can return the recorded exit code.
-                    if container.status != .running, container.startedDate == nil {
-                        throw ContainerizationError(
+                guard container.status == .running else {
+                    errors.append(
+                        ContainerizationError(
                             .invalidState,
-                            message: "container \(container.id) was never started"
-                        )
-                    }
+                            message:
+                                "container \(container.id) is not running (status: \(container.status.rawValue))"
+                        ))
+                    continue
+                }
+                do {
                     let exitCode = try await client.initProcess(id: container.id).wait()
                     print(exitCode)
                 } catch {

@@ -68,22 +68,20 @@ extension Application {
             for container in containers {
                 let id = container.id
                 do {
+                    // Stop then bootstrap. A bootstrap failure leaves the container stopped,
+                    // matching `docker restart` when start fails after stop.
+                    try await client.stop(id: id, opts: stopOptions)
                     let current = try await client.get(id: id)
-                    var env: [String: String] = [:]
-                    if let sshAuthSock = ProcessInfo.processInfo.environment["SSH_AUTH_SOCK"] {
-                        env["SSH_AUTH_SOCK"] = sshAuthSock
-                    }
-                    // Allocate stdio before stop so a ProcessIO failure leaves a running
-                    // container running. Stop is idempotent for already-stopped targets.
-                    // Mount sources are re-validated by bootstrap; do not refuse restart of
-                    // an already-running container solely because a host path vanished.
                     let io = try ProcessIO.create(
                         tty: current.configuration.initProcess.terminal,
                         interactive: false,
                         detach: true
                     )
                     defer { try? io.close() }
-                    try await client.stop(id: id, opts: stopOptions)
+                    var env: [String: String] = [:]
+                    if let sshAuthSock = ProcessInfo.processInfo.environment["SSH_AUTH_SOCK"] {
+                        env["SSH_AUTH_SOCK"] = sshAuthSock
+                    }
                     let process = try await client.bootstrap(id: id, stdio: io.stdio, dynamicEnv: env)
                     try await process.start()
                     try io.closeAfterStart()
