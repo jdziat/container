@@ -260,6 +260,10 @@ struct ComposePlanner {
             var environment: [String: String] = [:]
             if let envMap = body["environment"] as? [String: Any] {
                 for (k, v) in envMap {
+                    guard !k.isEmpty else {
+                        throw ComposeError.invalid(
+                            "service \(name): environment keys must be non-empty")
+                    }
                     if v is NSNull {
                         environment[k] = ""
                     } else if let s = v as? String {

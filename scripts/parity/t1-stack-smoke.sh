@@ -112,10 +112,7 @@ if [[ "${resolved:-0}" -ne 1 ]]; then
     fi
     warn "${APP} cannot resolve '${DB}' on ${NETWORK}; bare-name discovery on custom networks is not available yet"
     warn "see https://github.com/apple/container/issues/1809; rerun with PARITY_STRICT_DNS=1 to make this fatal"
-    # Soft failure: exit 0 so CI that treats non-zero as a failed tier stays green when
-    # bare-name discovery has not landed yet (see header / PARITY_STRICT_DNS).
-    echo "T1 stack smoke: passed (name resolution: soft-fail)"
-    exit 0
 fi
 
-echo "T1 stack smoke: passed (name resolution: ok)"
+# Soft DNS failure falls through here and exits 0 (see PARITY_STRICT_DNS in the header).
+echo "T1 stack smoke: passed (name resolution: $([[ "${resolved:-0}" -eq 1 ]] && echo ok || echo soft-fail))"
