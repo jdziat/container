@@ -104,9 +104,10 @@ extension Application {
                         return code
                     }
                 }
-                // Wait task should always produce a code; if the group drained without
-                // one, wait directly rather than inventing -1.
-                return try await process.wait()
+                throw ContainerizationError(
+                    .invalidState,
+                    message: "attach ended without an exit code from container \(id)"
+                )
             }
         }
     }

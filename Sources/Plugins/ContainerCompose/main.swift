@@ -137,15 +137,15 @@ struct ComposePlanner {
 
         func up(detach: Bool) async throws {
             // Idempotent network create: reuse an existing project network.
-            let networkExists: Bool
             do {
                 _ = try runContainer(["network", "inspect", network])
-                networkExists = true
             } catch {
-                networkExists = false
-            }
-            if !networkExists {
-                _ = try runContainer(["network", "create", network])
+                do {
+                    _ = try runContainer(["network", "create", network])
+                } catch {
+                    // Inspect may have false-negatived or raced; reuse if it exists now.
+                    _ = try runContainer(["network", "inspect", network])
+                }
             }
             for service in services {
                 // Dependencies are started earlier by topo order; wait for healthy when requested.

@@ -406,9 +406,7 @@ struct DockerAPIBridgeServer: Sendable {
     private static func isExactContainerResourcePath(_ path: String) -> Bool {
         guard path.hasPrefix("/containers/") else { return false }
         let rest = String(path.dropFirst("/containers/".count))
-        guard !rest.isEmpty, !rest.contains("/") else { return false }
-        let lower = rest.lowercased()
-        return !lower.contains("%2f")
+        return isSafeContainerID(rest)
     }
 
     /// `{id}` from `/containers/{id}{suffix}` when `{id}` is a single path segment.
@@ -416,10 +414,13 @@ struct DockerAPIBridgeServer: Sendable {
         let trimmed = String(path.dropFirst("/containers/".count))
         guard trimmed.hasSuffix(suffix) else { return nil }
         let id = String(trimmed.dropLast(suffix.count))
-        guard !id.isEmpty, !id.contains("/") else { return nil }
-        let lower = id.lowercased()
-        guard !lower.contains("%2f") else { return nil }
+        guard Self.isSafeContainerID(id) else { return nil }
         return id
+    }
+
+    /// Reject empty ids, path separators, and any percent-encoding (including `%252f`).
+    private static func isSafeContainerID(_ id: String) -> Bool {
+        !id.isEmpty && !id.contains("/") && !id.contains("%")
     }
 
     // MARK: - HTTP helpers

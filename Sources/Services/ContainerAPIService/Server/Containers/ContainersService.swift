@@ -65,8 +65,9 @@ public actor ContainersService {
     /// during `stop` does not schedule a restart before the on-disk marker is written.
     private var intentionalStops: Set<String> = []
     /// Continuations resumed when an in-flight stop finishes (or is abandoned), so
-    /// concurrent `stop` callers suspend without a polling sleep loop.
-    private var concurrentStopWaiters: [String: [CheckedContinuation<Void, Never>]] = [:]
+    /// concurrent `stop` callers suspend without a polling sleep loop. Tokens let a
+    /// timed-out waiter drop only itself without waking siblings still waiting.
+    private var concurrentStopWaiters: [String: [UUID: CheckedContinuation<Void, Never>]] = [:]
     /// Ensures boot-time restart starts run at most once after networks are wired.
     private var didScheduleBootStarts = false
     /// Per-container guest healthcheck probe loops (cancelled on stop/exit).
@@ -798,11 +799,8 @@ public actor ContainersService {
 
         // Persist the intentional-stop marker before client.stop so an API-server
         // crash mid-stop cannot lose unless-stopped semantics on the next boot.
-        // Keep intentionalStops through handleContainerExit so a concurrent exit
-        // monitor cannot schedule a crash restart during cleanup.
         // Keep intentionalStops through handleContainerExit so a concurrent exit-monitor
-        // path cannot schedule a crash restart. Waiters intentionally resume only after
-        // exit cleanup finishes (status `.stopped`).
+        // path cannot schedule a crash restart. Waiters resume after exit cleanup.
         self.intentionalStops.insert(id)
         defer {
             self.intentionalStops.remove(id)
@@ -826,9 +824,10 @@ public actor ContainersService {
 
     /// Suspend until the in-flight stop for `id` finishes, or `timeoutSeconds` elapses.
     private func waitForConcurrentStop(id: String, timeoutSeconds: Int64) async throws {
+        let token = UUID()
         let finished: Bool = try await withThrowingTaskGroup(of: Bool.self) { group in
             group.addTask {
-                await self.enqueueConcurrentStopWaiter(id: id)
+                await self.enqueueConcurrentStopWaiter(id: id, token: token)
                 return true
             }
             group.addTask {
@@ -840,8 +839,8 @@ public actor ContainersService {
             return first
         }
         if !finished {
-            // Unblock the waiter task, then fail if the peer is still stopping.
-            self.resumeConcurrentStopWaiters(id: id)
+            // Drop only this caller's waiter so sibling stop waiters stay parked.
+            self.dropConcurrentStopWaiter(id: id, token: token)
             if self.intentionalStops.contains(id),
                 self.containers[id]?.snapshot.status != .stopped
             {
@@ -853,7 +852,7 @@ public actor ContainersService {
         }
     }
 
-    private func enqueueConcurrentStopWaiter(id: String) async {
+    private func enqueueConcurrentStopWaiter(id: String, token: UUID) async {
         await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
             // Peer may have finished between the caller's check and registration.
             if !self.intentionalStops.contains(id)
@@ -862,13 +861,27 @@ public actor ContainersService {
                 continuation.resume()
                 return
             }
-            self.concurrentStopWaiters[id, default: []].append(continuation)
+            var waiters = self.concurrentStopWaiters[id] ?? [:]
+            waiters[token] = continuation
+            self.concurrentStopWaiters[id] = waiters
+        }
+    }
+
+    private func dropConcurrentStopWaiter(id: String, token: UUID) {
+        guard var waiters = self.concurrentStopWaiters[id] else { return }
+        if let continuation = waiters.removeValue(forKey: token) {
+            continuation.resume()
+        }
+        if waiters.isEmpty {
+            self.concurrentStopWaiters.removeValue(forKey: id)
+        } else {
+            self.concurrentStopWaiters[id] = waiters
         }
     }
 
     private func resumeConcurrentStopWaiters(id: String) {
-        let waiters = self.concurrentStopWaiters.removeValue(forKey: id) ?? []
-        for waiter in waiters {
+        let waiters = self.concurrentStopWaiters.removeValue(forKey: id) ?? [:]
+        for (_, waiter) in waiters {
             waiter.resume()
         }
     }
@@ -1819,30 +1832,31 @@ public actor ContainersService {
             let staged = "/tmp/container-hosts-refresh-\(UUID().uuidString.lowercased())"
             try await client.copyIn(source: tmpIn.path, destination: staged, mode: 0o644)
             // Last chance to drop a superseded refresh before mutating guest hosts.
+            let rootUtility: (String, [String]) -> ContainerResource.ProcessConfiguration = { executable, arguments in
+                var config = state.snapshot.configuration.initProcess
+                config.executable = executable
+                config.arguments = arguments
+                config.terminal = false
+                config.workingDirectory = "/"
+                config.user = .id(uid: 0, gid: 0)
+                return config
+            }
             guard self.hostsRefreshGenerations[id] == generation,
                 self.containers[id]?.snapshot.status == .running
             else {
-                var cleanup = state.snapshot.configuration.initProcess
-                cleanup.executable = "/bin/rm"
-                cleanup.arguments = ["-f", staged]
-                cleanup.terminal = false
+                let cleanup = rootUtility("/bin/rm", ["-f", staged])
                 let cleanupID = "hosts-cleanup-\(UUID().uuidString.lowercased())"
                 try? await client.createProcess(cleanupID, config: cleanup, stdio: [nil, nil, nil])
                 try? await client.startProcess(cleanupID)
                 _ = try? await client.wait(cleanupID)
                 return
             }
-            var install = state.snapshot.configuration.initProcess
-            install.executable = "/usr/bin/install"
-            install.arguments = ["-o", "root", "-g", "root", "-m", "644", staged, "/etc/hosts"]
-            install.terminal = false
+            let install = rootUtility(
+                "/usr/bin/install", ["-o", "root", "-g", "root", "-m", "644", staged, "/etc/hosts"])
             let processID = "hosts-\(UUID().uuidString.lowercased())"
             try await client.createProcess(processID, config: install, stdio: [nil, nil, nil])
             let removeStagedFile: () async -> Void = {
-                var cleanup = state.snapshot.configuration.initProcess
-                cleanup.executable = "/bin/rm"
-                cleanup.arguments = ["-f", staged]
-                cleanup.terminal = false
+                let cleanup = rootUtility("/bin/rm", ["-f", staged])
                 let cleanupID = "hosts-rm-\(UUID().uuidString.lowercased())"
                 try? await client.createProcess(cleanupID, config: cleanup, stdio: [nil, nil, nil])
                 try? await client.startProcess(cleanupID)
