@@ -56,4 +56,6 @@ public enum RuntimeKeys: String {
 
     /// Per-network connection info passed to the runtime so it can allocate directly.
     case networkBootstrapInfos
+    /// Peer host entries to inject into the guest `/etc/hosts` at bootstrap.
+    case peerHosts
 }

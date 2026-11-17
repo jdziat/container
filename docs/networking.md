@@ -90,17 +90,15 @@ container run -it --rm alpine/curl curl -v http://http-server.test:8000
 container stop http-server
 ```
 
-> [!WARNING]
-> This works for containers on the `default` network using a domain-qualified name
-> (`http-server.test`, as above). It does **not** currently work for looking up another
-> container by its *bare* hostname (no domain suffix) on a custom network created with
-> `container network create` — the kind of zero-configuration, Compose-style service
-> discovery some users expect. That gap is tracked upstream as
-> [apple/container#1809](https://github.com/apple/container/issues/1809) (open feature
-> request, not yet implemented) and related broader reports in
-> [apple/container#856](https://github.com/apple/container/issues/856). Until resolved,
-> reach a container on a custom network by its IP address instead (`container inspect
-> <name>` to find it).
+> [!NOTE]
+> On the `default` network, prefer a domain-qualified name (`http-server.test` above)
+> after `container system dns create`. On a **custom** network (`container network create`),
+> Compose-style **bare** names are injected into each guest's `/etc/hosts` for peers that
+> share a custom network (hostname plus `--network ...,alias=` names). Entries are written
+> at bootstrap and refreshed in already-running guests when containers join or leave the
+> network. Full network-scoped DNS remains tracked as
+> [apple/container#1809](https://github.com/apple/container/issues/1809). See also
+> [apple/container#856](https://github.com/apple/container/issues/856).
 
 ## Forward traffic from `localhost` to your container
 

@@ -1,0 +1,3 @@
+abstract = "Run multi-container stacks from a Compose file (curated subset; unsupported keys fail closed)"
+author = "container parity"
+version = 0.1

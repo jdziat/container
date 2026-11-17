@@ -72,6 +72,15 @@ public struct ContainerConfiguration: Sendable, Codable {
     public var readonlyPaths: [String]?
     /// The time at which the container was created.
     public var creationDate: Date = Date()
+    /// Restart policy for the container (Docker/Podman compatible).
+    public var restartPolicy: RestartPolicy = .no
+    /// Maximum failure restarts for `on-failure` (`nil` = unlimited). Ignored otherwise.
+    public var restartMaxRetries: UInt64?
+    /// Optional healthcheck contract (probe execution updates inspect status at runtime).
+    public var healthcheck: ContainerHealthcheck?
+    /// Create-time / last-written health hint. Probe updates stay in the API-server
+    /// in-memory snapshot and are not persisted back into the durable config.
+    public var healthStatus: ContainerHealthStatus = .none
 
     enum CodingKeys: String, CodingKey {
         case id
@@ -99,6 +108,42 @@ public struct ContainerConfiguration: Sendable, Codable {
         case maskedPaths
         case readonlyPaths
         case creationDate
+        case restartPolicy
+        case restartMaxRetries
+        case healthcheck
+        // healthStatus is intentionally omitted from durable encode/decode.
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(id, forKey: .id)
+        try container.encode(image, forKey: .image)
+        try container.encode(mounts, forKey: .mounts)
+        try container.encode(publishedPorts, forKey: .publishedPorts)
+        try container.encode(publishedSockets, forKey: .publishedSockets)
+        try container.encode(labels, forKey: .labels)
+        try container.encode(sysctls, forKey: .sysctls)
+        try container.encode(networks, forKey: .networks)
+        try container.encodeIfPresent(dns, forKey: .dns)
+        try container.encode(rosetta, forKey: .rosetta)
+        try container.encode(initProcess, forKey: .initProcess)
+        try container.encode(platform, forKey: .platform)
+        try container.encode(resources, forKey: .resources)
+        try container.encode(runtimeHandler, forKey: .runtimeHandler)
+        try container.encode(virtualization, forKey: .virtualization)
+        try container.encode(ssh, forKey: .ssh)
+        try container.encode(readOnly, forKey: .readOnly)
+        try container.encode(useInit, forKey: .useInit)
+        try container.encode(capAdd, forKey: .capAdd)
+        try container.encode(capDrop, forKey: .capDrop)
+        try container.encodeIfPresent(shmSize, forKey: .shmSize)
+        try container.encodeIfPresent(stopSignal, forKey: .stopSignal)
+        try container.encodeIfPresent(maskedPaths, forKey: .maskedPaths)
+        try container.encodeIfPresent(readonlyPaths, forKey: .readonlyPaths)
+        try container.encode(creationDate, forKey: .creationDate)
+        try container.encode(restartPolicy, forKey: .restartPolicy)
+        try container.encodeIfPresent(restartMaxRetries, forKey: .restartMaxRetries)
+        try container.encodeIfPresent(healthcheck, forKey: .healthcheck)
     }
 
     /// Create a configuration from the supplied Decoder, initializing missing
@@ -137,6 +182,11 @@ public struct ContainerConfiguration: Sendable, Codable {
         maskedPaths = try container.decodeIfPresent([String].self, forKey: .maskedPaths)
         readonlyPaths = try container.decodeIfPresent([String].self, forKey: .readonlyPaths)
         creationDate = try container.decodeIfPresent(Date.self, forKey: .creationDate) ?? Date(timeIntervalSince1970: 0)
+        restartPolicy = try container.decodeIfPresent(RestartPolicy.self, forKey: .restartPolicy) ?? .no
+        restartMaxRetries = try container.decodeIfPresent(UInt64.self, forKey: .restartMaxRetries)
+        healthcheck = try container.decodeIfPresent(ContainerHealthcheck.self, forKey: .healthcheck)
+        // Runtime-only; never restore a stale probe result from durable config.
+        healthStatus = .none
     }
 
     public struct DNSConfiguration: Sendable, Codable {

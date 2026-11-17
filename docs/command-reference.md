@@ -77,6 +77,12 @@ container run [<options>] <image> [<arguments> ...]
 *   `--tmpfs <tmpfs>`: Add a tmpfs mount to the container at the given path
 *   `-v, --volume <volume>`: Bind mount a volume into the container
 *   `--virtualization`: Expose virtualization capabilities to the container (requires host and guest support)
+*   `--restart <policy>`: Restart policy when the container exits (`no`, `on-failure[:max]`, `always`, `unless-stopped`). Crash restart uses exponential backoff (250ms…60s) and honors `on-failure` max retries; boot start is honored for `always`/`unless-stopped`. An intentional `container stop` sets a manual-stop marker so `unless-stopped` does not come back until started again.
+*   `--health-cmd <command>`: Create-time healthcheck command (shell form, or a JSON argv array). After start, a guest probe loop updates inspect `healthStatus` to `starting`/`healthy`/`unhealthy`.
+*   `--health-interval <seconds>`: Seconds between health checks (default: 30). Requires `--health-cmd`.
+*   `--health-timeout <seconds>`: Seconds before a single health check is treated as failed (default: 30). Requires `--health-cmd`.
+*   `--health-start-period <seconds>`: Grace period before failed checks count (default: 0). Requires `--health-cmd`.
+*   `--health-retries <n>`: Consecutive failures before unhealthy (default: 3). Requires `--health-cmd`.
 
 **Registry Options**
 
@@ -245,6 +251,12 @@ container create [<options>] <image> [<arguments> ...]
 *   `--tmpfs <tmpfs>`: Add a tmpfs mount to the container at the given path
 *   `-v, --volume <volume>`: Bind mount a volume into the container
 *   `--virtualization`: Expose virtualization capabilities to the container (requires host and guest support)
+*   `--restart <policy>`: Restart policy when the container exits (`no`, `on-failure[:max]`, `always`, `unless-stopped`). Crash restart uses exponential backoff (250ms…60s) and honors `on-failure` max retries; boot start is honored for `always`/`unless-stopped`. An intentional `container stop` sets a manual-stop marker so `unless-stopped` does not come back until started again.
+*   `--health-cmd <command>`: Create-time healthcheck command (shell form, or a JSON argv array). After start, a guest probe loop updates inspect `healthStatus` to `starting`/`healthy`/`unhealthy`.
+*   `--health-interval <seconds>`: Seconds between health checks (default: 30). Requires `--health-cmd`
+*   `--health-timeout <seconds>`: Seconds before a single health check is treated as failed (default: 30). Requires `--health-cmd`
+*   `--health-start-period <seconds>`: Grace period before failed checks count (default: 0). Requires `--health-cmd`
+*   `--health-retries <n>`: Consecutive failures before unhealthy (default: 3). Requires `--health-cmd`
 
 **Registry Options**
 
@@ -270,8 +282,26 @@ container start [--attach] [--interactive] [--debug] <container-id>
 
 **Options**
 
-*   `-a, --attach`: Attach stdout/stderr
-*   `-i, --interactive`: Attach stdin
+*   `-a, --attach`: Attach stdout/stderr (on an already-running container, streams logs from the current end and waits for exit)
+*   `-i, --interactive`: Attach stdin (for a fresh start only; already-running init stdin is not rebindable — use `container exec -it`)
+
+### `container attach`
+
+Attaches to a running container: streams stdio logs from the current end, forwards terminal signals to the init process, and exits with the container's exit code. Rebinding stdin to an already-running init process is not supported (stdio is bound at bootstrap); use `container exec -it` for a new interactive process.
+
+**Usage**
+
+```bash
+container attach [--interactive] [--debug] <container-id>
+```
+
+**Arguments**
+
+*   `<container-id>`: Container ID (must be running)
+
+**Options**
+
+*   `-i, --interactive`: Accepted for Docker CLI familiarity; stdin is not attached to the running init (a warning is logged)
 
 ### `container stop`
 
@@ -311,6 +341,54 @@ container kill [--all] [--signal <signal>] [--debug] [<container-ids> ...]
 
 *   `-a, --all`: Kill or signal all running containers
 *   `-s, --signal <signal>`: Signal to send to the container(s) (default: KILL)
+
+### `container restart`
+
+Stops then starts one or more containers.
+
+**Usage**
+
+```bash
+container restart [--all] [--time <time>] [--debug] [<container-ids> ...]
+```
+
+**Arguments**
+
+*   `<container-ids>`: Container IDs
+
+**Options**
+
+*   `-a, --all`: Restart all running containers
+*   `-t, --time <time>`: Seconds to wait before killing the containers on stop (default: 5)
+
+### `container wait`
+
+Blocks until each named running container stops, then prints its exit code (one per line, in argument order).
+
+**Usage**
+
+```bash
+container wait [--debug] <container-ids> ...
+```
+
+**Arguments**
+
+*   `<container-ids>`: Container IDs (must be running)
+
+### `container port`
+
+Lists published port mappings for a container as `<host address>:<host port>:<container port>/<proto>`.
+
+**Usage**
+
+```bash
+container port [--debug] <container-id> [<port>[/<proto>]]
+```
+
+**Arguments**
+
+*   `<container-id>`: Container ID
+*   `<port>[/<proto>]`: Optional filter for a container port (and optional `tcp`/`udp`)
 
 ### `container delete (rm)`
 

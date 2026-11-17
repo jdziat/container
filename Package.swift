@@ -566,6 +566,12 @@ let package = Package(
             ],
             path: "Sources/Services/Runtime/RuntimeClient"
         ),
+        .testTarget(
+            name: "ContainerRuntimeClientTests",
+            dependencies: [
+                "ContainerRuntimeClient"
+            ]
+        ),
         .target(
             name: "ContainerResource",
             dependencies: [
@@ -821,6 +827,29 @@ let package = Package(
             ],
             path: "Sources/Plugins/ContainerBuilder",
             exclude: ["config.toml"]
+        ),
+        .executableTarget(
+            name: "container-compose",
+            dependencies: [
+                .product(name: "ArgumentParser", package: "swift-argument-parser"),
+                "Yams",
+            ],
+            path: "Sources/Plugins/ContainerCompose",
+            exclude: ["config.toml"]
+        ),
+        .executableTarget(
+            name: "container-docker-api-bridge",
+            dependencies: [
+                .product(name: "ArgumentParser", package: "swift-argument-parser"),
+                .product(name: "NIOCore", package: "swift-nio"),
+                .product(name: "NIOHTTP1", package: "swift-nio"),
+                .product(name: "NIOPosix", package: "swift-nio"),
+                .product(name: "Logging", package: "swift-log"),
+                "ContainerAPIClient",
+                "ContainerResource",
+            ],
+            path: "Sources/Plugins/DockerAPIBridge",
+            exclude: ["config.toml", "README.md"]
         ),
     ]
 )

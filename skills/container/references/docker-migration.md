@@ -22,15 +22,18 @@ spelling.
 | `docker stats` | `container stats` | |
 | `docker ps` | `container list` / `ls` | add `-a` for stopped containers |
 | `docker container prune` | `container prune` | |
-| `docker restart` | — | `container stop <id> && container start <id>` |
-| `docker attach` | — | use `container exec -it <id> sh` |
+| `docker commit` | `container commit <id> <image>` | creates an image from the container's filesystem; a running container is snapshotted first |
+| `docker restart` | `container restart` | |
+| `docker wait` | `container wait` | prints one exit code per running container |
+| `docker port` | `container port` | prints `<host address>:<host port>:<container port>/<proto>` |
+| `docker attach` | `container attach` | streams logs from the current end and waits for exit; stdin to already-running init is not rebindable — use `exec -it` |
 | `docker top` | — | `container exec <id> ps aux` |
-| `docker port` | — | `container inspect <id>` |
-| `docker commit` | — | build an image from a Dockerfile instead |
-| `docker rename`, `pause`, `unpause`, `wait`, `diff`, `update` | — | no equivalent |
+| `docker rename`, `pause`, `unpause`, `diff`, `update` | — | no equivalent |
 
-There is no `--restart` policy flag on `container run`. Supervise long-running services with
-launchd on the host, or run them under an init system inside a container machine.
+`--restart` on `run`/`create` accepts `no|on-failure[:max]|always|unless-stopped` (crash restart uses exponential backoff).
+`--health-cmd` (plus `--health-interval`/`--health-timeout`/`--health-start-period`/`--health-retries`)
+configures a guest probe loop that updates inspect `healthStatus`.
+Full status: `docs/parity-matrix.md`.
 
 ## Images
 
@@ -95,17 +98,21 @@ container network prune
 
 ## Replacing a compose file
 
-There is no `container compose`. A compose file becomes a shell script: DNS-resolvable names
-on the `default` network, and `-d`.
+Two paths:
 
-**Do not reach for `container network create` here.** Name lookup between containers works on
-the `default` network with a domain-qualified name. It does *not* work for containers on a
-custom network — that gap is tracked as
-[apple/container#1809](https://github.com/apple/container/issues/1809). A custom network is
-for *isolating* containers; if you use one, wire the containers together by IP from
-`container inspect <name>`, not by name.
+1. **Plugin (preferred when installed):** `Sources/Plugins/ContainerCompose` installs as the
+   `compose` plugin (`container compose up|down|config`). It creates a project network, starts
+   services in dependency order, forwards `restart:` and `healthcheck:`, waits on
+   `depends_on: condition: service_healthy`, and fail-closes on unsupported keys.
+   Bare service names work via guest `/etc/hosts` injection (see `docs/parity-matrix.md`).
+   YAML `build:` is not executed yet.
+2. **Shell script:** translate the file by hand with `container run` as below.
 
-Set up name resolution once (all three steps — see SKILL.md):
+On the `default` network, use domain-qualified names after DNS setup. On a **custom**
+network, bare names land in `/etc/hosts` and refresh on join/leave
+([apple/container#1809](https://github.com/apple/container/issues/1809) interim).
+
+Set up name resolution once when staying on `default` (all three steps — see SKILL.md):
 
 ```bash
 # [dns] domain = "test" in ~/.config/container/config.toml
@@ -129,23 +136,40 @@ services:
     depends_on: [db]
 ```
 
-becomes:
+becomes (custom network + bare name):
 
 ```bash
 #!/bin/bash
 set -euo pipefail
 
-# no --network flag: both containers land on `default`, where name lookup works
-container run -d --name db \
+# One-shot stack up (not a destructive rerun). Tear down explicitly when needed:
+#   container stop web db; container delete web db; container network delete appnet
+if ! container network inspect appnet >/dev/null 2>&1; then
+  container network create appnet
+fi
+# --name is the bare hostname written into peers' /etc/hosts; no alias= needed
+container run -d --name db --network appnet \
   -e POSTGRES_PASSWORD=secret \
+  --restart unless-stopped \
   postgres:16
 
-# depends_on becomes an explicit readiness check
-until container exec db pg_isready -q; do sleep 1; done
+# Wait for db readiness before creating web (compose plugin can do service_healthy instead).
+for _ in $(seq 1 60); do
+  status="$(container inspect db 2>/dev/null | python3 -c 'import json,sys; d=json.load(sys.stdin); print(d[0].get("status",{}).get("status",""))' 2>/dev/null || true)"
+  if [[ "${status}" != "running" ]]; then
+    echo "db container is not running (status=${status:-missing})" >&2
+    exit 1
+  fi
+  container exec db pg_isready -q && break
+  sleep 1
+done
+if ! container exec db pg_isready -q; then
+  echo "db not ready after 60s" >&2
+  exit 1
+fi
 
-# db.test, not db — the name must be domain-qualified
-container run -d --name web -p 8080:80 \
-  -e DATABASE_URL=postgres://postgres:secret@db.test:5432/postgres \
+container run -d --name web --network appnet -p 8080:80 \
+  -e DATABASE_URL=postgres://postgres:secret@db:5432/postgres \
   my-app:latest
 ```
 
@@ -154,21 +178,23 @@ Teardown:
 ```bash
 container stop web db
 container delete web db
+container network delete appnet
 ```
 
 Mapping notes:
 
-- `depends_on` has no declarative form. Compose only waits for *start*, not readiness, so an
-  explicit readiness loop is usually more correct than what it replaced.
-- Reference other services as `<name>.<domain>` (`db.test`). A bare `db` does not resolve.
-  This means editing your application's config, not just the `run` command.
+- `depends_on` with `condition: service_healthy` is honored by the compose plugin; bare lists
+  wait for start order only.
+- On a custom network, bare service names resolve via `/etc/hosts` (refreshed on join/leave).
+  On `default`, prefer `<name>.<domain>` (`db.test`).
 - `ports:` → `-p`. Often unnecessary between containers, since each container has its own IP
   and is reachable without publishing. You need `-p` to reach a service from a host browser or
   a macOS-native tool.
 - `volumes:` → `-v` for bind mounts, or `container volume create` plus `-v <name>:<path>`.
 - `build:` → a `container build -t <name> .` line before the `run`.
-- `restart:` has no equivalent. Supervise with launchd on the host, or run the stack under an
-  init system inside a container machine.
+- `restart:` → pass `--restart <policy>` on each `container run` (the compose plugin forwards
+  `restart:` the same way). Policies: `no`, `on-failure[:max]`, `always`, `unless-stopped`.
+- `healthcheck:` → translated to `--health-cmd*` by the compose plugin.
 
 ## Features with no Docker counterpart
 
