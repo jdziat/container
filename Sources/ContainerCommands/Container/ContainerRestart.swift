@@ -68,23 +68,15 @@ extension Application {
             for container in containers {
                 let id = container.id
                 do {
-                    // Validate start inputs before stopping so a failed restart does not
-                    // leave a previously-running container permanently stopped.
                     let current = try await client.get(id: id)
-                    for mount in current.configuration.mounts where mount.isVirtiofs {
-                        if !FileManager.default.fileExists(atPath: mount.source) {
-                            throw ContainerizationError(
-                                .invalidState,
-                                message: "mount source path '\(mount.source)' does not exist"
-                            )
-                        }
-                    }
                     var env: [String: String] = [:]
                     if let sshAuthSock = ProcessInfo.processInfo.environment["SSH_AUTH_SOCK"] {
                         env["SSH_AUTH_SOCK"] = sshAuthSock
                     }
                     // Allocate stdio before stop so a ProcessIO failure leaves a running
                     // container running. Stop is idempotent for already-stopped targets.
+                    // Mount sources are re-validated by bootstrap; do not refuse restart of
+                    // an already-running container solely because a host path vanished.
                     let io = try ProcessIO.create(
                         tty: current.configuration.initProcess.terminal,
                         interactive: false,

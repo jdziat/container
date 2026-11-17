@@ -192,7 +192,8 @@ struct DockerAPIBridgeServer: Sendable {
             case (.DELETE, let p) where Self.isExactContainerResourcePath(p):
                 // Exact `/containers/{id}` only — any extra path segment is a subresource (501).
                 let id = String(p.dropFirst("/containers/".count))
-                let force = Self.queryBool(query, name: "force", default: false)
+                // Curated bridge defaults force=true (historical behavior). Pass force=0 for 409.
+                let force = Self.queryBool(query, name: "force", default: true)
                 try await handleContainerDelete(id: id, force: force, outbound: outbound)
             case (.GET, "/images/json"):
                 try await handleImagesList(outbound: outbound)
@@ -248,14 +249,13 @@ struct DockerAPIBridgeServer: Sendable {
                 "Status": snap.configuration.healthStatus.rawValue
             ]
         }()
-        // Pid is unavailable over this curated bridge. ExitCode is 0 while running;
-        // when stopped the runtime snapshot does not persist the last code, so report -1
-        // rather than claiming a successful exit (clients should use /wait for the real code).
+        // Pid is unavailable over this curated bridge. ExitCode is not persisted on the
+        // snapshot; report 0 here and use /containers/{id}/wait for the real code.
         var state: [String: Any] = [
             "Status": snap.status.rawValue,
             "Running": snap.status == .running,
             "Pid": 0,
-            "ExitCode": snap.status == .running ? 0 : -1,
+            "ExitCode": 0,
         ]
         if let health { state["Health"] = health }
         let payload: [String: Any] = [

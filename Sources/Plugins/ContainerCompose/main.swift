@@ -200,26 +200,13 @@ struct ComposePlanner {
         }
 
         func down() async throws {
-            var failures: [String] = []
             for service in services.reversed() {
                 // Idempotent: ignore stop/delete failures for missing or already-stopped containers.
                 _ = try? runContainer(["stop", service.name])
                 _ = try? runContainer(["delete", "-f", service.name])
             }
-            do {
-                _ = try runContainer(["network", "delete", network])
-            } catch {
-                // Missing network is fine on a second down.
-                let message = "\(error)"
-                if !message.localizedCaseInsensitiveContains("not found")
-                    && !message.localizedCaseInsensitiveContains("no such")
-                {
-                    failures.append("network delete \(network): \(error)")
-                }
-            }
-            if !failures.isEmpty {
-                throw ComposeError.commandFailed(failures.joined(separator: "; "))
-            }
+            // Idempotent: missing or already-deleted networks are fine on a second down.
+            _ = try? runContainer(["network", "delete", network])
         }
     }
 
