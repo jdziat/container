@@ -97,25 +97,19 @@ extension Application {
                     return nil
                 }
 
-                // Keep waiting until the init process reports an exit code. Cancel siblings
-                // only after the log-follow task has had a chance to observe EOF; prefer
-                // waiting briefly for a nil result from follow before cancelAll.
-                var exitCode: Int32?
+                // Wait for the init exit code. Nil results from follow/signal tasks are
+                // ignored so we keep waiting on process.wait(). cancelAll stops siblings
+                // after the code is known (tail bytes still in the follow task may drop).
                 while let result = try await group.next() {
                     if let code = result {
-                        exitCode = code
-                        break
+                        group.cancelAll()
+                        return code
                     }
                 }
-                guard let code = exitCode else {
-                    throw ContainerizationError(
-                        .invalidState,
-                        message: "attach ended without an exit code from container \(id)"
-                    )
-                }
-                // One more non-blocking drain opportunity for followLogHandle, then cancel.
-                group.cancelAll()
-                return code
+                throw ContainerizationError(
+                    .invalidState,
+                    message: "attach ended without an exit code from container \(id)"
+                )
             }
         }
     }
