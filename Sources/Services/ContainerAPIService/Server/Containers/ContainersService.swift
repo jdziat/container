@@ -842,9 +842,14 @@ public actor ContainersService {
         }
         if !finished {
             // Drop only this caller's waiter so sibling stop waiters stay parked.
-            // Do not throw: the caller re-checks status and may retry stop itself if
-            // the peer is still in flight past this wait budget.
             self.dropConcurrentStopWaiter(id: id, token: token)
+            if self.containers[id]?.snapshot.status == .stopped {
+                return
+            }
+            throw ContainerizationError(
+                .timeout,
+                message: "timed out waiting for concurrent stop of container \(id)"
+            )
         }
     }
 
