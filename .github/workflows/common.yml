@@ -161,6 +161,9 @@ jobs:
       # the system left by the test step above and starts its own on the isolated APP_ROOT. This is what keeps the parity matrix
       # honest; the older grep-based targets pass even when the build is broken.
       - name: Docker parity (behavioral)
+        # Runs even when the upstream test step above failed, so a failure there cannot hide whether
+        # this gate passes. The job as a whole still fails if either step fails.
+        if: ${{ !cancelled() }}
         run: make APP_ROOT="${APP_ROOT}" LOG_ROOT="${LOG_ROOT}" parity-behavioral
 
       - name: Extract coverage percentages
