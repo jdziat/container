@@ -120,6 +120,7 @@ The scripts under `scripts/parity/` check the claims above against a running sys
 
 ## Keeping this page honest
 
+- **What CI covers today.** `.github/workflows/static-parity.yml` runs on a GitHub-hosted `macos-26` runner (build, 1140 unit tests, a walk of every command's `--help`, compose matrix drift) and was green on PR #3. That catches compile breaks, argument-definition bugs and doc drift. It does **not** boot VMs, so it is not evidence that any `done` row *behaves* as claimed. The live gate (`make parity-behavioral`, wired into `common.yml`) has passed locally on an isolated app root but has **not run in CI**: `common.yml`'s build jobs are gated to `apple/container` and need a self-hosted macOS 26 runner.
 - **Static checks are not evidence.** `scripts/parity/{f3,f4,f5,c3,l1,l2,l3,l4}*.sh` and their `make` targets only `grep` source or docs for symbols and comments. They pass when the build is broken. Do not cite them as proof a row is `done`; only `make parity-behavioral` and the unit tests are evidence.
 
 - A row moves to `done` only when the command ships and is covered by a test or harness step.
