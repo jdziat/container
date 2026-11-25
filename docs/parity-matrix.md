@@ -39,7 +39,7 @@ For flag-level detail, see the [command reference](command-reference.md). For a 
 | `cp` | `container copy` / `container cp` | `done` | |
 | `export` | `container export` | `done` | |
 | `inspect` | `container inspect` | `done` | `-f` / `--format` accepts a Go template (`'{{.Name}}'`, `'{{json .}}'`). Also the way to find a container's IP address. |
-| `stats` | `container stats` | `done` | `--format` takes `json`/`table`/`yaml`/`toml` only (no Go templates); `--no-stream` supported. |
+| `stats` | `container stats` | `done` | `--format` takes `json`/`table`/`yaml`/`toml` or a Docker-style Go template (`{{.Name}}`, `{{.CPUPerc}}`, `{{.MemUsage}}`, `{{.MemPerc}}`, `{{.NetIO}}`, `{{.BlockIO}}`, `{{.PIDs}}`); `--no-stream` supported. |
 | `commit` | `container commit` | `done` | Creates an image from a container's filesystem. See [`container commit`](command-reference.md#container-commit). |
 | `container prune` | `container prune` | `done` | |
 | `restart` | `container restart` | `done` | Stops, then starts again. |

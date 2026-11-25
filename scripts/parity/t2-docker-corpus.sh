@@ -124,6 +124,10 @@ if [[ "${out}" == *"corpus-line-3"* && "${out}" != *"corpus-line-1"* ]]; then
 else
     fail "logs --tail 2: ${out:0:200}"
 fi
+out="$(d stats --no-stream --format '{{.Name}}|{{.PIDs}}|{{.MemUsage}}' "${NAME}")"
+if [[ "${out}" == "${NAME}|"[0-9]*"|"*" / "* ]]; then pass "stats --format template prints name, pids and memory"; else fail "stats --format: ${out:0:160}"; fi
+out="$(d stats --no-stream --format 'table {{.Name}}\t{{.CPUPerc}}' "${NAME}")"
+[[ "${out}" == NAME$'\t'CPUPERC* ]] && pass "stats --format 'table ...' prints a header row" || fail "stats table header: ${out:0:120}"
 expect_out "images --format Repository:Tag"      "alpine:3.20" images --format '{{.Repository}}:{{.Tag}}'
 VOLN="corpusvol${SUFFIX}"
 "${CONTAINER_BIN}" volume create "${VOLN}" >/dev/null 2>&1
@@ -165,9 +169,29 @@ cc -f "${LF}/c.yml" -p "${PROJ}" start >/dev/null; sleep 2; [[ "$(cstate)" == "r
 cc -f "${LF}/c.yml" -p "${PROJ}" pause >/dev/null; [[ "$(cstate)" == "paused" ]] && pass "compose pause" || fail "compose pause: '$(cstate)'"
 cc -f "${LF}/c.yml" -p "${PROJ}" unpause >/dev/null; [[ "$(cstate)" == "running" ]] && pass "compose unpause" || fail "compose unpause: '$(cstate)'"
 [[ "$(cc -f "${LF}/c.yml" -p "${PROJ}" top svc)" == *"PID"* ]] && pass "compose top shows guest processes" || fail "compose top"
+# restart must really restart the guest: age it, restart, and require the uptime to drop.
+sleep 8
+up_before="$("${CONTAINER_BIN}" exec "$("${CONTAINER_BIN}" ps -q --filter "label=com.docker.compose.project=${PROJ}" 2>/dev/null | grep -v '^Warning' | head -1)" cat /proc/uptime 2>/dev/null | awk '{print int($1)}')"
+cc -f "${LF}/c.yml" -p "${PROJ}" restart -t 1 >/dev/null; sleep 3
+up_after="$("${CONTAINER_BIN}" exec "$("${CONTAINER_BIN}" ps -q --filter "label=com.docker.compose.project=${PROJ}" 2>/dev/null | grep -v '^Warning' | head -1)" cat /proc/uptime 2>/dev/null | awk '{print int($1)}')"
+if [[ -n "${up_before}" && -n "${up_after}" && "${up_before}" -ge 8 && "${up_after}" -lt "${up_before}" ]]; then pass "compose restart really restarts the guest (uptime ${up_before}s -> ${up_after}s)"; else fail "compose restart: uptime ${up_before:-?}s -> ${up_after:-?}s"; fi
+cc -f "${LF}/c.yml" -p "${PROJ}" kill >/dev/null; sleep 2
+[[ "$(cstate)" == "stopped" ]] && pass "compose kill stops the container" || fail "compose kill: state='$(cstate)'"
+cc -f "${LF}/c.yml" -p "${PROJ}" start >/dev/null; sleep 2
+[[ "$(cc -f "${LF}/c.yml" -p "${PROJ}" port svc 2>&1)" != *"Unknown option"* ]] && pass "compose port runs for a service" || fail "compose port"
 [[ "$(cc "-f${LF}/c.yml" -p"${PROJ}" logs svc)" == *"from-svc"* ]] && pass "compose logs works with attached -fFILE/-pNAME forms" || fail "compose logs / attached short options"
 [[ "$(cc -f "${LF}/c.yml" -f "${LF}/c.yml" up 2>&1)" == *"multiple -f"* ]] && pass "repeating -f is rejected, not silently ignored" || fail "repeated -f accepted"
 cc -f "${LF}/c.yml" -p "${PROJ}" rm -f -s svc >/dev/null; [[ -z "$(cstate)" ]] && pass "compose rm -f -s removes the container" || fail "compose rm: '$(cstate)'"
+# Containers are named after the service, so these must run once the first project's `svc` is gone.
+CP="${PROJ}c"
+cc -f "${LF}/c.yml" -p "${CP}" create >/dev/null
+cst="$("${CONTAINER_BIN}" ps -a --filter "label=com.docker.compose.project=${CP}" --format '{{.Status}}' 2>/dev/null | grep -v '^Warning' | head -1)"
+[[ -n "${cst}" && "${cst}" != "running" ]] && pass "compose create makes the container without starting it (state=${cst})" || fail "compose create: state='${cst}'"
+cc -f "${LF}/c.yml" -p "${CP}" down -t 1 >/dev/null
+cc -f "${LF}/c.yml" -p "${CP}" up -d --build --wait >/dev/null; sleep 2
+[[ "$("${CONTAINER_BIN}" ps --filter "label=com.docker.compose.project=${CP}" --format '{{.Status}}' 2>/dev/null | grep -v '^Warning' | head -1)" == "running" ]] \
+    && pass "compose up -d --build --wait is accepted and starts the project" || fail "compose up --build --wait"
+cc -f "${LF}/c.yml" -p "${CP}" down -t 1 >/dev/null
 cc -f "${LF}/c.yml" -p "${PROJ}" down -t 1 >/dev/null; rm -rf "${LF}"
 
 # --- compose verbs must only ever act on THIS project's containers -------------------------------
