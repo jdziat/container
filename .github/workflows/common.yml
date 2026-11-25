@@ -149,17 +149,21 @@ jobs:
           echo "LOG_ROOT=${LOG_ROOT}" >> $GITHUB_ENV
 
       - name: Test the container project
-        if: ${{ !inputs.coverage }}
+        if: ${{ !inputs.coverage && vars.LIVE_GATE_ONLY != 'true' }}
         run: make APP_ROOT="${APP_ROOT}" LOG_ROOT="${LOG_ROOT}" test install-kernel integration
 
       - name: Test the container project with coverage
-        if: ${{ inputs.coverage }}
+        if: ${{ inputs.coverage && vars.LIVE_GATE_ONLY != 'true' }}
         run: make APP_ROOT="${APP_ROOT}" LOG_ROOT="${LOG_ROOT}" install-kernel coverage
 
       # Behavioral Docker/Podman parity: real commands, observable output. Runs in BOTH modes: PR
       # builds set coverage=true, and gating this on !coverage once made it skip on every PR. It stops
       # the system left by the test step above and starts its own on the isolated APP_ROOT. This is what keeps the parity matrix
       # honest; the older grep-based targets pass even when the build is broken.
+      # LIVE_GATE_ONLY=true (repository variable) skips upstream's long, VM-heavy integration/coverage
+      # suite and runs only the parity gate below. Intended for a fork whose self-hosted runner is also
+      # someone's everyday machine: that suite is not this project's gate, runs 30+ minutes, and once
+      # coincided with the runner losing its network connection. Leave it unset upstream.
       - name: Docker parity (behavioral)
         # Runs even when the upstream test step above failed, so a failure there cannot hide whether
         # this gate passes. The job as a whole still fails if either step fails.
@@ -167,7 +171,7 @@ jobs:
         run: make APP_ROOT="${APP_ROOT}" LOG_ROOT="${LOG_ROOT}" parity-behavioral
 
       - name: Extract coverage percentages
-        if: ${{ inputs.coverage }}
+        if: ${{ inputs.coverage && vars.LIVE_GATE_ONLY != 'true' }}
         env:
           PR_NUMBER: ${{ inputs.pr_number }}
         run: |
@@ -180,7 +184,7 @@ jobs:
           cat pr-coverage/*.txt
 
       - name: Upload coverage data
-        if: ${{ inputs.coverage }}
+        if: ${{ inputs.coverage && vars.LIVE_GATE_ONLY != 'true' }}
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: pr-coverage-${{ inputs.pr_number }}
@@ -189,7 +193,7 @@ jobs:
           if-no-files-found: warn
 
       - name: Upload coverage HTML reports
-        if: ${{ inputs.coverage }}
+        if: ${{ inputs.coverage && vars.LIVE_GATE_ONLY != 'true' }}
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: coverage-html-reports
