@@ -38,3 +38,10 @@ _serve/
 .test-scratch/
 scripts/parity/compose-corpus/10-immich/library/
 scripts/parity/compose-corpus/10-immich/postgres/
+
+# Local agent/editor tooling and test artifacts: never part of the project.
+/.semanta/
+/.nfs-export/
+/.cursor/
+/.opencode/
+/opencode.json

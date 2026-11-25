@@ -551,6 +551,59 @@ extension ContainerCompose {
     }
 }
 
+// MARK: - Project scoping (pure; unit-tested)
+
+/// Decides which containers and volumes belong to a compose project. Kept free of I/O so the
+/// destructive verbs (`rm`, `kill`, `down`, `--force-recreate`, `--remove-orphans`, `down -v`) can
+/// be tested without a running system. Everything here keys on the project's compose label: a
+/// resource that merely shares a service's name is never ours.
+enum ComposeScope {
+    static let projectLabel = "com.docker.compose.project"
+    static let serviceLabel = "com.docker.compose.service"
+
+    private static func rows(_ json: String) throws -> [[String: Any]] {
+        guard let data = json.data(using: .utf8),
+            let rows = try JSONSerialization.jsonObject(with: data) as? [[String: Any]]
+        else { throw ComposeError.commandFailed("list returned unparseable JSON") }
+        return rows
+    }
+
+    /// (name, id) of every container carrying this project's label.
+    static func ownedContainers(listJSON: String, project: String) throws -> [(name: String, id: String)] {
+        try rows(listJSON).compactMap { row in
+            guard extractLabels(row)[projectLabel] == project,
+                let cfg = row["configuration"] as? [String: Any], let id = cfg["id"] as? String
+            else { return nil }
+            return ((cfg["name"] as? String) ?? id, id)
+        }
+    }
+
+    /// Ids of project containers whose service is not declared in the file at all. A container of a
+    /// declared-but-profile-disabled service is not an orphan, and neither is one with no service
+    /// label (an unknown one is left alone rather than guessed at).
+    static func orphanContainerIDs(listJSON: String, project: String, declaredServices: Set<String>) throws -> [String] {
+        try rows(listJSON).compactMap { row in
+            let labels = extractLabels(row)
+            guard labels[projectLabel] == project, let service = labels[serviceLabel],
+                !declaredServices.contains(service),
+                let cfg = row["configuration"] as? [String: Any], let id = cfg["id"] as? String
+            else { return nil }
+            return id
+        }
+    }
+
+    /// Volumes `down -v` may delete: carry this project's label AND are declared by the file.
+    static func removableVolumeNames(listJSON: String, project: String, declared: Set<String>) throws -> [String] {
+        try rows(listJSON).compactMap { row in
+            guard extractLabels(row)[projectLabel] == project,
+                let cfg = row["configuration"] as? [String: Any], let name = cfg["name"] as? String,
+                declared.contains(name)
+            else { return nil }
+            return name
+        }
+    }
+}
+
 // MARK: - Planner
 
 struct ComposePlanner {
@@ -919,56 +972,25 @@ struct ComposePlanner {
 
         /// `--remove-orphans`: delete project containers whose service is not declared in the file.
         func removeOrphans() async throws {
-            // Docker's definition: a project container whose SERVICE is not declared in the file at
-            // all. Using the planned names instead would also catch containers of services a profile
-            // left out, and `compose run` one-offs, which carry the project label too.
-            let rows = try runContainer(["list", "-a", "--format", "json"])
-            guard let data = rows.data(using: .utf8),
-                let parsed = try JSONSerialization.jsonObject(with: data) as? [[String: Any]]
-            else { throw ComposeError.commandFailed("container list returned unparseable JSON") }
-            for row in parsed {
-                let labels = extractLabels(row)
-                guard labels["com.docker.compose.project"] == project,
-                    let service = labels["com.docker.compose.service"],
-                    !declaredServices.contains(service),
-                    let cfg = row["configuration"] as? [String: Any], let id = cfg["id"] as? String
-                else { continue }
-                _ = try? runContainer(["delete", "-f", id])
-            }
+            let ids = try ComposeScope.orphanContainerIDs(
+                listJSON: runContainer(["list", "-a", "--format", "json"]),
+                project: project, declaredServices: declaredServices)
+            for id in ids { _ = try? runContainer(["delete", "-f", id]) }
         }
 
         /// `down -v`: remove non-external named volumes declared by the project.
         func removeProjectVolumes() throws {
-            // Only volumes this project created (they carry its label). A declared `name:` that
-            // resolves to someone else's volume, or a volume from before labels existed, is left alone.
-            let json = try runContainer(["volume", "list", "--format", "json"])
-            guard let data = json.data(using: .utf8),
-                let rows = try JSONSerialization.jsonObject(with: data) as? [[String: Any]]
-            else { return }
             let declared = Set(volumes.values.filter { !$0.external }.map(\.name))
-            for row in rows where extractLabels(row)["com.docker.compose.project"] == project {
-                guard let cfg = row["configuration"] as? [String: Any], let name = cfg["name"] as? String,
-                    declared.contains(name)
-                else { continue }
-                _ = try? runContainer(["volume", "delete", name])
-            }
+            let names = try ComposeScope.removableVolumeNames(
+                listJSON: runContainer(["volume", "list", "--format", "json"]), project: project, declared: declared)
+            for name in names { _ = try? runContainer(["volume", "delete", name]) }
         }
 
         /// (name, id) of every container carrying this project's compose label. The single source of
         /// truth for "ours": anything that deletes or stops by name must stay inside this set.
         func projectContainerPairs() throws -> [(name: String, id: String)] {
-            let json = try runContainer(["list", "-a", "--format", "json"])
-            guard let data = json.data(using: .utf8),
-                let rows = try JSONSerialization.jsonObject(with: data) as? [[String: Any]]
-            else {
-                throw ComposeError.commandFailed("container list returned unparseable JSON")
-            }
-            var pairs: [(name: String, id: String)] = []
-            for row in rows where extractLabels(row)["com.docker.compose.project"] == project {
-                guard let cfg = row["configuration"] as? [String: Any], let id = cfg["id"] as? String else { continue }
-                pairs.append(((cfg["name"] as? String) ?? id, id))
-            }
-            return pairs
+            try ComposeScope.ownedContainers(
+                listJSON: runContainer(["list", "-a", "--format", "json"]), project: project)
         }
 
         /// Names AND ids of this project's containers (see ``projectContainerPairs``).

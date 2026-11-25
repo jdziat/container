@@ -187,6 +187,10 @@ var package = Package(
             ]
         ),
         .testTarget(
+            name: "ContainerComposeTests",
+            dependencies: ["container-compose"]
+        ),
+        .testTarget(
             name: "ClusterPluginTests",
             dependencies: [
                 "ContainerAPIClient",

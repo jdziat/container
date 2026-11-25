@@ -158,7 +158,7 @@ out="$(d ps -aq --filter "name=corpus-")"
 
 # --- compose lifecycle: real state transitions through Docker-style global options ---------------
 LF="$(mktemp -d)"; PROJ="corpuslife${SUFFIX}"
-printf 'services:\n  svc:\n    image: %s\n    command: ["sh","-c","echo from-svc; sleep 300"]\n' "${IMAGE}" >"${LF}/c.yml"
+printf 'services:\n  svc:\n    image: %s\n    command: ["sh","-c","echo from-svc; sleep 300"]\n    ports: ["18080:80"]\n' "${IMAGE}" >"${LF}/c.yml"
 cc() { "${CONTAINER_BIN}" compose "$@" 2>&1 | grep -v '^Warning! Running debug build'; }
 cstate() { "${CONTAINER_BIN}" ps -a --filter "label=com.docker.compose.project=${PROJ}" --format '{{.Status}}' 2>/dev/null | grep -v '^Warning' | head -1; }
 cc -f "${LF}/c.yml" -p "${PROJ}" up -d >/dev/null; sleep 3
@@ -178,7 +178,9 @@ if [[ -n "${up_before}" && -n "${up_after}" && "${up_before}" -ge 8 && "${up_aft
 cc -f "${LF}/c.yml" -p "${PROJ}" kill >/dev/null; sleep 2
 [[ "$(cstate)" == "stopped" ]] && pass "compose kill stops the container" || fail "compose kill: state='$(cstate)'"
 cc -f "${LF}/c.yml" -p "${PROJ}" start >/dev/null; sleep 2
-[[ "$(cc -f "${LF}/c.yml" -p "${PROJ}" port svc 2>&1)" != *"Unknown option"* ]] && pass "compose port runs for a service" || fail "compose port"
+# The fixture publishes 18080->80, so `compose port` must report that mapping, not merely not error.
+out="$(cc -f "${LF}/c.yml" -p "${PROJ}" port svc 2>&1)"
+[[ "${out}" == *"18080"* && "${out}" == *"80"* ]] && pass "compose port reports the published mapping" || fail "compose port did not report 18080->80: ${out:0:160}"
 [[ "$(cc "-f${LF}/c.yml" -p"${PROJ}" logs svc)" == *"from-svc"* ]] && pass "compose logs works with attached -fFILE/-pNAME forms" || fail "compose logs / attached short options"
 [[ "$(cc -f "${LF}/c.yml" -f "${LF}/c.yml" up 2>&1)" == *"multiple -f"* ]] && pass "repeating -f is rejected, not silently ignored" || fail "repeated -f accepted"
 cc -f "${LF}/c.yml" -p "${PROJ}" rm -f -s svc >/dev/null; [[ -z "$(cstate)" ]] && pass "compose rm -f -s removes the container" || fail "compose rm: '$(cstate)'"
