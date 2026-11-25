@@ -24,7 +24,9 @@ jobs:
   # containerization does for vminitd. The macOS job packages the artifact.
   buildClusterShim:
     name: Build cluster-shim
-    if: github.repository == 'apple/container'
+    # Runs upstream, or on a fork that has set the repository variable LIVE_GATE_ENABLED=true AFTER
+    # registering a self-hosted runner with the labels below. Off by default, so forks are unchanged.
+    if: github.repository == 'apple/container' || vars.LIVE_GATE_ENABLED == 'true'
     timeout-minutes: 30
     runs-on: ubuntu-24.04
     container: swift:6.3.0-noble
@@ -52,7 +54,9 @@ jobs:
 
   buildAndTest:
     name: Build and test the project
-    if: github.repository == 'apple/container'
+    # Runs upstream, or on a fork that has set the repository variable LIVE_GATE_ENABLED=true AFTER
+    # registering a self-hosted runner with the labels below. Off by default, so forks are unchanged.
+    if: github.repository == 'apple/container' || vars.LIVE_GATE_ENABLED == 'true'
     needs: buildClusterShim
     timeout-minutes: 90
     runs-on: [self-hosted, macos, goldengate, ARM64]
