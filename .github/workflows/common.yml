@@ -146,16 +146,16 @@ jobs:
         if: ${{ !inputs.coverage }}
         run: make APP_ROOT="${APP_ROOT}" LOG_ROOT="${LOG_ROOT}" test install-kernel integration
 
-      # Behavioral Docker/Podman parity: real commands, observable output. Runs against the same
-      # isolated APP_ROOT as the integration tests above. This is what keeps the parity matrix
-      # honest; the older grep-based targets pass even when the build is broken.
-      - name: Docker parity (behavioral)
-        if: ${{ !inputs.coverage }}
-        run: make APP_ROOT="${APP_ROOT}" LOG_ROOT="${LOG_ROOT}" parity-behavioral
-
       - name: Test the container project with coverage
         if: ${{ inputs.coverage }}
         run: make APP_ROOT="${APP_ROOT}" LOG_ROOT="${LOG_ROOT}" install-kernel coverage
+
+      # Behavioral Docker/Podman parity: real commands, observable output. Runs in BOTH modes: PR
+      # builds set coverage=true, and gating this on !coverage once made it skip on every PR. It stops
+      # the system left by the test step above and starts its own on the isolated APP_ROOT. This is what keeps the parity matrix
+      # honest; the older grep-based targets pass even when the build is broken.
+      - name: Docker parity (behavioral)
+        run: make APP_ROOT="${APP_ROOT}" LOG_ROOT="${LOG_ROOT}" parity-behavioral
 
       - name: Extract coverage percentages
         if: ${{ inputs.coverage }}
