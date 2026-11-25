@@ -1,0 +1,53 @@
+name: static parity checks
+
+# Runs on GitHub-hosted macOS, so it works on forks with no self-hosted runner.
+#
+# WHAT THIS IS: build, unit tests, the CLI-surface walk (every command's --help must parse), and
+# the compose doc-drift check. These catch compile breaks, argument-definition bugs and doc drift.
+#
+# WHAT THIS IS NOT: the live behavioral gate. `make parity-behavioral` boots real VMs and needs
+# macOS 26 on Apple silicon with Virtualization entitlements, which GitHub-hosted runners do not
+# provide (no nested virtualization). That gate runs from common.yml on the project's self-hosted
+# runner. A green run HERE is not evidence that Docker-parity behavior works; do not cite it as such.
+
+permissions:
+  contents: read
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+concurrency:
+  group: static-parity-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  static:
+    name: Build, unit tests, CLI surface, matrix drift
+    runs-on: macos-26
+    timeout-minutes: 60
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Select the newest installed Xcode
+        run: |
+          newest="$(ls -d /Applications/Xcode_26*.app 2>/dev/null | sort -V | tail -1)"
+          if [ -n "${newest}" ]; then
+            sudo xcode-select -s "${newest}/Contents/Developer"
+          fi
+          xcode-select -p
+          swift --version
+
+      - name: Build
+        run: swift build
+
+      - name: Unit tests
+        run: swift test --skip IntegrationTests
+
+      - name: CLI surface (every command must parse)
+        run: bash scripts/parity/cli-surface.sh
+
+      - name: Compose matrix drift
+        run: bash scripts/parity/compose-matrix-drift.sh
