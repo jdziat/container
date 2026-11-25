@@ -107,6 +107,16 @@ extension APIServer {
                         }
                     }
 
+                    if ContainerSystemConfig.wantsInCoreDockerSock(config: containerSystemConfig) {
+                        group.addTask {
+                            await Self.spawnInCoreDockerSock(
+                                pluginLoader: pluginLoader,
+                                log: log
+                            )
+                            return .success(())
+                        }
+                    }
+
                     // start up host table DNS
                     group.addTask {
                         let hostsResolver = ContainerDNSHandler(networkService: networkService)
@@ -308,6 +318,14 @@ extension APIServer {
             routes[XPCRoute.containerCopyOut] = XPCServer.route(harness.copyOut)
             routes[XPCRoute.containerExport] = XPCServer.route(harness.export)
             routes[XPCRoute.containerClean] = XPCServer.route(harness.clean)
+            routes[XPCRoute.containerEvent] = XPCServer.route(harness.events)
+            routes[XPCRoute.containerRename] = XPCServer.route(harness.rename)
+            routes[XPCRoute.containerUpdate] = XPCServer.route(harness.update)
+            routes[XPCRoute.containerPause] = XPCServer.route(harness.pause)
+            routes[XPCRoute.containerUnpause] = XPCServer.route(harness.unpause)
+            routes[XPCRoute.containerDiff] = XPCServer.route(harness.diff)
+            routes[XPCRoute.containerNetworkConnect] = XPCServer.route(harness.networkConnect)
+            routes[XPCRoute.containerNetworkDisconnect] = XPCServer.route(harness.networkDisconnect)
 
             return service
         }
@@ -394,6 +412,86 @@ extension APIServer {
             let harness = DiskUsageHarness(service: service, log: log)
 
             routes[XPCRoute.systemDiskUsage] = XPCServer.route(harness.get)
+        }
+
+        /// Opt-in E3: spawn `container-docker-api-bridge serve --privileged-sock`.
+        /// Application Support sock remains the default; fail soft if `/var/run` bind fails.
+        private static func spawnInCoreDockerSock(pluginLoader: PluginLoader, log: Logger) async {
+            let bridgeURL = resolveDockerAPIBridgeBinary(pluginLoader: pluginLoader)
+            guard let bridgeURL else {
+                log.warning(
+                    "CONTAINER_INCORE_DOCKER_SOCK / enginePrivilegedSock enabled but container-docker-api-bridge not found next to apiserver or in plugins; skipping in-core /var/run/docker.sock"
+                )
+                return
+            }
+            log.info(
+                "starting in-core docker.sock bridge (opt-in)",
+                metadata: [
+                    "binary": "\(bridgeURL.path)",
+                    "socket": "/var/run/docker.sock",
+                ]
+            )
+            let process = Process()
+            process.executableURL = bridgeURL
+            process.arguments = ["serve", "--privileged-sock"]
+            process.standardOutput = FileHandle.nullDevice
+            let errPipe = Pipe()
+            process.standardError = errPipe
+            do {
+                try process.run()
+            } catch {
+                log.warning(
+                    "in-core /var/run/docker.sock spawn failed; continuing with Application Support sock only",
+                    metadata: ["error": "\(error)"]
+                )
+                return
+            }
+            // Brief settle: if the process exits immediately, bind likely failed (permissions).
+            try? await Task.sleep(for: .milliseconds(400))
+            if !process.isRunning {
+                let errData = errPipe.fileHandleForReading.readDataToEndOfFile()
+                let errText = String(data: errData, encoding: .utf8)?
+                    .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+                log.warning(
+                    "in-core /var/run/docker.sock bind failed; continuing with Application Support sock only",
+                    metadata: [
+                        "exitStatus": "\(process.terminationStatus)",
+                        "stderr": "\(errText.prefix(400))",
+                    ]
+                )
+                return
+            }
+            log.info("in-core docker-api-bridge listening on unix:///var/run/docker.sock")
+            // Keep the Task alive for the process lifetime without failing the API server group.
+            await withCheckedContinuation { (cont: CheckedContinuation<Void, Never>) in
+                process.terminationHandler = { _ in
+                    cont.resume()
+                }
+            }
+            log.warning("in-core docker-api-bridge exited; Application Support sock remains available")
+        }
+
+        private static func resolveDockerAPIBridgeBinary(pluginLoader: PluginLoader) -> URL? {
+            let fm = FileManager.default
+            if let plugin = pluginLoader.findPlugin(name: "container-docker-api-bridge")
+                ?? pluginLoader.findPlugin(name: "docker-api-bridge"),
+                fm.isExecutableFile(atPath: plugin.binaryURL.path)
+            {
+                return plugin.binaryURL
+            }
+            // Prefer a sibling of container-apiserver (same install prefix).
+            let apiserver = URL(fileURLWithPath: CommandLine.arguments[0]).resolvingSymlinksInPath()
+            let siblingNames = [
+                "container-docker-api-bridge",
+                "docker-api-bridge",
+            ]
+            for name in siblingNames {
+                let candidate = apiserver.deletingLastPathComponent().appendingPathComponent(name)
+                if fm.isExecutableFile(atPath: candidate.path) {
+                    return candidate
+                }
+            }
+            return nil
         }
     }
 }

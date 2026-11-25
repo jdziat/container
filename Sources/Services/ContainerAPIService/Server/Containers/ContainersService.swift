@@ -49,7 +49,14 @@ public actor ContainersService {
     }
 
     private static let machServicePrefix = "com.apple.container"
-    private static let launchdDomainString = try! ServiceManager.getDomainString()
+    private static let launchdDomainString: String = {
+        do {
+            return try ServiceManager.getDomainString()
+        } catch {
+            // Launchd domain is required for plugin mach services; fail loud at process start.
+            fatalError("ContainersService: failed to resolve launchd domain: \(error)")
+        }
+    }()
 
     private let log: Logger
     private let debugHelpers: Bool
@@ -81,9 +88,23 @@ public actor ContainersService {
     /// Peer refreshes scheduled after an AsyncLock is released (queue so concurrent
     /// start/exit handoffs cannot overwrite each other).
     private var pendingPeerHostsRefresh: [(id: String, networks: Set<String>, retiredIPs: Set<String>)] = []
+    /// Lifecycle event fan-out for `container events`.
+    private let eventBus = ContainerEventBus()
 
     // FIXME: Find a better mechanism for services running on the APIServer to work with each other
     private weak var networksService: NetworksService?
+
+    /// Wait for lifecycle events with id greater than `since`.
+    public func events(since: UInt64) async -> [ContainerEvent] {
+        // Shorter than every client long-poll timeout so the server always answers first.
+        await eventBus.next(since: since, timeout: .seconds(20))
+    }
+
+    private func emitEvent(status: String, action: String, id: String, attributes: [String: String] = [:]) async {
+        var attrs = attributes
+        attrs["name"] = attrs["name"] ?? id
+        _ = await eventBus.publish(status: status, action: action, actorID: id, attributes: attrs)
+    }
 
     public init(
         appRoot: URL,
@@ -178,6 +199,23 @@ public actor ContainersService {
         }
     }
 
+    /// Move an unbootable bundle to `<appRoot>/orphaned-containers/` instead of deleting it.
+    static func quarantine(bundle: URL, root: URL, log: Logger) {
+        let destinationRoot = root.deletingLastPathComponent().appendingPathComponent("orphaned-containers")
+        let stamp = ISO8601DateFormatter().string(from: Date()).replacingOccurrences(of: ":", with: "-")
+        let destination = destinationRoot.appendingPathComponent("\(bundle.lastPathComponent)-\(stamp)")
+        do {
+            try FileManager.default.createDirectory(at: destinationRoot, withIntermediateDirectories: true)
+            try FileManager.default.moveItem(at: bundle, to: destination)
+            log.warning(
+                "container bundle has no runtime plugin; moved aside (not deleted)",
+                metadata: ["from": "\(bundle.path)", "to": "\(destination.path)"])
+        } catch {
+            // If it cannot be moved, leave it in place: never fall back to deleting.
+            log.error("could not quarantine container bundle", metadata: ["path": "\(bundle.path)", "error": "\(error)"])
+        }
+    }
+
     static func loadAtBoot(root: URL, loader: PluginLoader, log: Logger) async throws -> [String: ContainerState] {
         var directories = try FileManager.default.contentsOfDirectory(
             at: root,
@@ -190,10 +228,15 @@ public actor ContainersService {
         let runtimePlugins = loader.findPlugins().filter { $0.hasType(.runtime) }
         var results = [String: ContainerState]()
         for dir in directories {
+            // A bundle whose runtime plugin no longer exists can never boot, so it is dropped.
+            // Any other load failure (I/O, decode) may be transient and must not wipe durable
+            // container state, so those bundles are left in place for a later boot to retry.
+            var runtimeIsMissing = false
             do {
                 let (config, options) = try Self.getContainerConfiguration(at: dir)
 
                 guard let plugin = runtimePlugins.first(where: { $0.name == config.runtimeHandler }) else {
+                    runtimeIsMissing = true
                     throw ContainerizationError(
                         .internalError,
                         message: "failed to find runtime plugin \(config.runtimeHandler)"
@@ -241,7 +284,13 @@ public actor ContainersService {
                 )
                 results[config.id] = state
             } catch {
-                try? FileManager.default.removeItem(at: dir)
+                if runtimeIsMissing {
+                    // The bundle can never boot without its runtime, so take it out of `containers/`
+                    // (otherwise it is re-examined every boot). But "plugin not found" is an inference:
+                    // a half-finished upgrade or a momentarily malformed plugin config looks the same.
+                    // So move it aside rather than delete it; nothing is lost if the inference is wrong.
+                    Self.quarantine(bundle: dir, root: root, log: log)
+                }
                 log.warning(
                     "failed to load container",
                     metadata: [
@@ -284,7 +333,9 @@ public actor ContainersService {
             let snapshot = state.snapshot
 
             if !filters.ids.isEmpty {
-                guard filters.ids.contains(snapshot.id) else {
+                // `ids` accepts either the stable Id or the mutable Name (Name≠Id).
+                let name = snapshot.configuration.name
+                guard filters.ids.contains(snapshot.id) || filters.ids.contains(name) else {
                     return nil
                 }
             }
@@ -307,41 +358,42 @@ public actor ContainersService {
         }
     }
 
-    /// Execute an operation with the current container list while maintaining atomicity
-    /// This prevents race conditions where containers are created during the operation
+    /// Snapshot the container list under the lock, then run `operation` outside it
+    /// so callers cannot deadlock by re-entering ContainersService.
     public func withContainerList<T: Sendable>(
         logMetadata: Logger.Metadata? = nil,
         _ operation: @Sendable @escaping ([ContainerSnapshot]) async throws -> T
     ) async throws -> T {
-        try await lock.withLock(logMetadata: logMetadata) { context in
-            let snapshots = await self.containers.values.map { $0.snapshot }
-            return try await operation(snapshots)
+        let snapshots: [ContainerSnapshot] = await lock.withLock(logMetadata: logMetadata) { _ in
+            await self.containers.values.map { $0.snapshot }
         }
+        return try await operation(snapshots)
     }
 
     /// Calculate disk usage for containers
     /// - Returns: Tuple of (total count, active count, total size, reclaimable size)
     public func calculateDiskUsage() async -> (Int, Int, UInt64, UInt64) {
-        await lock.withLock(logMetadata: ["acquirer": "\(#function)"]) { _ in
+        // Snapshot on the actor (no AsyncLock re-entry), then size off-actor so
+        // FileManager I/O does not stall other container operations.
+        let root = self.containerRoot
+        let items: [(path: URL, running: Bool)] = self.containers.map { id, state in
+            (root.appendingPathComponent(id), state.snapshot.status == .running)
+        }
+        return await Task.detached(priority: .utility) {
             var totalSize: UInt64 = 0
             var reclaimableSize: UInt64 = 0
             var activeCount = 0
-
-            for (id, state) in await self.containers {
-                let bundlePath = self.containerRoot.appendingPathComponent(id)
-                let containerSize = FileManager.default.allocatedSize(of: bundlePath)
+            for item in items {
+                let containerSize = FileManager.default.allocatedSize(of: item.path)
                 totalSize += containerSize
-
-                if state.snapshot.status == .running {
+                if item.running {
                     activeCount += 1
                 } else {
-                    // Stopped containers are reclaimable
                     reclaimableSize += containerSize
                 }
             }
-
-            return (await self.containers.count, activeCount, totalSize, reclaimableSize)
-        }
+            return (items.count, activeCount, totalSize, reclaimableSize)
+        }.value
     }
 
     /// Get set of image references used by containers (for disk usage calculation)
@@ -382,12 +434,27 @@ public actor ContainersService {
                     message: "container already exists: \(configuration.id)"
                 )
             }
+            let newName = configuration.name.trimmingCharacters(in: .whitespacesAndNewlines)
+            if await self.containers.contains(where: {
+                $0.value.snapshot.configuration.name.trimmingCharacters(in: .whitespacesAndNewlines) == newName
+            }) {
+                throw ContainerizationError(
+                    .exists,
+                    message: "container name already in use: \(configuration.name.isEmpty ? "(empty)" : configuration.name)"
+                )
+            }
 
             var existingNetworks = [AttachmentConfiguration]()
             for container in await self.containers.values {
                 existingNetworks.append(contentsOf: container.snapshot.configuration.networks)
             }
             try AttachmentNameValidator.validate(networks: configuration.networks, existing: existingNetworks)
+            try Self.validateExclusiveNamedVolumes(
+                mounts: configuration.mounts,
+                newID: configuration.id,
+                existing: await self.containers,
+                log: self.log
+            )
 
             guard self.runtimePlugins.first(where: { $0.name == configuration.runtimeHandler }) != nil else {
                 throw ContainerizationError(
@@ -438,6 +505,9 @@ public actor ContainersService {
                 )
 
                 try runtimeConfig.writeRuntimeConfiguration()
+                // Also write bundle config.json so load prefers a durable copy if
+                // runtime-config.json is lost before any later persistConfiguration.
+                try ContainerResource.Bundle(path: path).set(configuration: configuration)
 
                 let snapshot = ContainerSnapshot(
                     configuration: configuration,
@@ -446,6 +516,7 @@ public actor ContainersService {
                     startedDate: nil
                 )
                 await self.setContainerState(configuration.id, ContainerState(snapshot: snapshot), context: context)
+                await self.emitEvent(status: "create", action: "create", id: configuration.id)
             } catch {
                 throw error
             }
@@ -485,6 +556,12 @@ public actor ContainersService {
             let path = self.containerRoot.appendingPathComponent(id)
             let (config, _) = try Self.getContainerConfiguration(at: path)
             try AttachmentNameValidator.validateStored(id: id, networks: config.networks)
+            try Self.validateExclusiveNamedVolumes(
+                mounts: config.mounts,
+                newID: id,
+                existing: await self.containers,
+                log: self.log
+            )
 
             var networkBootstrapInfos = [NetworkBootstrapInfo]()
             for n in config.networks {
@@ -546,6 +623,7 @@ public actor ContainersService {
         config: ProcessConfiguration,
         stdio: [FileHandle?]
     ) async throws {
+        let id = try self.resolveID(id)
         log.debug(
             "ContainersService: enter",
             metadata: [
@@ -683,6 +761,7 @@ public actor ContainersService {
                     state.snapshot.configuration.healthStatus = .starting
                 }
                 await self.setContainerState(id, state, context: context)
+                await self.emitEvent(status: "start", action: "start", id: id)
                 await self.startHealthMonitor(id: id)
                 // Peer refresh runs after this lock is released (see below).
                 await self.enqueuePendingPeerHostsRefresh(
@@ -721,6 +800,7 @@ public actor ContainersService {
             )
         }
 
+        let id = try self.resolveID(id)
         let state = try self._getContainerState(id: id)
         let client = try state.getClient()
         try await client.kill(processID, signal: signal)
@@ -733,6 +813,7 @@ public actor ContainersService {
     /// Stop all containers inside the sandbox, aborting any processes currently
     /// executing inside the container, before stopping the underlying sandbox.
     public func stop(id: String, options: ContainerStopOptions) async throws {
+        let id = try self.resolveID(id)
         log.debug(
             "ContainersService: enter",
             metadata: [
@@ -907,6 +988,7 @@ public actor ContainersService {
             )
         }
 
+        let id = try self.resolveID(id)
         let state = try self._getContainerState(id: id)
         let client = try state.getClient()
         return try await client.dial(port)
@@ -934,6 +1016,7 @@ public actor ContainersService {
             )
         }
 
+        let id = try self.resolveID(id)
         let state = try self._getContainerState(id: id)
         let client = try state.getClient()
         return try await client.wait(processID)
@@ -960,6 +1043,7 @@ public actor ContainersService {
             )
         }
 
+        let id = try self.resolveID(id)
         let state = try self._getContainerState(id: id)
         let client = try state.getClient()
         try await client.resize(processID, size: size)
@@ -989,6 +1073,7 @@ public actor ContainersService {
         // first try and get the container state so we get a nicer error message
         // (container foo not found) however.
         do {
+            let id = try self.resolveID(id)
             _ = try _getContainerState(id: id)
             let path = self.containerRoot.appendingPathComponent(id)
             let bundle = ContainerResource.Bundle(path: path)
@@ -999,6 +1084,8 @@ public actor ContainersService {
                 try self.openLog(bundle.containerLog, of: id),
                 try self.openLog(bundle.bootlog, of: id),
             ]
+        } catch let err as ContainerizationError where err.code == .notFound {
+            throw err
         } catch {
             throw ContainerizationError(
                 .internalError,
@@ -1052,6 +1139,7 @@ public actor ContainersService {
     public func copyIn(id: String, source: String, destination: String, mode: UInt32, createParents: Bool = true) async throws {
         self.log.debug("\(#function)")
 
+        let id = try self.resolveID(id)
         let state = try self._getContainerState(id: id)
         guard state.snapshot.status == .running else {
             throw ContainerizationError(.invalidState, message: "container \(id) is not running")
@@ -1064,6 +1152,7 @@ public actor ContainersService {
     public func copyOut(id: String, source: String, destination: String, createParents: Bool = true) async throws {
         self.log.debug("\(#function)")
 
+        let id = try self.resolveID(id)
         let state = try self._getContainerState(id: id)
         guard state.snapshot.status == .running else {
             throw ContainerizationError(.invalidState, message: "container \(id) is not running")
@@ -1074,6 +1163,7 @@ public actor ContainersService {
 
     /// Get statistics for the container.
     public func stats(id: String) async throws -> ContainerStats {
+        let id = try self.resolveID(id)
         log.debug(
             "ContainersService: enter",
             metadata: [
@@ -1116,21 +1206,22 @@ public actor ContainersService {
             )
         }
 
+        let id = try self.resolveID(id)
         let state = try self._getContainerState(id: id)
         switch state.snapshot.status {
-        case .running:
+        case .running, .paused:
             if !force {
                 throw ContainerizationError(
                     .invalidState,
                     message: "container \(id) is \(state.snapshot.status) and can not be deleted"
                 )
             }
-            let opts = ContainerStopOptions(
-                timeoutInSeconds: 5,
-                signal: "SIGKILL"
+            // Route through stop() so intentionalStops / exit-monitor coordination
+            // runs before cleanup (avoids treating force-delete as a crash restart).
+            try await self.stop(
+                id: id,
+                options: ContainerStopOptions(timeoutInSeconds: 5, signal: "SIGKILL")
             )
-            let client = try state.getClient()
-            try await client.stop(options: opts)
             try await self.lock.withLock(logMetadata: ["acquirer": "\(#function)", "id": "\(id)"]) { context in
                 self.log.info(
                     "ContainersService: attempt cleanup",
@@ -1178,6 +1269,7 @@ public actor ContainersService {
             )
         }
 
+        let id = try self.resolveID(id)
         let containerPath = self.containerRoot.appendingPathComponent(id).path
 
         return FileManager.default.allocatedSize(of: URL(fileURLWithPath: containerPath))
@@ -1186,7 +1278,7 @@ public actor ContainersService {
     public func exportRootfs(id: String, archive: URL) async throws {
         self.log.debug("\(#function)")
 
-        let state = try self._getContainerState(id: id)
+        let (id, state) = try self.resolvedContainer(idOrName: id)
         let path = self.containerRoot.appendingPathComponent(id)
         let bundle = ContainerResource.Bundle(path: path)
         let rootfs = bundle.containerRootfsBlock
@@ -1198,6 +1290,11 @@ public actor ContainersService {
             defer { try? FileManager.default.removeItem(at: snapshot) }
             try await client.snapshotDisk(imagePath: rootfs.path, destinationPath: snapshot.path)
             try EXT4.EXT4Reader(blockDevice: FilePath(snapshot)).export(archive: FilePath(archive))
+        case .paused:
+            let snapshot = rootfs.appendingPathExtension("snapshot")
+            defer { try? FileManager.default.removeItem(at: snapshot) }
+            try FileManager.default.copyItem(at: rootfs, to: snapshot)
+            try EXT4.EXT4Reader(blockDevice: FilePath(snapshot)).export(archive: FilePath(archive))
         case .stopped:
             try EXT4.EXT4Reader(blockDevice: FilePath(rootfs)).export(archive: FilePath(archive))
         default:
@@ -1208,7 +1305,7 @@ public actor ContainersService {
     public func clean(id: String) async throws {
         self.log.debug("\(#function)")
 
-        let state = try self._getContainerState(id: id)
+        let (id, state) = try self.resolvedContainer(idOrName: id)
         guard state.snapshot.status == .running else {
             throw ContainerizationError(.invalidState, message: "container is not running")
         }
@@ -1243,6 +1340,7 @@ public actor ContainersService {
     ) {
         self.pendingPeerHostsRefresh.append(value)
     }
+
 
     private func drainPendingPeerHostsRefresh() -> [(id: String, networks: Set<String>, retiredIPs: Set<String>)] {
         let values = self.pendingPeerHostsRefresh
@@ -1336,6 +1434,7 @@ public actor ContainersService {
         state.snapshot.networks = []
         state.client = nil
         await self.setContainerState(id, state, context: context)
+        await self.emitEvent(status: "die", action: "die", id: id)
         // Caller schedules peer refresh after releasing AsyncLock.
 
         let options = try getContainerCreationOptions(id: id)
@@ -1784,17 +1883,11 @@ public actor ContainersService {
             return
         }
 
+        // Only peers belong in the managed block. Putting this container's own
+        // addresses into managedIPs makes the first unmarked merge drop the
+        // bootstrap self line, so a concurrent peer can appear before identity
+        // (and break tests that expect localhost then self).
         var peerLines: [String] = []
-        for attachment in state.snapshot.networks {
-            let aliases =
-                state.snapshot.configuration.networks
-                .first(where: { $0.network == attachment.network })?
-                .options.aliases ?? []
-            let hostnames = PeerHostEntry.hostnames(fromHostname: attachment.hostname, aliases: aliases)
-            let ip = attachment.ipv4Address.address.description
-            guard !ip.isEmpty, !hostnames.isEmpty else { continue }
-            peerLines.append("\(ip)\t\(hostnames.joined(separator: "\t"))")
-        }
         for peer in self.peerHostEntries(for: state.snapshot.configuration, excluding: id) {
             peerLines.append("\(peer.ipAddress)\t\(peer.hostnames.joined(separator: "\t"))")
         }
@@ -1852,11 +1945,13 @@ public actor ContainersService {
                 _ = try? await client.wait(cleanupID)
                 return
             }
+            // Write beside /etc/hosts then `mv` so the publish is atomic on the guest FS.
+            let hostsNew = "/etc/hosts.container-new"
             let install = rootUtility(
-                "/usr/bin/install", ["-o", "root", "-g", "root", "-m", "644", staged, "/etc/hosts"])
+                "/usr/bin/install", ["-o", "root", "-g", "root", "-m", "644", staged, hostsNew])
             let processID = "hosts-\(UUID().uuidString.lowercased())"
-            let removeStagedFile: () async -> Void = {
-                let cleanup = rootUtility("/bin/rm", ["-f", staged])
+            let removeTemps: () async -> Void = {
+                let cleanup = rootUtility("/bin/rm", ["-f", staged, hostsNew])
                 let cleanupID = "hosts-rm-\(UUID().uuidString.lowercased())"
                 try? await client.createProcess(cleanupID, config: cleanup, stdio: [nil, nil, nil])
                 try? await client.startProcess(cleanupID)
@@ -1865,28 +1960,40 @@ public actor ContainersService {
             do {
                 try await client.createProcess(processID, config: install, stdio: [nil, nil, nil])
             } catch {
-                await removeStagedFile()
+                await removeTemps()
                 throw error
             }
             // Re-check immediately before mutating /etc/hosts so a newer refresh wins.
             guard self.hostsRefreshGenerations[id] == generation,
                 self.containers[id]?.snapshot.status == .running
             else {
-                await removeStagedFile()
+                await removeTemps()
                 return
             }
             do {
                 try await client.startProcess(processID)
-                let status = try await client.wait(processID)
-                await removeStagedFile()
-                guard status.exitCode == 0 else {
+                let installStatus = try await client.wait(processID)
+                guard installStatus.exitCode == 0 else {
+                    await removeTemps()
                     throw ContainerizationError(
                         .internalError,
-                        message: "install /etc/hosts failed with rc \(status.exitCode)"
+                        message: "install /etc/hosts staging failed with rc \(installStatus.exitCode)"
+                    )
+                }
+                let move = rootUtility("/bin/mv", ["-f", hostsNew, "/etc/hosts"])
+                let moveID = "hosts-mv-\(UUID().uuidString.lowercased())"
+                try await client.createProcess(moveID, config: move, stdio: [nil, nil, nil])
+                try await client.startProcess(moveID)
+                let moveStatus = try await client.wait(moveID)
+                await removeTemps()
+                guard moveStatus.exitCode == 0 else {
+                    throw ContainerizationError(
+                        .internalError,
+                        message: "mv /etc/hosts failed with rc \(moveStatus.exitCode)"
                     )
                 }
             } catch {
-                await removeStagedFile()
+                await removeTemps()
                 throw error
             }
             self.log.info("refreshed peer hosts", metadata: ["id": "\(id)"])
@@ -2018,6 +2125,7 @@ public actor ContainersService {
         }
 
         self.containers.removeValue(forKey: id)
+        await self.emitEvent(status: "destroy", action: "destroy", id: id)
     }
 
     private func cleanUp(id: String, context: AsyncLock.Context) async throws {
@@ -2068,9 +2176,9 @@ public actor ContainersService {
         try self._getContainerState(id: id)
     }
 
+    /// Looks up by stable Id only. Call ``resolveID`` first when the caller may pass a Name.
     private func _getContainerState(id: String) throws -> ContainerState {
-        let state = self.containers[id]
-        guard let state else {
+        guard let state = self.containers[id] else {
             throw ContainerizationError(
                 .notFound,
                 message: "container with ID \(id) not found"
@@ -2079,8 +2187,477 @@ public actor ContainersService {
         return state
     }
 
+    /// Resolve Id-or-Name then return the canonical Id with its in-memory state.
+    private func resolvedContainer(idOrName: String) throws -> (id: String, state: ContainerState) {
+        let id = try self.resolveID(idOrName)
+        return (id, try self._getContainerState(id: id))
+    }
+
+    /// Resolve a caller-supplied Id or Name to the stable container Id.
+    public func resolveID(_ idOrName: String) throws -> String {
+        let key = idOrName.trimmingCharacters(in: .whitespacesAndNewlines)
+        if self.containers[key] != nil {
+            return key
+        }
+        if let match = self.containers.first(where: {
+            $0.value.snapshot.configuration.name.trimmingCharacters(in: .whitespacesAndNewlines) == key
+        }) {
+            return match.key
+        }
+        throw ContainerizationError(
+            .notFound,
+            message: "container with ID or name \(idOrName) not found"
+        )
+    }
+
+    /// Attach a container to a network.
+    ///
+    /// Running containers prefer ``RuntimeClient/hotplugNetwork`` (CR or VZ spare-NIC swap).
+    /// On failure, fall back to transparent stop+start. Disable with `CONTAINER_NET_HOTPLUG=0`.
+    /// `restartIfRunning` is accepted for CLI compatibility but no longer required.
+    public func networkConnect(
+        idOrName: String,
+        network: String,
+        aliases: [String],
+        restartIfRunning: Bool
+    ) async throws {
+        _ = restartIfRunning
+        guard let networksService = self.networksService else {
+            throw ContainerizationError(.invalidState, message: "networks service is not available")
+        }
+        let networks = try await networksService.list()
+        guard let networkResource = networks.first(where: { $0.id == network || $0.name == network }) else {
+            throw ContainerizationError(.notFound, message: "network \(network) not found")
+        }
+        let networkID = networkResource.id
+
+        let pending = try await self.lock.withLock(logMetadata: ["acquirer": "\(#function)", "id": "\(idOrName)"]) {
+            [self] context -> (id: String, needsRestart: Bool, attachment: AttachmentConfiguration, client: RuntimeClient?) in
+            let id = try await self.resolveID(idOrName)
+            var state = try await self.getContainerState(id: id, context: context)
+            if state.snapshot.configuration.networks.contains(where: { $0.network == networkID }) {
+                throw ContainerizationError(.exists, message: "container \(id) already connected to \(network)")
+            }
+            let hostname = state.snapshot.configuration.name
+            let attachment = AttachmentConfiguration(
+                network: networkID,
+                options: AttachmentOptions(hostname: hostname, aliases: aliases)
+            )
+            let existing = await self.containers.values
+                .filter { $0.snapshot.configuration.id != id }
+                .flatMap { $0.snapshot.configuration.networks }
+            try AttachmentNameValidator.validate(
+                networks: state.snapshot.configuration.networks + [attachment],
+                existing: existing
+            )
+            let needsRestart = state.snapshot.status == .running
+            state.snapshot.configuration.networks.append(attachment)
+            try Self.persistConfiguration(state.snapshot.configuration, id: id, containerRoot: self.containerRoot)
+            await self.setContainerState(id, state, context: context)
+            await self.emitEvent(
+                status: "connect", action: "connect", id: id,
+                attributes: ["network": networkID])
+            return (id, needsRestart, attachment, try? state.getClient())
+        }
+        if pending.needsRestart {
+            if Self.preferCRNetHotplug(), let client = pending.client {
+                do {
+                    let pluginName = try await networksService.plugin(for: networkID)
+                    try await client.hotplugNetwork(
+                        attachment: pending.attachment,
+                        plugin: .init(plugin: pluginName)
+                    )
+                    // Refresh live attachment list so inspect/status shows the new NIC.
+                    if let sandbox = try? await client.state() {
+                        try await self.lock.withLock(logMetadata: ["acquirer": "hotplug-refresh", "id": "\(pending.id)"]) {
+                            [self] context in
+                            var state = try await self.getContainerState(id: pending.id, context: context)
+                            state.snapshot.networks = sandbox.networks
+                            await self.setContainerState(pending.id, state, context: context)
+                        }
+                    }
+                    self.log.info("networkConnect used live hotplug", metadata: ["id": "\(pending.id)", "network": "\(networkID)"])
+                    return
+                } catch {
+                    self.log.warning(
+                        "net hotplug failed; falling back to auto-restart",
+                        metadata: ["id": "\(pending.id)", "error": "\(error)"]
+                    )
+                    // Strict mode: surface the live-hotplug failure instead of masking it
+                    // behind stop+start (R1 diagnostics / harness).
+                    if ProcessInfo.processInfo.environment["CONTAINER_NET_HOTPLUG_STRICT"] == "1" {
+                        throw error
+                    }
+                }
+            }
+            try await self.stop(id: pending.id, options: .default)
+            try await self.bootstrap(id: pending.id, stdio: [nil, nil, nil], dynamicEnv: [:])
+            try await self.startProcess(id: pending.id, processID: pending.id)
+        }
+    }
+
+    /// Whether to try live NIC hotplug before auto-restart on `network connect`.
+    ///
+    /// Default **on** for CR and VZ (R1). Disable with `CONTAINER_NET_HOTPLUG=0`.
+    private static func preferCRNetHotplug() -> Bool {
+        let env = ProcessInfo.processInfo.environment
+        if env["CONTAINER_NET_HOTPLUG"] == "0" { return false }
+        return true
+    }
+
+    /// Detach a container from a network.
+    ///
+    /// Secondary NICs prefer live ``RuntimeClient/unplugNetwork`` (R1); primary still
+    /// stop+starts so the default route/ports stay coherent.
+    public func networkDisconnect(
+        idOrName: String,
+        network: String,
+        restartIfRunning: Bool,
+        force: Bool
+    ) async throws {
+        _ = restartIfRunning
+        let networkID: String
+        if let networksService = self.networksService,
+            let match = try await networksService.list().first(where: { $0.id == network || $0.name == network })
+        {
+            networkID = match.id
+        } else {
+            networkID = network
+        }
+        let pending = try await self.lock.withLock(logMetadata: ["acquirer": "\(#function)", "id": "\(idOrName)"]) {
+            [self] context -> (id: String, needsRestart: Bool, client: RuntimeClient?, unplugID: String?)? in
+            let id = try await self.resolveID(idOrName)
+            var state = try await self.getContainerState(id: id, context: context)
+            let before = state.snapshot.configuration.networks.count
+            let primaryNetwork = state.snapshot.configuration.networks.first?.network
+            guard let index = state.snapshot.configuration.networks.firstIndex(where: {
+                $0.network == networkID || $0.network == network
+            })
+            else {
+                if force { return nil }
+                throw ContainerizationError(
+                    .notFound, message: "container \(id) is not connected to \(network)")
+            }
+            // The first attachment is the primary NIC (default route + published ports).
+            let removing = state.snapshot.configuration.networks[index].network
+            if removing == primaryNetwork && before > 1 && !force {
+                throw ContainerizationError(
+                    .invalidState,
+                    message: "cannot disconnect primary network \(network) while other networks remain; disconnect secondaries first or pass --force"
+                )
+            }
+            let running = state.snapshot.status == .running
+            let secondary = index > 0
+            let preferUnplug = Self.preferCRNetHotplug() && secondary && running
+            let needsRestart = running && !preferUnplug
+            state.snapshot.configuration.networks.remove(at: index)
+            if preferUnplug {
+                // Drop matching live attachment from snapshot eagerly; runtime unplug refreshes.
+                state.snapshot.networks.removeAll { $0.network == removing }
+            }
+            try Self.persistConfiguration(state.snapshot.configuration, id: id, containerRoot: self.containerRoot)
+            await self.setContainerState(id, state, context: context)
+            await self.emitEvent(
+                status: "disconnect", action: "disconnect", id: id,
+                attributes: ["network": network])
+            return (id, needsRestart, try? state.getClient(), preferUnplug ? removing : nil)
+        }
+        guard let pending else { return }
+        if let unplugID = pending.unplugID, let client = pending.client {
+            do {
+                try await client.unplugNetwork(networkID: unplugID)
+                if let sandbox = try? await client.state() {
+                    try await self.lock.withLock(logMetadata: ["acquirer": "unplug-refresh", "id": "\(pending.id)"]) {
+                        [self] context in
+                        var state = try await self.getContainerState(id: pending.id, context: context)
+                        state.snapshot.networks = sandbox.networks
+                        await self.setContainerState(pending.id, state, context: context)
+                    }
+                }
+                self.log.info("networkDisconnect used live unplug", metadata: ["id": "\(pending.id)", "network": "\(unplugID)"])
+                return
+            } catch {
+                self.log.warning(
+                    "net unplug failed; falling back to auto-restart",
+                    metadata: ["id": "\(pending.id)", "error": "\(error)"]
+                )
+                if ProcessInfo.processInfo.environment["CONTAINER_NET_HOTPLUG_STRICT"] == "1" {
+                    throw error
+                }
+                try await self.stop(id: pending.id, options: .default)
+                try await self.bootstrap(id: pending.id, stdio: [nil, nil, nil], dynamicEnv: [:])
+                try await self.startProcess(id: pending.id, processID: pending.id)
+                return
+            }
+        }
+        if pending.needsRestart {
+            try await self.stop(id: pending.id, options: .default)
+            try await self.bootstrap(id: pending.id, stdio: [nil, nil, nil], dynamicEnv: [:])
+            try await self.startProcess(id: pending.id, processID: pending.id)
+        }
+    }
+
+    /// Apply a partial configuration update. CPU/memory changes on a running
+    /// container are persisted and take effect on the next start; restart policy
+    /// applies immediately.
+    public func update(idOrName: String, request: ContainerUpdateRequest) async throws {
+        try await self.lock.withLock(logMetadata: ["acquirer": "\(#function)", "id": "\(idOrName)"]) { [self] context in
+            let id = try await self.resolveID(idOrName)
+            var state = try await self.getContainerState(id: id, context: context)
+            if let cpus = request.cpus {
+                try ContainerConfiguration.Resources.validate(cpus: Int64(cpus))
+                state.snapshot.configuration.resources.cpus = cpus
+            }
+            if let memory = request.memoryInBytes {
+                try ContainerConfiguration.Resources.validate(memoryInBytes: memory)
+                state.snapshot.configuration.resources.memoryInBytes = memory
+            }
+            if let policy = request.restartPolicy {
+                state.snapshot.configuration.restartPolicy = policy
+                state.snapshot.configuration.restartMaxRetries = request.restartMaxRetries
+            }
+            try Self.persistConfiguration(state.snapshot.configuration, id: id, containerRoot: self.containerRoot)
+            await self.setContainerState(id, state, context: context)
+            await self.emitEvent(status: "update", action: "update", id: id)
+        }
+    }
+
+    /// Suspend the container VM (Docker `pause`).
+    public func pause(idOrName: String) async throws {
+        try await self.lock.withLock(logMetadata: ["acquirer": "\(#function)", "id": "\(idOrName)"]) { [self] context in
+            let id = try await self.resolveID(idOrName)
+            var state = try await self.getContainerState(id: id, context: context)
+            switch state.snapshot.status {
+            case .paused:
+                return
+            case .running:
+                break
+            default:
+                throw ContainerizationError(
+                    .invalidState,
+                    message: "container \(id) is \(state.snapshot.status) and cannot be paused"
+                )
+            }
+            let client = try state.getClient()
+            try await client.pause()
+            state.snapshot.status = .paused
+            await self.setContainerState(id, state, context: context)
+            await self.emitEvent(status: "pause", action: "pause", id: id)
+        }
+    }
+
+    /// Resume a paused container VM (Docker `unpause`).
+    public func unpause(idOrName: String) async throws {
+        try await self.lock.withLock(logMetadata: ["acquirer": "\(#function)", "id": "\(idOrName)"]) { [self] context in
+            let id = try await self.resolveID(idOrName)
+            var state = try await self.getContainerState(id: id, context: context)
+            switch state.snapshot.status {
+            case .running:
+                return
+            case .paused:
+                break
+            default:
+                throw ContainerizationError(
+                    .invalidState,
+                    message: "container \(id) is \(state.snapshot.status) and cannot be unpaused"
+                )
+            }
+            let client = try state.getClient()
+            try await client.resume()
+            state.snapshot.status = .running
+            await self.setContainerState(id, state, context: context)
+            await self.emitEvent(status: "unpause", action: "unpause", id: id)
+        }
+    }
+
+    /// Filesystem changes vs the image snapshot (Docker `diff`).
+    public func diff(idOrName: String) async throws -> [ContainerDiffChange] {
+        // Capture a stable block + image refs under the service lock so stop/delete
+        // cannot tear down the client mid-snapshotDisk.
+        let prepared = try await self.lock.withLock(
+            logMetadata: ["acquirer": "\(#function)", "id": "\(idOrName)"]
+        ) { [self] context -> (id: String, containerBlock: URL, snapshotCleanup: URL?, image: ImageDescription, platform: Platform) in
+            let id = try await self.resolveID(idOrName)
+            let state = try await self.getContainerState(id: id, context: context)
+            let path = self.containerRoot.appendingPathComponent(id)
+            let bundle = ContainerResource.Bundle(path: path)
+            let rootfs = bundle.containerRootfsBlock
+            let image = state.snapshot.configuration.image
+            let platform = state.snapshot.configuration.platform
+
+            switch state.snapshot.status {
+            case .running:
+                let client = try state.getClient()
+                let snapshot = rootfs.appendingPathExtension("diff-snapshot")
+                try await client.snapshotDisk(imagePath: rootfs.path, destinationPath: snapshot.path)
+                return (id, snapshot, snapshot, image, platform)
+            case .paused:
+                // VM suspended — host copy is consistent without a guest freeze.
+                let snapshot = rootfs.appendingPathExtension("diff-snapshot")
+                try FileManager.default.copyItem(at: rootfs, to: snapshot)
+                return (id, snapshot, snapshot, image, platform)
+            case .stopped:
+                return (id, rootfs, nil, image, platform)
+            default:
+                throw ContainerizationError(
+                    .invalidState, message: "container must be running, paused, or stopped to diff")
+            }
+        }
+        defer {
+            if let snapshotCleanup = prepared.snapshotCleanup {
+                try? FileManager.default.removeItem(at: snapshotCleanup)
+            }
+        }
+
+        let image = ClientImage(description: prepared.image)
+        let imageFs = try await image.getSnapshot(platform: prepared.platform)
+        guard imageFs.isBlock else {
+            throw ContainerizationError(
+                .invalidState, message: "image snapshot for \(prepared.id) is not a block filesystem")
+        }
+
+        let containerReader = try EXT4.EXT4Reader(blockDevice: FilePath(prepared.containerBlock.path))
+        let imageReader = try EXT4.EXT4Reader(blockDevice: FilePath(imageFs.source))
+        let containerInv = try Self.ext4Inventory(containerReader)
+        let imageInv = try Self.ext4Inventory(imageReader)
+
+        var changes: [ContainerDiffChange] = []
+        for (path, meta) in containerInv {
+            if let base = imageInv[path] {
+                if base.size != meta.size || base.mtime != meta.mtime {
+                    changes.append(ContainerDiffChange(kind: .changed, path: path))
+                }
+            } else {
+                changes.append(ContainerDiffChange(kind: .added, path: path))
+            }
+        }
+        for path in imageInv.keys where containerInv[path] == nil {
+            changes.append(ContainerDiffChange(kind: .deleted, path: path))
+        }
+        changes.sort { $0.path < $1.path }
+        return changes
+    }
+
+    private static func ext4Inventory(
+        _ reader: EXT4.EXT4Reader
+    ) throws -> [String: (size: UInt64, mtime: UInt32)] {
+        var result: [String: (size: UInt64, mtime: UInt32)] = [:]
+        func walk(_ dir: FilePath) throws {
+            for name in try reader.listDirectory(dir) {
+                let child = dir.join(name)
+                let (_, inode) = try reader.stat(child, followSymlinks: false)
+                let pathStr = child.description
+                // EXT4.FileModeFlag.rawValue is package-internal; use POSIX S_IFMT / S_IFDIR.
+                let isDirectory = inode.mode & 0xF000 == 0x4000
+                let size = (UInt64(inode.sizeHigh) << 32) | UInt64(inode.sizeLow)
+                // Include directories so add/delete/mtime changes surface in `container diff`.
+                result[pathStr] = (size, inode.mtime)
+                if isDirectory {
+                    try walk(child)
+                }
+            }
+        }
+        try walk(FilePath("/"))
+        return result
+    }
+
+    /// Change the user-facing Name of a container (Id stays fixed).
+    public func rename(idOrName: String, newName: String) async throws {
+        let trimmedName = newName.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard ManagedContainer.nameValid(trimmedName) else {
+            throw ContainerizationError(.invalidArgument, message: "container name \(newName) is not a valid container name")
+        }
+        try await self.lock.withLock(logMetadata: ["acquirer": "\(#function)", "id": "\(idOrName)"]) { [self] context in
+            let id = try await self.resolveID(idOrName)
+            if let other = await self.containers.first(where: {
+                $0.value.snapshot.configuration.name.trimmingCharacters(in: .whitespacesAndNewlines)
+                    == trimmedName && $0.key != id
+            }) {
+                throw ContainerizationError(
+                    .exists,
+                    message: "container name \(trimmedName) already in use by \(other.key)"
+                )
+            }
+            var state = try await self.getContainerState(id: id, context: context)
+            state.snapshot.configuration.name = trimmedName
+            try Self.persistConfiguration(state.snapshot.configuration, id: id, containerRoot: self.containerRoot)
+            await self.setContainerState(id, state, context: context)
+            await self.emitEvent(
+                status: "rename", action: "rename", id: id,
+                attributes: ["name": trimmedName])
+        }
+    }
+
     private static func isInitProcess(id: String, processID: String) -> Bool {
         id == processID
+    }
+
+    /// Persist configuration into both the bundle (canonical on load) and runtime-config.json.
+    /// Bundle is written first so a failure mid-update still loads the new config next boot.
+    private static func persistConfiguration(
+        _ configuration: ContainerConfiguration, id: String, containerRoot: URL
+    ) throws {
+        let path = containerRoot.appendingPathComponent(id)
+        try ContainerResource.Bundle(path: path).set(configuration: configuration)
+        if let runtime = try? RuntimeConfiguration.readRuntimeConfiguration(from: path) {
+            let updated = RuntimeConfiguration(
+                path: runtime.path,
+                initialFilesystem: runtime.initialFilesystem,
+                kernel: runtime.kernel,
+                containerConfiguration: configuration,
+                containerRootFilesystem: runtime.containerRootFilesystem,
+                options: runtime.options,
+                runtimeData: runtime.runtimeData
+            )
+            try updated.writeRuntimeConfiguration()
+        }
+    }
+
+    /// Block-image named volumes remain exclusive (virtio-blk). Directory-backed
+    /// volumes use the shared virtiofs plane and may be RW-mounted by multiple VMs.
+    private static func validateExclusiveNamedVolumes(
+        mounts: [Filesystem],
+        newID: String,
+        existing: [String: ContainerState],
+        log: Logger
+    ) throws {
+        let wanted = mounts.compactMap { fs -> (name: String, shared: Bool)? in
+            guard fs.isVolume, !fs.options.readonly, let name = fs.volumeName else { return nil }
+            return (name, fs.isSharedVirtiofsVolume)
+        }
+        guard !wanted.isEmpty else { return }
+        // Same named volume may appear more than once (different destinations); do not trap.
+        let wantedByName = Dictionary(wanted.map { ($0.name, $0.shared) }, uniquingKeysWith: { first, _ in first })
+
+        for (otherID, state) in existing {
+            guard otherID != newID else { continue }
+            guard state.snapshot.status == .running else { continue }
+            for mount in state.snapshot.configuration.mounts {
+                guard mount.isVolume, !mount.options.readonly, let name = mount.volumeName else { continue }
+                guard let newIsShared = wantedByName[name] else { continue }
+                let existingIsShared = mount.isSharedVirtiofsVolume
+                if newIsShared && existingIsShared {
+                    log.info(
+                        "named volume RW share via virtiofs plane",
+                        metadata: [
+                            "volume": "\(name)",
+                            "container": "\(newID)",
+                            "peer": "\(otherID)",
+                        ]
+                    )
+                    continue
+                }
+                throw ContainerizationError(
+                    .invalidArgument,
+                    message:
+                        "named volume \"\(name)\" is already mounted read-write by running container \(otherID). "
+                        + "Block-image named volumes are exclusive virtio-blk (single-writer). "
+                        + "Recreate the volume without --opt backend=block (default directory/virtiofs plane) "
+                        + "to share RW across containers, or use separate volumes / NFS / one writer. "
+                        + "See docs/volumes.md."
+                )
+            }
+        }
     }
 
     /// Get container configuration, either from existing bundle or from RuntimeConfiguration
@@ -2112,7 +2689,7 @@ extension XPCMessage {
 
     func stopOptions() throws -> ContainerStopOptions {
         guard let data = self.dataNoCopy(key: .stopOptions) else {
-            throw ContainerizationError(.invalidArgument, message: "empty StopOptions")
+            throw ContainerizationError(.invalidArgument, message: "missing StopOptions")
         }
         return try JSONDecoder().decode(ContainerStopOptions.self, from: data)
     }
@@ -2142,7 +2719,7 @@ extension XPCMessage {
 
     func processConfig() throws -> ProcessConfiguration {
         guard let data = self.dataNoCopy(key: .processConfig) else {
-            throw ContainerizationError(.invalidArgument, message: "empty process configuration")
+            throw ContainerizationError(.invalidArgument, message: "missing process configuration")
         }
         return try JSONDecoder().decode(ProcessConfiguration.self, from: data)
     }

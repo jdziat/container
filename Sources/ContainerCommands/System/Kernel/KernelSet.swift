@@ -23,6 +23,7 @@ import ContainerizationError
 import ContainerizationExtras
 import ContainerizationOCI
 import Foundation
+import Logging
 import TerminalProgress
 
 extension Application {
@@ -41,7 +42,15 @@ extension Application {
         @Flag(name: .long, help: "Overwrites an existing kernel with the same name")
         var force: Bool = false
 
-        @Flag(name: .long, help: "Download and install the recommended kernel as the default (takes precedence over all other flags)")
+        @Flag(
+            name: .long,
+            help: ArgumentHelp(
+                "Install the preferred default kernel (takes precedence over all other flags). "
+                    + "When CONTAINER_PREFERRED_KERNEL is unset or nfs (default), runs the NFS-capable "
+                    + "install path (`make install-nfs-kernel` / install-recommended-kernel). "
+                    + "Set CONTAINER_PREFERRED_KERNEL=kata for the historic Kata tarball."
+            )
+        )
         var recommended: Bool = false
 
         @Option(name: .customLong("tar"), help: "Filesystem path or remote URL to a tar archive containing a kernel file")
@@ -57,10 +66,18 @@ extension Application {
 
         public func run() async throws {
             if recommended {
+                let preference = Self.preferredKernelPreference()
+                if Self.prefersNFSCapableKernel(preference) {
+                    log.info(
+                        "Preferred kernel is NFS-capable (CONTAINER_PREFERRED_KERNEL=\(preference)). Installing via install-nfs-kernel / install-recommended-kernel..."
+                    )
+                    try await Self.installPreferredNFSKernel(force: force, log: log)
+                    return
+                }
                 let containerSystemConfig: ContainerSystemConfig = try await ClientHealthCheck.loadContainerSystemConfig()
                 let url = containerSystemConfig.kernel.url
                 let path: String = containerSystemConfig.kernel.binaryPath
-                log.info("Installing the recommended kernel from \(url)...")
+                log.info("Installing the Kata recommended kernel from \(url) (CONTAINER_PREFERRED_KERNEL=\(preference))...")
                 try await Self.downloadAndInstallWithProgressBar(
                     tarRemoteURL: url,
                     kernelFilePath: path,
@@ -157,6 +174,95 @@ extension Application {
                 expectedDigest: expectedDigest,
                 force: force)
             progress.finish()
+        }
+
+        /// Default preference is `nfs` (stock path for NFS / Compose users).
+        static func preferredKernelPreference() -> String {
+            let raw = ProcessInfo.processInfo.environment["CONTAINER_PREFERRED_KERNEL"]?
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+                .lowercased()
+            guard let raw, !raw.isEmpty else { return "nfs" }
+            return raw
+        }
+
+        static func prefersNFSCapableKernel(_ preference: String = preferredKernelPreference()) -> Bool {
+            preference == "nfs"
+        }
+
+        /// Locate install-recommended-kernel / install-nfs-kernel helpers next to the CLI or in a repo checkout.
+        static func locatePreferredKernelInstaller() -> URL? {
+            let fm = FileManager.default
+            var dirs: [URL] = []
+            let argv0 = URL(fileURLWithPath: CommandLine.arguments[0])
+            dirs.append(argv0.deletingLastPathComponent())
+            let resolved = URL(fileURLWithPath: CommandLine.arguments[0]).resolvingSymlinksInPath()
+            dirs.append(resolved.deletingLastPathComponent())
+            dirs.append(URL(fileURLWithPath: FileManager.default.currentDirectoryPath))
+            dirs.append(URL(fileURLWithPath: FileManager.default.currentDirectoryPath).appendingPathComponent("scripts"))
+            dirs.append(URL(fileURLWithPath: FileManager.default.currentDirectoryPath).appendingPathComponent("bin"))
+
+            let names = [
+                "install-recommended-kernel.sh",
+                "install-container-recommended-kernel",
+                "install-nfs-kernel.sh",
+                "install-container-nfs-kernel",
+            ]
+            for dir in dirs {
+                for name in names {
+                    let candidate = dir.appendingPathComponent(name)
+                    if fm.isExecutableFile(atPath: candidate.path) || fm.fileExists(atPath: candidate.path) {
+                        return candidate
+                    }
+                }
+                // Repo layout: <checkout>/bin/container → <checkout>/scripts/...
+                let siblingScripts = dir.deletingLastPathComponent().appendingPathComponent("scripts")
+                for name in ["install-recommended-kernel.sh", "install-nfs-kernel.sh"] {
+                    let candidate = siblingScripts.appendingPathComponent(name)
+                    if fm.isExecutableFile(atPath: candidate.path) || fm.fileExists(atPath: candidate.path) {
+                        return candidate
+                    }
+                }
+            }
+            return nil
+        }
+
+        static func installPreferredNFSKernel(force: Bool, log: Logger) async throws {
+            let instructions =
+                "NFS-capable kernel is the stock preferred path. Run: "
+                + "`make install-recommended-kernel` or `make install-nfs-kernel` "
+                + "(or `install-container-nfs-kernel` / `scripts/install-nfs-kernel.sh`). "
+                + "Set CONTAINER_PREFERRED_KERNEL=kata to use the historic Kata --recommended tarball. "
+                + "See docs/volumes.md#nfs-mounts."
+
+            guard let installer = locatePreferredKernelInstaller() else {
+                log.error("\(instructions)")
+                throw ContainerizationError(.notFound, message: instructions)
+            }
+
+            log.info("Invoking \(installer.path)...")
+            let process = Process()
+            process.executableURL = URL(fileURLWithPath: "/bin/bash")
+            process.arguments = [installer.path]
+            var env = ProcessInfo.processInfo.environment
+            env["CONTAINER_PREFERRED_KERNEL"] = "nfs"
+            // install-nfs-kernel.sh reads FORCE (default 1).
+            env["FORCE"] = force ? "1" : "0"
+            if env["CONTAINER_BIN"] == nil {
+                env["CONTAINER_BIN"] = CommandLine.arguments[0]
+            }
+            process.environment = env
+            process.standardOutput = FileHandle.standardOutput
+            process.standardError = FileHandle.standardError
+
+            try process.run()
+            process.waitUntilExit()
+            guard process.terminationStatus == 0 else {
+                throw ContainerizationError(
+                    .internalError,
+                    message:
+                        "preferred NFS kernel install failed (exit \(process.terminationStatus)). \(instructions)"
+                )
+            }
         }
 
     }

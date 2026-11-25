@@ -27,7 +27,7 @@ extension Application {
             aliases: ["ls"])
 
         @Option(name: .long, help: "Format of the output")
-        var format: ListFormat = .table
+        var format: FormatArgument = .table
 
         @Flag(name: .shortAndLong, help: "Only output the network name")
         var quiet = false
@@ -40,7 +40,7 @@ extension Application {
         public func run() async throws {
             let networkClient = NetworkClient()
             let networks = try await networkClient.list()
-            try Output.render(payload: networks, display: networks, format: format, quiet: quiet)
+            try format.render(payload: networks, display: networks, quiet: quiet)
         }
     }
 }

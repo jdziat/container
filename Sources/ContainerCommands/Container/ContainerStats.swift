@@ -87,17 +87,11 @@ extension Application {
                 // No containers specified - show all running containers
                 containersToShow = try await client.list(filters: ContainerListFilters(status: .running))
             } else {
-                // Fetch specified containers by ID
-                containersToShow = try await client.list(filters: ContainerListFilters(ids: containers))
-                // Validate all specified containers were found
-                for containerId in containers {
-                    guard containersToShow.contains(where: { $0.id == containerId }) else {
-                        throw ContainerizationError(
-                            .notFound,
-                            message: "no such container: \(containerId)"
-                        )
-                    }
-                }
+                // Resolve Id or Name client-side (server ids filter is Id-only).
+                let (found, notFound) = try await client.findContainers(
+                    named: containers, filters: ContainerListFilters())
+                if let first = notFound.first { throw first }
+                containersToShow = found
             }
 
             let statsData = try await Self.collectStats(client: client, for: containersToShow)
@@ -110,17 +104,13 @@ extension Application {
         private static func runStreaming(containerIds: [String]) async throws {
             let client = ContainerClient()
 
-            // If containers were specified, validate they all exist upfront
+            // If containers were specified, validate they all exist upfront (Id or Name).
+            var resolvedIds = containerIds
             if !containerIds.isEmpty {
-                let specifiedContainers = try await client.list(filters: ContainerListFilters(ids: containerIds))
-                for containerId in containerIds {
-                    guard specifiedContainers.contains(where: { $0.id == containerId }) else {
-                        throw ContainerizationError(
-                            .notFound,
-                            message: "no such container: \(containerId)"
-                        )
-                    }
-                }
+                let (found, notFound) = try await client.findContainers(
+                    named: containerIds, filters: ContainerListFilters())
+                if let first = notFound.first { throw first }
+                resolvedIds = found.map { $0.id }
             }
 
             clearScreen()
@@ -130,10 +120,10 @@ extension Application {
             while true {
                 do {
                     let containersToShow: [ContainerSnapshot]
-                    if containerIds.isEmpty {
+                    if resolvedIds.isEmpty {
                         containersToShow = try await client.list(filters: ContainerListFilters(status: .running))
                     } else {
-                        containersToShow = try await client.list(filters: ContainerListFilters(ids: containerIds))
+                        containersToShow = try await client.list(filters: ContainerListFilters(ids: resolvedIds))
                     }
 
                     let statsData = try await collectStats(client: client, for: containersToShow)

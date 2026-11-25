@@ -31,26 +31,68 @@ extension Application {
         @OptionGroup
         public var logOptions: Flags.Logging
 
+        @Option(name: .shortAndLong, help: "Format the output using a Go template, e.g. '{{.Name}}' or '{{json .}}'")
+        var format: String?
+
         @Argument(help: "Container IDs to inspect")
         var containerIds: [String]
 
         public func run() async throws {
             let client = ContainerClient()
-            let uniqueIds = Set(containerIds)
-            let containers = try await client.list().filter {
-                uniqueIds.contains($0.id)
+            // Prefer exact Id over Name (same policy as ContainerLookup) so a Name that
+            // collides with another container's Id cannot silently inspect the wrong one.
+            let listed = try await client.list()
+            var byId: [String: ContainerSnapshot] = [:]
+            var byName: [String: [ContainerSnapshot]] = [:]
+            for snap in listed {
+                byId[snap.id] = snap
+                let name = snap.configuration.name
+                if !name.isEmpty {
+                    byName[name, default: []].append(snap)
+                }
             }
-
-            if containers.count != uniqueIds.count {
-                let found = Set(containers.map { $0.id })
-                let missing = uniqueIds.subtracting(found).sorted()
+            var containers: [ContainerSnapshot] = []
+            var missing: [String] = []
+            var ambiguous: [String] = []
+            var seenIds = Set<String>()
+            for key in containerIds {
+                if let snap = byId[key] {
+                    if seenIds.insert(snap.id).inserted {
+                        containers.append(snap)
+                    }
+                    continue
+                }
+                let named = byName[key] ?? []
+                if named.isEmpty {
+                    missing.append(key)
+                } else if named.count > 1 {
+                    ambiguous.append(key)
+                } else if seenIds.insert(named[0].id).inserted {
+                    containers.append(named[0])
+                }
+            }
+            if !ambiguous.isEmpty {
+                throw ContainerizationError(
+                    .invalidArgument,
+                    message: "container name is ambiguous: \(ambiguous.joined(separator: ", "))"
+                )
+            }
+            if !missing.isEmpty {
                 throw ContainerizationError(
                     .notFound,
                     message: "container not found: \(missing.joined(separator: ", "))"
                 )
             }
 
-            try Output.emit(Output.renderJSON(containers.map { ManagedContainer($0) }, options: .pretty))
+            let managed = containers.map { ManagedContainer($0) }
+            if let format {
+                guard GoTemplate.isTemplate(format) else {
+                    throw ContainerizationError(.invalidArgument, message: "--format expects a Go template such as '{{.Name}}'")
+                }
+                try Output.renderTemplate(format, payload: managed)
+                return
+            }
+            try Output.emit(Output.renderJSON(managed, options: .pretty))
         }
     }
 }

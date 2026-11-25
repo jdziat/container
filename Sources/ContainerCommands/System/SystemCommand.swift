@@ -28,6 +28,7 @@ extension Application {
                 SystemDNS.self,
                 SystemKernel.self,
                 SystemLogs.self,
+                SystemPrune.self,
                 SystemProperty.self,
                 SystemStart.self,
                 SystemStatus.self,

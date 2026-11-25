@@ -1,0 +1,15 @@
+name: corpus-completed
+services:
+  init:
+    image: docker.io/library/alpine:3.20
+    command: ["sh", "-c", "echo init-done && exit 0"]
+  app:
+    image: docker.io/library/alpine:3.20
+    depends_on:
+      init:
+        condition: service_completed_successfully
+    hostname: app-host
+    cap_add:
+      - NET_RAW
+    stop_grace_period: 3s
+    command: ["sh", "-c", "echo completed-ok && sleep 20"]

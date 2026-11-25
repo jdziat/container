@@ -1,0 +1,155 @@
+#!/bin/sh
+# Copyright © 2026 Apple Inc. and the container project authors.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#   https://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# Drop-in `docker` shim for Apple `container` (#79).
+# Resolves the sibling `container` binary (or CONTAINER_BIN) and rewrites a
+# small set of Docker-only verbs before exec.
+
+set -eu
+
+resolve_container() {
+    if [ -n "${CONTAINER_BIN:-}" ] && [ -x "${CONTAINER_BIN}" ]; then
+        printf '%s\n' "${CONTAINER_BIN}"
+        return
+    fi
+    self=$0
+    case ${self} in
+    /*) ;;
+    *) self=$(command -v "$self" 2>/dev/null || printf '%s\n' "$self") ;;
+    esac
+    dir=$(CDPATH= cd -- "$(dirname -- "${self}")" && pwd)
+    if [ -x "${dir}/container" ]; then
+        printf '%s\n' "${dir}/container"
+        return
+    fi
+    if command -v container >/dev/null 2>&1; then
+        command -v container
+        return
+    fi
+    echo "docker: cannot find container CLI (set CONTAINER_BIN or install container beside this shim)" >&2
+    exit 127
+}
+
+CONTAINER=$(resolve_container)
+
+# No args → show container help under the docker name.
+if [ "$#" -eq 0 ]; then
+    exec "${CONTAINER}" --help
+fi
+
+cmd=$1
+shift
+
+case ${cmd} in
+info)
+    exec "${CONTAINER}" system status "$@"
+    ;;
+version)
+    exec "${CONTAINER}" system version "$@"
+    ;;
+logout)
+    exec "${CONTAINER}" registry logout "$@"
+    ;;
+compose)
+    # Prefer the compose plugin the same way `container compose` does.
+    exec "${CONTAINER}" compose "$@"
+    ;;
+container)
+    # `docker container ls` → `container list` etc.
+    if [ "$#" -eq 0 ]; then
+        exec "${CONTAINER}" --help
+    fi
+    sub=$1
+    shift
+    case ${sub} in
+    ls | list | ps) exec "${CONTAINER}" list "$@" ;;
+    rm | remove) exec "${CONTAINER}" delete "$@" ;;
+    prune) exec "${CONTAINER}" prune "$@" ;;
+    *) exec "${CONTAINER}" "${sub}" "$@" ;;
+    esac
+    ;;
+image)
+    if [ "$#" -eq 0 ]; then
+        exec "${CONTAINER}" image --help
+    fi
+    sub=$1
+    shift
+    case ${sub} in
+    ls | list) exec "${CONTAINER}" images "$@" ;;
+    rm | remove) exec "${CONTAINER}" rmi "$@" ;;
+    *) exec "${CONTAINER}" image "${sub}" "$@" ;;
+    esac
+    ;;
+images)
+    exec "${CONTAINER}" images "$@"
+    ;;
+rmi)
+    exec "${CONTAINER}" rmi "$@"
+    ;;
+rm)
+    exec "${CONTAINER}" delete "$@"
+    ;;
+ps)
+    exec "${CONTAINER}" ps "$@"
+    ;;
+top)
+    # docker top CONTAINER [ps opts] → container exec CONTAINER ps …
+    if [ "$#" -eq 0 ]; then
+        echo "docker top: container name or id required" >&2
+        exit 2
+    fi
+    id=$1
+    shift
+    if [ "$#" -eq 0 ]; then
+        exec "${CONTAINER}" exec "${id}" ps aux
+    fi
+    exec "${CONTAINER}" exec "${id}" ps "$@"
+    ;;
+# Verbs that exist under `container image ...` but live at the top level in Docker.
+save | load | tag | history)
+    exec "${CONTAINER}" image "${cmd}" "$@"
+    ;;
+# Docker verbs with no equivalent. Fail loudly with the nearest alternative instead of
+# falling through to a confusing "unknown command" from `container`.
+import)
+    echo "docker import: not supported (no rootfs-tarball import). Build an image with 'container build', or load an OCI archive with 'container image load'." >&2
+    exit 2
+    ;;
+search)
+    echo "docker search: not supported (no registry search API). Look up the image on the registry's website, then 'container image pull <name>'." >&2
+    exit 2
+    ;;
+context)
+    echo "docker context: not supported. Point clients at this engine with DOCKER_HOST=unix:///var/run/docker.sock (or the Application Support socket); see docs/docker-job-catalog.md." >&2
+    exit 2
+    ;;
+buildx)
+    echo "docker buildx: not supported. 'container build' already uses BuildKit; use 'docker build' with --platform for multi-arch." >&2
+    exit 2
+    ;;
+builder)
+    if [ "$#" -eq 0 ]; then
+        exec "${CONTAINER}" builder --help
+    fi
+    exec "${CONTAINER}" builder "$@"
+    ;;
+swarm | service | stack | node | secret | config)
+    echo "docker ${cmd}: Swarm orchestration is not supported by this engine." >&2
+    exit 2
+    ;;
+*)
+    exec "${CONTAINER}" "${cmd}" "$@"
+    ;;
+esac

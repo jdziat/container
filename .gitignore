@@ -36,3 +36,5 @@ _serve/
 # Default APP_ROOT and SCRATCH_ROOT for local test runs.
 .test-data/
 .test-scratch/
+scripts/parity/compose-corpus/10-immich/library/
+scripts/parity/compose-corpus/10-immich/postgres/

@@ -49,6 +49,8 @@ PKG_PATH := bin/$(BUILD_CONFIGURATION)/container-installer-unsigned.pkg
 DSYM_DIR := bin/$(BUILD_CONFIGURATION)/bundle/container-dSYM
 DSYM_PATH := bin/$(BUILD_CONFIGURATION)/bundle/container-dSYM.zip
 CODESIGN_OPTS ?= --force --sign - --timestamp=none
+# When CONTAINER_VMM_CR=1, sign the Linux runtime with hypervisor + virtualization entitlements.
+RUNTIME_LINUX_ENTITLEMENTS ?= $(if $(filter 1,$(CONTAINER_VMM_CR)),signing/container-runtime-linux-cr.entitlements,signing/container-runtime-linux.entitlements)
 
 # Strip the staged copies of the executables, never the build products, so the
 # .dSYM bundles that `dsym` collects still match the stripped binaries (strip
@@ -59,6 +61,7 @@ CODESIGN_OPTS ?= --force --sign - --timestamp=none
 STRIP_BINARIES ?= $(if $(filter release,$(BUILD_CONFIGURATION)),true,false)
 STRIP_OPTS ?= -x
 # Executables the installer ships, relative to the staging directory.
+# Note: bin/docker is a shell shim from scripts/docker — staged but not stripped.
 STAGED_EXECUTABLES := \
 	bin/container \
 	bin/container-apiserver \
@@ -68,7 +71,9 @@ STAGED_EXECUTABLES := \
 	libexec/container/plugins/machine-apiserver/bin/machine-apiserver \
 	libexec/container/plugins/cluster/bin/cluster \
 	libexec/container/plugins/build/bin/build \
-	libexec/container/plugins/builder/bin/builder
+	libexec/container/plugins/builder/bin/builder \
+	libexec/container/plugins/compose/bin/compose \
+	libexec/container-plugins/compose/bin/compose
 # The build products those executables are installed from, by product name.
 # Keep in sync with the install steps in $(STAGING_DIR): `dsym` archives a dSYM
 # for each one.
@@ -81,7 +86,8 @@ DSYM_PRODUCTS := \
 	machine-apiserver \
 	cluster \
 	container-build \
-	container-builder
+	container-builder \
+	container-compose
 
 # Default isolated application data root under the project directory so test runs do not touch your
 # own installation. Override with APP_ROOT=/your/path, or APP_ROOT= (empty) to run against
@@ -166,6 +172,7 @@ cli:
 	@echo Installing container CLI to bin/...
 	@mkdir -p bin
 	@install "$(BUILD_BIN_DIR)/container" "bin/container"
+	@install -m 0755 scripts/docker "bin/docker"
 
 .PHONY: container
 # Install binaries under project directory
@@ -208,11 +215,22 @@ $(STAGING_DIR):
 	@mkdir -p "$(join $(STAGING_DIR), libexec/container/plugins/cluster-hoststore/bin)"
 	@mkdir -p "$(join $(STAGING_DIR), libexec/container/plugins/build/bin)"
 	@mkdir -p "$(join $(STAGING_DIR), libexec/container/plugins/builder/bin)"
+	@mkdir -p "$(join $(STAGING_DIR), libexec/container/plugins/compose/bin)"
+	@mkdir -p "$(join $(STAGING_DIR), libexec/container-plugins/compose/bin)"
+	@mkdir -p "$(join $(STAGING_DIR), libexec/container/helpers)"
 
 	@install "$(BUILD_BIN_DIR)/container" "$(join $(STAGING_DIR), bin/container)"
+	@install -m 0755 scripts/docker "$(join $(STAGING_DIR), bin/docker)"
 	@install "$(BUILD_BIN_DIR)/container-apiserver" "$(join $(STAGING_DIR), bin/container-apiserver)"
 	@install "$(BUILD_BIN_DIR)/container-runtime-linux" "$(join $(STAGING_DIR), libexec/container/plugins/container-runtime-linux/bin/container-runtime-linux)"
 	@install Sources/Plugins/RuntimeLinux/config.toml "$(join $(STAGING_DIR), libexec/container/plugins/container-runtime-linux/config.toml)"
+	@# F6: CR is the default VMM; override with CONTAINER_VMM_BACKEND=vz
+	@printf '$(if $(filter 1,$(CONTAINER_VMM_CR)),cr,vz)\n' > "$(join $(STAGING_DIR), libexec/container/plugins/container-runtime-linux/bin/vmm-backend)"
+	@if [ ! -f resources/network-dns/hosts-dns ]; then \
+		echo "error: resources/network-dns/hosts-dns missing; run 'make hosts-dns' before packaging." >&2; \
+		exit 1; \
+	fi
+	@install -m 0755 resources/network-dns/hosts-dns "$(join $(STAGING_DIR), libexec/container/helpers/hosts-dns)"
 	@install "$(BUILD_BIN_DIR)/container-network-vmnet" "$(join $(STAGING_DIR), libexec/container/plugins/container-network-vmnet/bin/container-network-vmnet)"
 	@install Sources/Plugins/NetworkVmnet/config.toml "$(join $(STAGING_DIR), libexec/container/plugins/container-network-vmnet/config.toml)"
 	@install "$(BUILD_BIN_DIR)/container-core-images" "$(join $(STAGING_DIR), libexec/container/plugins/container-core-images/bin/container-core-images)"
@@ -236,11 +254,21 @@ $(STAGING_DIR):
 	@install Sources/Plugins/ContainerBuild/config.toml "$(join $(STAGING_DIR), libexec/container/plugins/build/config.toml)"
 	@install "$(BUILD_BIN_DIR)/container-builder" "$(join $(STAGING_DIR), libexec/container/plugins/builder/bin/builder)"
 	@install Sources/Plugins/ContainerBuilder/config.toml "$(join $(STAGING_DIR), libexec/container/plugins/builder/config.toml)"
+	@install "$(BUILD_BIN_DIR)/container-compose" "$(join $(STAGING_DIR), libexec/container/plugins/compose/bin/compose)"
+	@install Sources/Plugins/ContainerCompose/config.toml "$(join $(STAGING_DIR), libexec/container/plugins/compose/config.toml)"
+	# PluginLoader also scans libexec/container-plugins (legacy layout); keep both in sync.
+	@install "$(BUILD_BIN_DIR)/container-compose" "$(join $(STAGING_DIR), libexec/container-plugins/compose/bin/compose)"
+	@install Sources/Plugins/ContainerCompose/config.toml "$(join $(STAGING_DIR), libexec/container-plugins/compose/config.toml)"
 
 	@echo Install update script
 	@install scripts/update-container.sh "$(join $(STAGING_DIR), bin/update-container.sh)"
 	@echo Install uninstaller script
 	@install scripts/uninstall-container.sh "$(join $(STAGING_DIR), bin/uninstall-container.sh)"
+	@echo Install NFS-capable / preferred kernel helpers
+	@install -m 0755 scripts/install-nfs-kernel.sh "$(join $(STAGING_DIR), bin/install-container-nfs-kernel)"
+	@install -m 0755 scripts/install-recommended-kernel.sh "$(join $(STAGING_DIR), bin/install-container-recommended-kernel)"
+	@echo Install Recipe B engine sock helper
+	@install -m 0755 scripts/install-engine-sock.sh "$(join $(STAGING_DIR), bin/install-container-engine-sock)"
 
 .PHONY: installer-pkg
 installer-pkg: $(STAGING_DIR)
@@ -255,13 +283,15 @@ installer-pkg: $(STAGING_DIR)
 	@codesign $(CODESIGN_OPTS) --identifier com.apple.container.apiserver "$(join $(STAGING_DIR), bin/container-apiserver)"
 	@codesign $(CODESIGN_OPTS) --prefix=com.apple.container. "$(join $(STAGING_DIR), libexec/container/plugins/container-core-images/bin/container-core-images)"
 	@codesign $(CODESIGN_OPTS) --prefix=com.apple.container. "$(join $(STAGING_DIR), libexec/container/plugins/container-core-clusters/bin/container-core-clusters)"
-	@codesign $(CODESIGN_OPTS) --prefix=com.apple.container. --entitlements=signing/container-runtime-linux.entitlements "$(join $(STAGING_DIR), libexec/container/plugins/container-runtime-linux/bin/container-runtime-linux)"
+	@codesign $(CODESIGN_OPTS) --prefix=com.apple.container. --entitlements=$(RUNTIME_LINUX_ENTITLEMENTS) "$(join $(STAGING_DIR), libexec/container/plugins/container-runtime-linux/bin/container-runtime-linux)"
 	@codesign $(CODESIGN_OPTS) --prefix=com.apple.container. --entitlements=signing/container-network-vmnet.entitlements "$(join $(STAGING_DIR), libexec/container/plugins/container-network-vmnet/bin/container-network-vmnet)"
 	@codesign $(CODESIGN_OPTS) --prefix=com.apple.container. "$(join $(STAGING_DIR), libexec/container/plugins/machine-apiserver/bin/machine-apiserver)"
 	@codesign $(CODESIGN_OPTS) --prefix=com.apple.container. "$(join $(STAGING_DIR), libexec/container/plugins/cluster/bin/cluster)"
 	@codesign $(CODESIGN_OPTS) --prefix=com.apple.container. "$(join $(STAGING_DIR), libexec/container/plugins/cluster-hoststore/bin/cluster-hoststore)"
 	@codesign $(CODESIGN_OPTS) --prefix=com.apple.container. "$(join $(STAGING_DIR), libexec/container/plugins/build/bin/build)"
 	@codesign $(CODESIGN_OPTS) --prefix=com.apple.container. "$(join $(STAGING_DIR), libexec/container/plugins/builder/bin/builder)"
+	@codesign $(CODESIGN_OPTS) --prefix=com.apple.container. "$(join $(STAGING_DIR), libexec/container/plugins/compose/bin/compose)"
+	@codesign $(CODESIGN_OPTS) --prefix=com.apple.container. "$(join $(STAGING_DIR), libexec/container-plugins/compose/bin/compose)"
 
 	@echo Creating application installer
 	@pkgbuild --root "$(STAGING_DIR)" --identifier com.apple.container-installer --install-location /usr/local --version ${RELEASE_VERSION} $(PKG_PATH)
@@ -301,6 +331,21 @@ install-kernel:
 	@bin/container system stop || true
 	@echo Starting system to install kernel
 	@bin/container --debug system start --timeout 60 --enable-kernel-install $(SYSTEM_START_OPTS)
+
+# Stock kernel install for NFS users (CONTAINER_PREFERRED_KERNEL=nfs, default).
+# Kata `system kernel set --recommended` often omits `nfs` (see docs/volumes.md#nfs-mounts).
+# Prefer `make install-recommended-kernel` (alias below) or this target directly.
+.PHONY: install-nfs-kernel
+install-nfs-kernel: container
+	@chmod +x scripts/install-nfs-kernel.sh
+	@CONTAINER_BIN="$(ROOT_DIR)/bin/container" ./scripts/install-nfs-kernel.sh
+
+# Preferred kernel install. Default CONTAINER_PREFERRED_KERNEL=nfs → install-nfs-kernel.
+# Set CONTAINER_PREFERRED_KERNEL=kata for the historic Kata --recommended tarball.
+.PHONY: install-recommended-kernel
+install-recommended-kernel: container
+	@chmod +x scripts/install-recommended-kernel.sh scripts/install-nfs-kernel.sh
+	@CONTAINER_BIN="$(ROOT_DIR)/bin/container" ./scripts/install-recommended-kernel.sh
 
 
 # Coverage report generation helpers
@@ -421,6 +466,142 @@ define RUN_INTEGRATION
 	}
 endef
 
+# --- Behavioral parity gates -------------------------------------------------------------------
+# These run real commands and assert on observable output. Unlike the older source-grep
+# targets below, they fail when behavior regresses, not only when a comment is removed.
+#
+# cli-surface needs no running system (it walks `--help` for every command), so it is safe
+# anywhere. The rest need a started system and are isolated by APP_ROOT in CI; do not point
+# them at a machine whose containers/volumes you care about without reading each script's
+# SAFETY note (the lifecycle script only touches uniquely named resources and label-scoped prunes).
+.PHONY: parity-cli-surface
+parity-cli-surface:
+	@chmod +x scripts/parity/cli-surface.sh scripts/parity/compose-matrix-drift.sh
+	@BIN_DIR="$(BUILD_BIN_DIR)" bash scripts/parity/cli-surface.sh
+	@bash scripts/parity/compose-matrix-drift.sh
+
+# Self-contained and ISOLATED: like `make integration`, this stops any running system, starts a
+# fresh one under APP_ROOT (default ./.test-data), runs the live harnesses against THAT, and stops it
+# again. The harnesses therefore never see a developer's real containers, volumes or networks.
+# (A previous version ran against whatever system was up and an unscoped prune deleted a
+# developer's volumes.) It does not depend on `container`: it tests the installed bin/ (CI builds
+# it earlier in the same job; locally run `make container` first). Locally this leaves the
+# system stopped afterwards, exactly as `make integration` does.
+.PHONY: parity-behavioral
+parity-behavioral: parity-cli-surface
+	@test -x "$(ROOT_DIR)/bin/container" || { echo "bin/container not installed: run 'make container' first" >&2; exit 2; }
+	@test -x "$(ROOT_DIR)/bin/docker" || { echo "bin/docker not installed: run 'make container' first" >&2; exit 2; }
+	@test -n "$(strip $(APP_ROOT))" || { echo "parity-behavioral refuses to run against the default system: set APP_ROOT to an isolated directory" >&2; exit 2; }
+	@chmod +x scripts/parity/t2-docker-corpus.sh scripts/parity/t2-bridge-streams.sh scripts/parity/t2-bridge-hostconfig.sh scripts/parity/t2-bridge-lifecycle.sh
+	@echo "Stopping any running system; parity harnesses run against an isolated root: $(APP_ROOT)"
+	@bin/container system stop || true
+	@sleep 3 && scripts/ensure-container-stopped.sh
+	@mkdir -p "$(APP_ROOT)"
+	@bin/container --debug system start --timeout 60 --enable-kernel-install $(SYSTEM_START_OPTS) && \
+	{ \
+		export CONTAINER_APP_ROOT="$(APP_ROOT)" CONTAINER_BIN="$(ROOT_DIR)/bin/container" DOCKER_BIN="$(ROOT_DIR)/bin/docker" BRIDGE_BIN="$(BUILD_BIN_DIR)/container-docker-api-bridge" ; \
+		rc=0 ; \
+		for h in t2-docker-corpus t2-bridge-streams t2-bridge-hostconfig t2-bridge-lifecycle ; do \
+			echo "==> $$h" ; \
+			bash scripts/parity/$$h.sh || rc=1 ; \
+		done ; \
+		echo "Stopping the isolated system" ; \
+		scripts/ensure-container-stopped.sh ; \
+		exit $$rc ; \
+	}
+
+.PHONY: compose-parity
+compose-parity: container
+	@chmod +x scripts/parity/t3-compose-corpus.sh
+	CONTAINER_BIN="$(ROOT_DIR)/bin/container" bash scripts/parity/t3-compose-corpus.sh
+
+.PHONY: compose-doctor-smoke
+compose-doctor-smoke: container
+	@chmod +x scripts/parity/compose-doctor-smoke.sh
+	CONTAINER_BIN="$(ROOT_DIR)/bin/container" bash scripts/parity/compose-doctor-smoke.sh
+
+# NOTE: the l1/l2/l3/l4/f2-f5/c3 targets below are STATIC CHECKS: they grep source/docs for symbols and
+# comments and pass even when the build is broken. They are not evidence of behavior. Use
+# `make parity-behavioral` for that.
+# L1 contract: preferred kernel install defaults to NFS-capable (no guest mount).
+.PHONY: l1-nfs-default
+l1-nfs-default:
+	@chmod +x scripts/parity/l1-nfs-default.sh
+	@bash scripts/parity/l1-nfs-default.sh
+
+# L4 contract: Recipe B first-class for docker.sock consumers.
+.PHONY: l4-recipe-b-sock
+l4-recipe-b-sock: container
+	@chmod +x scripts/parity/l4-recipe-b-sock.sh
+	CONTAINER_BIN="$(ROOT_DIR)/bin/container" bash scripts/parity/l4-recipe-b-sock.sh
+
+# L2 contract: shared virtiofs named-volume plane.
+.PHONY: l2-shared-volumes
+l2-shared-volumes:
+	@chmod +x scripts/parity/l2-shared-volumes.sh
+	@bash scripts/parity/l2-shared-volumes.sh
+
+# L3 contract: network-scoped exact aliases.
+.PHONY: l3-network-scoped-aliases
+l3-network-scoped-aliases:
+	@chmod +x scripts/parity/l3-network-scoped-aliases.sh
+	@bash scripts/parity/l3-network-scoped-aliases.sh
+
+# F2 contract: Compose extends merge.
+.PHONY: f2-compose-extends
+f2-compose-extends: container
+	@chmod +x scripts/parity/f2-compose-extends.sh
+	CONTAINER_BIN="$(ROOT_DIR)/bin/container" bash scripts/parity/f2-compose-extends.sh
+
+.PHONY: bridge-corpus-parity
+bridge-corpus-parity: container
+	@chmod +x scripts/parity/t2-bridge-corpus.sh
+	CONTAINER_BIN="$(ROOT_DIR)/bin/container" bash scripts/parity/t2-bridge-corpus.sh
+
+# F4 CR virtio-net hotplug gate (static; set F4_LIVE=1 for live connect smoke).
+.PHONY: f4-net-hotplug
+f4-net-hotplug:
+	@chmod +x scripts/parity/f4-net-hotplug.sh
+	@bash scripts/parity/f4-net-hotplug.sh
+
+# C3 blk hotplug caller gate (RuntimeService → CRVirtualMachineInstance.hotplug).
+.PHONY: c3-blk-hotplug
+c3-blk-hotplug:
+	@chmod +x scripts/parity/c3-blk-hotplug.sh
+	@bash scripts/parity/c3-blk-hotplug.sh
+
+# F5 in-core sock remains opt-in (static gate).
+.PHONY: f5-incore-sock
+f5-incore-sock:
+	@chmod +x scripts/parity/f5-incore-sock.sh
+	@bash scripts/parity/f5-incore-sock.sh
+
+.PHONY: f3-devices-unrestricted
+f3-devices-unrestricted:
+	@chmod +x scripts/parity/f3-devices-unrestricted.sh
+	@bash scripts/parity/f3-devices-unrestricted.sh
+
+.PHONY: f4-vz-net-hotplug
+f4-vz-net-hotplug:
+	@chmod +x scripts/parity/f4-vz-net-hotplug.sh
+	@bash scripts/parity/f4-vz-net-hotplug.sh
+
+.PHONY: f4-vz-net-hotplug-live
+f4-vz-net-hotplug-live: container
+	@chmod +x scripts/parity/f4-vz-net-hotplug-live.sh
+	CONTAINER_BIN="$(ROOT_DIR)/bin/container" bash scripts/parity/f4-vz-net-hotplug-live.sh
+
+.PHONY: r6-container-gui
+r6-container-gui:
+	@chmod +x scripts/parity/r6-container-gui.sh
+	@bash scripts/parity/r6-container-gui.sh
+
+.PHONY: t2-client-smoke
+t2-client-smoke: container
+	@chmod +x scripts/parity/t2-client-smoke.sh
+	CONTAINER_BIN="$(ROOT_DIR)/bin/container" bash scripts/parity/t2-client-smoke.sh
+
+
 .PHONY: integration
 integration: container init-block
 	@echo "HOSTNAME: $$(hostname)"
@@ -535,6 +716,23 @@ docs:
 demo-gif:
 	@echo Recording the README demo...
 	@scripts/record-demo.sh
+
+.PHONY: hosts-dns
+# Cross-compile the in-guest hosts-dns helper (Linux/arm64 static) via alpine.
+# Depend on `cli` (not `container`/installer) so packaging can require the helper
+# without a circular hosts-dns ↔ installer dependency.
+hosts-dns: cli
+	@mkdir -p resources/network-dns
+	@test -f resources/network-dns/hosts-dns.c || (echo "missing resources/network-dns/hosts-dns.c" >&2; exit 1)
+	@echo Building hosts-dns helper...
+	@CONTAINER_BIN="$${CONTAINER_BIN:-$(ROOT_DIR)/bin/container}"; \
+	  "$$CONTAINER_BIN" run --rm \
+	    --mount "type=bind,source=$(ROOT_DIR)/resources/network-dns,target=/src" \
+	    alpine:3.20 \
+	    sh -c 'apk add --no-cache gcc musl-dev >/dev/null && cc -static -O2 -s -o /src/hosts-dns /src/hosts-dns.c'
+	@mkdir -p libexec/container/helpers
+	@install -m 0755 resources/network-dns/hosts-dns libexec/container/helpers/hosts-dns
+	@echo Installed libexec/container/helpers/hosts-dns
 
 .PHONY: cleancontent
 cleancontent:

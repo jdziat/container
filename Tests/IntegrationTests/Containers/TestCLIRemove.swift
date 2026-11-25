@@ -76,9 +76,11 @@ struct TestCLIRemove {
             let name = "\(f.testID)-c"
             try f.doCreate(name: name, image: image)
             f.addCleanup { try f.doRemoveIfExists(name, force: true, ignoreFailure: true) }
+            let id = try f.inspectContainer(name).configuration.id
             let result = try f.run(["delete", name, name])
             #expect(result.status == 0, "delete with duplicate IDs should succeed, stderr: \(result.error)")
-            let lines = result.output.split(separator: "\n").filter { $0.contains(name) }
+            // delete prints the stable Id once even when the Name is passed twice.
+            let lines = result.output.split(separator: "\n").filter { $0.contains(id) }
             #expect(lines.count == 1, "container should be deleted exactly once, got \(lines.count) lines")
         }
     }

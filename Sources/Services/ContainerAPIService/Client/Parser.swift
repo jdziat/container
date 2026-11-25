@@ -22,6 +22,7 @@ import ContainerizationExtras
 import ContainerizationOCI
 import ContainerizationOS
 import DNSServer
+import Darwin
 import Foundation
 import SystemPackage
 
@@ -403,6 +404,8 @@ public struct Parser {
         "virtiofs",
         "bind",
         "tmpfs",
+        "volume",
+        "nfs",
     ]
 
     public static let defaultDirectives = ["type": "virtiofs"]
@@ -457,8 +460,10 @@ public struct Parser {
             throw ContainerizationError(.invalidArgument, message: "invalid mount format: \(mount)")
         }
         var directives = defaultDirectives
+        // Docker-compatible NFS (and similar) pass-through options: addr=, nfsvers=, soft, …
+        var passthroughOptions: [String] = []
         for part in parts {
-            let keyVal = part.split(separator: "=", maxSplits: 2)
+            let keyVal = part.split(separator: "=", maxSplits: 1)
             var key = String(keyVal[0])
             var skipValue = false
             switch key {
@@ -472,7 +477,13 @@ public struct Parser {
                 key = "ro"
                 skipValue = true
             default:
-                throw ContainerizationError(.invalidArgument, message: "unknown directive \(key) when parsing mount \(mount)")
+                // Defer unknown keys; accepted only for type=nfs after directives resolve.
+                if keyVal.count == 1 {
+                    passthroughOptions.append(key)
+                } else {
+                    passthroughOptions.append("\(key)=\(String(keyVal[1]))")
+                }
+                continue
             }
             var value = ""
             if !skipValue {
@@ -487,6 +498,21 @@ public struct Parser {
         var fs = Filesystem()
         var isVolume = false
         var volumeName = ""
+        let resolvedType = directives["type"] ?? ""
+        // Prefer "unsupported mount type" over "unknown directive" when type is present.
+        if !resolvedType.isEmpty {
+            let normalized = resolvedType == "bind" ? "virtiofs" : resolvedType
+            let known: Set<String> = ["virtiofs", "tmpfs", "nfs", "volume"]
+            if !known.contains(normalized) {
+                throw ContainerizationError(.invalidArgument, message: "unsupported mount type \(resolvedType)")
+            }
+        }
+        if resolvedType != "nfs", !passthroughOptions.isEmpty {
+            let first = passthroughOptions[0]
+            let key = first.split(separator: "=", maxSplits: 1).first.map(String.init) ?? first
+            throw ContainerizationError(.invalidArgument, message: "unknown directive \(key) when parsing mount \(mount)")
+        }
+
         for (key, val) in directives {
             var val = val
             let type = directives["type"] ?? ""
@@ -502,6 +528,8 @@ public struct Parser {
                 case "tmpfs":
                     fs.type = Filesystem.FSType.tmpfs
                     fs.source = "tmpfs"
+                case "nfs":
+                    fs.type = Filesystem.FSType.nfs
                 case "volume":
                     isVolume = true
                 default:
@@ -531,16 +559,14 @@ public struct Parser {
             case "source":
                 switch type {
                 case "virtiofs", "bind":
-                    // For bind mounts, resolve both absolute and relative paths
+                    // For bind mounts, resolve both absolute and relative paths.
+                    // Directories and regular files are allowed (Docker bind / Compose configs+secrets).
                     let url = basePath?.appending(path: val).standardizedFileURL ?? URL(filePath: val)
                     let absolutePath = url.absoluteURL.path
 
                     var isDirectory: ObjCBool = false
                     guard FileManager.default.fileExists(atPath: absolutePath, isDirectory: &isDirectory) else {
                         throw ContainerizationError(.invalidArgument, message: "path '\(val)' does not exist")
-                    }
-                    guard isDirectory.boolValue else {
-                        throw ContainerizationError(.invalidArgument, message: "path '\(val)' is not a directory")
                     }
                     fs.source = absolutePath
                 case "volume":
@@ -552,6 +578,12 @@ public struct Parser {
                     // This is a named volume
                     volumeName = val
                     fs.source = val
+                case "nfs":
+                    // Export path or server:export — must exist in the guest network, not on the host.
+                    guard !val.isEmpty else {
+                        throw ContainerizationError(.invalidArgument, message: "nfs mount source cannot be empty")
+                    }
+                    fs.source = val
                 case "tmpfs":
                     throw ContainerizationError(.invalidArgument, message: "cannot specify source for tmpfs mount")
                 default:
@@ -561,6 +593,13 @@ public struct Parser {
                 fs.destination = val
             default:
                 throw ContainerizationError(.invalidArgument, message: "unknown mount directive \(key)")
+            }
+        }
+
+        if resolvedType == "nfs" {
+            fs.options.append(contentsOf: passthroughOptions)
+            if fs.source.isEmpty {
+                throw ContainerizationError(.invalidArgument, message: "nfs mount requires source")
             }
         }
 
@@ -664,7 +703,12 @@ public struct Parser {
     public static func validateMount(_ mount: VolumeOrFilesystem) throws {
         switch mount {
         case .filesystem(let fs):
-            if !fs.isTmpfs {
+            if fs.isNfs {
+                // Guest NFS: source is an export path (optionally server:export), not a host directory.
+                if fs.source.isEmpty {
+                    throw ContainerizationError(.invalidArgument, message: "nfs mount source cannot be empty")
+                }
+            } else if !fs.isTmpfs {
                 if !fs.source.isAbsolutePath() {
                     throw ContainerizationError(
                         .invalidArgument, message: "\(fs.source) is not an absolute path on the host")
@@ -1126,10 +1170,182 @@ public struct Parser {
         return parsed
     }
 
+    // MARK: Host devices (allowlist)
+
+    /// Default host device paths accepted by `--device` / Compose `devices:`.
+    /// Extend with comma-separated `CONTAINER_DEVICE_ALLOWLIST` (absolute paths).
+    public static let defaultDeviceAllowlist: Set<String> = [
+        "/dev/null", "/dev/zero", "/dev/urandom", "/dev/tty",
+    ]
+
+    /// Effective allowlist: defaults plus `CONTAINER_DEVICE_ALLOWLIST`.
+    public static func deviceAllowlist() -> Set<String> {
+        var allowed = defaultDeviceAllowlist
+        if let extra = ProcessInfo.processInfo.environment["CONTAINER_DEVICE_ALLOWLIST"] {
+            for part in extra.split(separator: ",") {
+                let path = part.trimmingCharacters(in: .whitespacesAndNewlines)
+                if !path.isEmpty { allowed.insert(path) }
+            }
+        }
+        return allowed
+    }
+
+    /// Parse Docker-shaped `--device` / Compose `devices` specs (`HOST[:CONTAINER[:MODE]]`).
+    /// Unrestricted by default (R2). Set `CONTAINER_DEVICE_ALLOWLIST_ONLY=1` for the old fail-closed allowlist.
+    public static func devices(_ raw: [String]) throws -> [ContainerDevice] {
+        let allowed = deviceAllowlist()
+        let allowlistOnly = ProcessInfo.processInfo.environment["CONTAINER_DEVICE_ALLOWLIST_ONLY"] == "1"
+        var result: [ContainerDevice] = []
+        result.reserveCapacity(raw.count)
+        for spec in raw {
+            let trimmed = spec.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !trimmed.isEmpty else { continue }
+            let parts = trimmed.split(separator: ":", omittingEmptySubsequences: false).map(String.init)
+            let host: String
+            let container: String
+            let mode: String?
+            switch parts.count {
+            case 1:
+                host = parts[0]
+                container = parts[0]
+                mode = nil
+            case 2:
+                host = parts[0]
+                container = parts[1].isEmpty ? parts[0] : parts[1]
+                mode = nil
+            case 3:
+                host = parts[0]
+                container = parts[1].isEmpty ? parts[0] : parts[1]
+                mode = parts[2].isEmpty ? nil : parts[2]
+            default:
+                throw ContainerizationError(
+                    .invalidArgument,
+                    message: "invalid --device format '\(spec)' (expected HOST[:CONTAINER[:MODE]])"
+                )
+            }
+            guard host.hasPrefix("/") else {
+                throw ContainerizationError(
+                    .invalidArgument, message: "device host path must be absolute: \(host)")
+            }
+            guard container.hasPrefix("/") else {
+                throw ContainerizationError(
+                    .invalidArgument, message: "device container path must be absolute: \(container)")
+            }
+            if allowlistOnly, !allowed.contains(host) {
+                let sorted = allowed.sorted().joined(separator: ", ")
+                throw ContainerizationError(
+                    .invalidArgument,
+                    message:
+                        "host device '\(host)' is not on the allowlist (allowed: \(sorted); "
+                        + "extend with CONTAINER_DEVICE_ALLOWLIST or unset CONTAINER_DEVICE_ALLOWLIST_ONLY)"
+                )
+            }
+            var st = stat()
+            guard lstat(host, &st) == 0 else {
+                throw ContainerizationError(
+                    .invalidArgument, message: "device host path '\(host)' does not exist")
+            }
+            guard (st.st_mode & S_IFMT) != S_IFLNK else {
+                throw ContainerizationError(
+                    .invalidArgument,
+                    message: "device host path '\(host)' must not be a symbolic link"
+                )
+            }
+            guard (st.st_mode & S_IFMT) == S_IFCHR || (st.st_mode & S_IFMT) == S_IFBLK else {
+                throw ContainerizationError(
+                    .invalidArgument,
+                    message: "device host path '\(host)' must be a character or block device"
+                )
+            }
+            result.append(ContainerDevice(hostPath: host, containerPath: container, mode: mode))
+        }
+        return result
+    }
+
     // MARK: Capabilities
 
     /// Parse and validate --cap-add / --cap-drop arguments.
     /// Returns normalized uppercase CAP_* strings.
+    /// `--add-host host:ip` (Docker also allows `host=ip`). Returns normalized `host:ip` strings.
+    /// IPv6 literals may be bracketed (`host:[::1]`) or bare.
+    public static func extraHosts(_ raw: [String]) throws -> [String] {
+        try raw.map { spec in
+            let trimmed = spec.trimmingCharacters(in: .whitespaces)
+            guard let split = trimmed.firstIndex(where: { $0 == ":" || $0 == "=" }) else {
+                throw ContainerizationError(.invalidArgument, message: "--add-host '\(spec)' must be host:ip")
+            }
+            let host = String(trimmed[..<split])
+            var address = String(trimmed[trimmed.index(after: split)...])
+            if address.hasPrefix("["), address.hasSuffix("]") { address = String(address.dropFirst().dropLast()) }
+            guard !host.isEmpty,
+                host.range(of: #"^[A-Za-z0-9_]([A-Za-z0-9._-]*[A-Za-z0-9_])?$"#, options: .regularExpression) != nil
+            else {
+                throw ContainerizationError(.invalidArgument, message: "--add-host '\(spec)' has an invalid host name")
+            }
+            // `host-gateway` is Docker's magic value; there is no host-side bridge IP here to resolve it to.
+            guard address != "host-gateway" else {
+                throw ContainerizationError(
+                    .invalidArgument, message: "--add-host '\(spec)': host-gateway is not supported; use the gateway IP")
+            }
+            var v4 = in_addr(), v6 = in6_addr()
+            guard inet_pton(AF_INET, address, &v4) == 1 || inet_pton(AF_INET6, address, &v6) == 1 else {
+                throw ContainerizationError(.invalidArgument, message: "--add-host '\(spec)' has an invalid IP address")
+            }
+            return "\(host):\(address)"
+        }
+    }
+
+    /// `--sysctl key=value`. Keys must be dotted lowercase kernel parameter names.
+    public static func sysctls(_ raw: [String]) throws -> [String: String] {
+        var result: [String: String] = [:]
+        for spec in raw {
+            let parts = spec.split(separator: "=", maxSplits: 1, omittingEmptySubsequences: false).map(String.init)
+            guard parts.count == 2, !parts[0].isEmpty,
+                parts[0].range(of: #"^[a-z0-9_]+([./][a-z0-9_-]+)+$"#, options: .regularExpression) != nil
+            else {
+                throw ContainerizationError(.invalidArgument, message: "--sysctl '\(spec)' must be key=value (e.g. net.ipv4.ip_forward=1)")
+            }
+            result[parts[0].replacingOccurrences(of: "/", with: ".")] = parts[1]
+        }
+        return result
+    }
+
+    /// `--stop-signal` accepts `SIGTERM`, `TERM`, or a number 1...64. Normalized to `SIGxxx`.
+    public static func stopSignal(_ raw: String) throws -> String {
+        let known = [
+            "HUP", "INT", "QUIT", "ILL", "TRAP", "ABRT", "BUS", "FPE", "KILL", "USR1", "SEGV", "USR2", "PIPE", "ALRM",
+            "TERM", "STKFLT", "CHLD", "CONT", "STOP", "TSTP", "TTIN", "TTOU", "URG", "XCPU", "XFSZ", "VTALRM", "PROF",
+            "WINCH", "IO", "PWR", "SYS",
+        ]
+        if let number = Int(raw) {
+            guard (1...64).contains(number) else {
+                throw ContainerizationError(.invalidArgument, message: "--stop-signal \(raw) is out of range 1-64")
+            }
+            return raw
+        }
+        let name = raw.uppercased().hasPrefix("SIG") ? String(raw.uppercased().dropFirst(3)) : raw.uppercased()
+        guard known.contains(name) else {
+            throw ContainerizationError(.invalidArgument, message: "--stop-signal '\(raw)' is not a recognized signal")
+        }
+        return "SIG\(name)"
+    }
+
+    /// One concise warning per Docker flag the per-VM model cannot honor. Never fails the run.
+    public static func warnUnsupportedDockerFlags(_ flags: Flags.Management) {
+        func warn(_ message: String) { FileHandle.standardError.write(Data("warning: \(message)\n".utf8)) }
+        if flags.privileged {
+            warn("--privileged has no extra effect: each container already runs in its own VM; host devices need --device")
+        }
+        if !flags.securityOpts.isEmpty { warn("--security-opt is ignored (no seccomp/AppArmor profile selection)") }
+        if flags.pidsLimit != nil { warn("--pids-limit is ignored (no per-container pids cgroup limit)") }
+        if let mode = flags.pidMode, mode != "private" { warn("--pid=\(mode) is ignored: containers cannot share the host PID namespace") }
+        if let mode = flags.ipcMode, mode != "private" { warn("--ipc=\(mode) is ignored: containers cannot share the host IPC namespace") }
+        if let driver = flags.logDriver, driver != "json-file", driver != "local" {
+            warn("--log-driver=\(driver) is ignored: logs always use the built-in driver")
+        }
+        if flags.gpus != nil { warn("--gpus is ignored: GPU passthrough is not available") }
+    }
+
     public static func capabilities(capAdd: [String], capDrop: [String]) throws -> (capAdd: [String], capDrop: [String]) {
         var normalizedAdd: [String] = []
         normalizedAdd.reserveCapacity(capAdd.count)

@@ -36,6 +36,8 @@ public actor VolumesService {
     // Storage constants
     private static let entityFile = "entity.json"
     private static let blockFile = "volume.img"
+    /// Host directory for the shared virtiofs named-volume plane (default backend).
+    private static let dataDir = "_data"
 
     public init(resourceRoot: FilePath, containersService: ContainersService, log: Logger) async throws {
         try FileManager.default.createDirectory(atPath: resourceRoot.string, withIntermediateDirectories: true)
@@ -259,10 +261,44 @@ public actor VolumesService {
         "\(volumePath(for: name))/\(Self.blockFile)"
     }
 
+    private nonisolated func dataPath(for name: String) -> String {
+        "\(volumePath(for: name))/\(Self.dataDir)"
+    }
+
     private func createVolumeDirectory(for name: String) throws {
         let volumePath = volumePath(for: name)
         let fm = FileManager.default
         try fm.createDirectory(atPath: volumePath, withIntermediateDirectories: true, attributes: nil)
+    }
+
+    private func createVolumeDataDirectory(for name: String) throws {
+        let path = dataPath(for: name)
+        try FileManager.default.createDirectory(atPath: path, withIntermediateDirectories: true, attributes: nil)
+    }
+
+    /// L2 strategy lock: default local named volumes use the shared virtiofs directory plane.
+    /// Exclusive virtio-blk via `--opt backend=block` (or size/journal / format=ext4).
+    private static func usesBlockBackend(_ driverOpts: [String: String]) -> Bool {
+        if let backend = driverOpts["backend"]?.lowercased() {
+            if backend == "directory" || backend == "virtiofs" || backend == "shared" {
+                return false
+            }
+            if backend == "block" {
+                return true
+            }
+        }
+        if let format = driverOpts["format"]?.lowercased() {
+            if format == "directory" || format == "virtiofs" { return false }
+            if format == "ext4" { return true }
+        }
+        if let sharing = driverOpts["sharing"]?.lowercased(), sharing == "shared" {
+            return false
+        }
+        // Explicit size/journal imply exclusive block image.
+        if driverOpts["size"] != nil || driverOpts["journal"] != nil {
+            return true
+        }
+        return false
     }
 
     static func parseJournalConfig(_ value: String) throws -> EXT4.JournalConfig {
@@ -327,27 +363,39 @@ public actor VolumesService {
 
         try createVolumeDirectory(for: name)
 
-        // Parse size from driver options (default 512GB)
-        let sizeInBytes: UInt64
-        if let sizeString = driverOpts["size"] {
-            sizeInBytes = try parseSize(sizeString)
+        let volume: VolumeConfiguration
+        if Self.usesBlockBackend(driverOpts) {
+            // Exclusive virtio-blk plane (single-writer).
+            let sizeInBytes: UInt64
+            if let sizeString = driverOpts["size"] {
+                sizeInBytes = try parseSize(sizeString)
+            } else {
+                sizeInBytes = VolumeStorage.defaultVolumeSizeBytes
+            }
+            let journalConfig = try driverOpts["journal"].map { try Self.parseJournalConfig($0) }
+            try createVolumeImage(for: name, sizeInBytes: sizeInBytes, journal: journalConfig)
+            volume = VolumeConfiguration(
+                name: name,
+                driver: driver,
+                format: "ext4",
+                source: blockPath(for: name),
+                labels: labels,
+                options: driverOpts,
+                sizeInBytes: sizeInBytes
+            )
         } else {
-            sizeInBytes = VolumeStorage.defaultVolumeSizeBytes
+            // Shared virtiofs plane: host directory mounted into each guest VM.
+            try createVolumeDataDirectory(for: name)
+            volume = VolumeConfiguration(
+                name: name,
+                driver: driver,
+                format: "directory",
+                source: dataPath(for: name),
+                labels: labels,
+                options: driverOpts,
+                sizeInBytes: nil
+            )
         }
-
-        let journalConfig = try driverOpts["journal"].map { try Self.parseJournalConfig($0) }
-
-        try createVolumeImage(for: name, sizeInBytes: sizeInBytes, journal: journalConfig)
-
-        let volume = VolumeConfiguration(
-            name: name,
-            driver: driver,
-            format: "ext4",
-            source: blockPath(for: name),
-            labels: labels,
-            options: driverOpts,
-            sizeInBytes: sizeInBytes
-        )
 
         try await store.create(volume)
 
@@ -356,6 +404,7 @@ public actor VolumesService {
             metadata: [
                 "name": "\(name)",
                 "driver": "\(driver)",
+                "format": "\(volume.format)",
                 "isAnonymous": "\(volume.isAnonymous)",
             ])
         return volume

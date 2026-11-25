@@ -23,8 +23,10 @@ extension Application {
             commandName: "network",
             abstract: "Manage container networks",
             subcommands: [
+                NetworkConnect.self,
                 NetworkCreate.self,
                 NetworkDelete.self,
+                NetworkDisconnect.self,
                 NetworkList.self,
                 NetworkInspect.self,
                 NetworkPrune.self,

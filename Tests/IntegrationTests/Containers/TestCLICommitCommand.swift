@@ -57,7 +57,13 @@ struct TestCLICommitCommand {
                 #expect(try f.isImagePresent(reference))
                 try assertCommittedImageMetadata(f, reference: reference)
 
-                try await f.withContainer(image: reference) { committedName in
+                // Distinct name (source container still present). Image ENTRYPOINT is `sleep`
+                // from the source process, so only pass the CMD arg `infinity`.
+                try await f.withContainer(
+                    image: reference,
+                    tag: "committed",
+                    containerArgs: ["infinity"]
+                ) { committedName in
                     let output = try f.doExec(committedName, cmd: ["cat", "/committed-file"])
                     #expect(output.trimmingCharacters(in: .whitespacesAndNewlines) == expected)
 
@@ -82,15 +88,28 @@ struct TestCLICommitCommand {
 
         let decoder = JSONDecoder()
         let index = try decoder.decode(Index.self, from: Data(contentsOf: URL(filePath: extractedDirectory.appending("index.json").string)))
-        let manifestDescriptor = try #require(index.manifests.first)
-        #expect(manifestDescriptor.annotations?["org.opencontainers.image.ref.name"] == reference)
+        let topDescriptor = try #require(index.manifests.first)
+        #expect(topDescriptor.annotations?["org.opencontainers.image.ref.name"] == reference)
 
-        let manifest = try decoder.decode(Manifest.self, from: blobData(manifestDescriptor, in: extractedDirectory))
-        #expect(manifest.layers.count == 1)
+        // `image save` may wrap the platform manifest in an indirect index; walk until
+        // we reach an image manifest that carries `config` + `layers`.
+        var descriptor = topDescriptor
+        var manifest: Manifest?
+        for _ in 0..<4 {
+            let data = try blobData(descriptor, in: extractedDirectory)
+            if let imageManifest = try? decoder.decode(Manifest.self, from: data), imageManifest.config.size > 0 {
+                manifest = imageManifest
+                break
+            }
+            let nested = try decoder.decode(Index.self, from: data)
+            descriptor = try #require(nested.manifests.first)
+        }
+        let resolved = try #require(manifest, "expected an OCI image manifest under \(reference)")
+        #expect(resolved.layers.count == 1)
 
-        let image = try decoder.decode(Image.self, from: blobData(manifest.config, in: extractedDirectory))
-        #expect(image.rootfs.diffIDs == manifest.layers.map { $0.digest })
-        #expect(image.history?.count == manifest.layers.count)
+        let image = try decoder.decode(Image.self, from: blobData(resolved.config, in: extractedDirectory))
+        #expect(image.rootfs.diffIDs == resolved.layers.map { $0.digest })
+        #expect(image.history?.count == resolved.layers.count)
         #expect(image.config?.entrypoint == ["sleep"])
         #expect(image.config?.cmd == ["infinity"])
     }

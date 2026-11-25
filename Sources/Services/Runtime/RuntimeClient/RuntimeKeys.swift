@@ -58,4 +58,12 @@ public enum RuntimeKeys: String {
     case networkBootstrapInfos
     /// Peer host entries to inject into the guest `/etc/hosts` at bootstrap.
     case peerHosts
+    /// Single AttachmentConfiguration JSON for live network hotplug.
+    case networkAttachment
+    /// Network id to unplug (secondary NIC disconnect).
+    case unplugNetworkID
+    /// Host path to a block image for live virtio-blk hotplug (C3).
+    case hotplugBlockPath
+    /// Registry id for a live virtio-blk hotplug (C3).
+    case hotplugBlockID
 }

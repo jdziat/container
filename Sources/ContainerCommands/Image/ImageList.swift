@@ -33,7 +33,7 @@ extension Application {
             aliases: ["ls"])
 
         @Option(name: .long, help: "Format of the output")
-        var format: ListFormat = .table
+        var format: FormatArgument = .table
 
         @Flag(name: .shortAndLong, help: "Only output the image name")
         var quiet = false
@@ -55,7 +55,7 @@ extension Application {
 
             // Quiet mode prints references directly and skips the more expensive
             // per-image manifest resolution.
-            if quiet && format == .table {
+            if quiet && format.template == nil && format.listFormat == .table {
                 for image in images {
                     let processedReferenceString = try ClientImage.denormalizeReference(image.reference, containerSystemConfig: containerSystemConfig)
                     print(processedReferenceString)
@@ -63,9 +63,21 @@ extension Application {
                 return
             }
 
+            if let template = format.template {
+                var resources: [ImageResource] = []
+                for image in images {
+                    do { resources.append(try await image.toImageResource(containerSystemConfig: containerSystemConfig)) } catch {
+                        guard Self.isUnreadableImageError(error) else { throw error }
+                        log.warning("skipping unreadable image", metadata: ["image": "\(image.reference)", "error": "\(error)"])
+                    }
+                }
+                try Output.renderTemplate(template, payload: resources)
+                return
+            }
+
             try await Self.renderImages(
                 images: images,
-                format: format,
+                format: format.listFormat,
                 verbose: verbose,
                 resolve: { image in
                     try await image.toImageResource(containerSystemConfig: containerSystemConfig)

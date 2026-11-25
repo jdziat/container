@@ -1,0 +1,19 @@
+# Edge network + labels (Traefik-like) with light images.
+name: corpus-traefik
+services:
+  whoami:
+    image: docker.io/library/alpine:3.20
+    labels:
+      - "traefik.enable=true"
+    networks:
+      - edge
+    command: ["sh", "-c", "echo whoami && sleep 30"]
+  proxy:
+    image: docker.io/library/alpine:3.20
+    command: ["sh", "-c", "echo proxy && sleep 30"]
+    ports:
+      - "18081:80"
+    networks:
+      - edge
+networks:
+  edge:

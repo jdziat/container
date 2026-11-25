@@ -25,7 +25,7 @@ public struct ManagedContainer: ManagedResource {
 
     // MARK: ManagedResource
     public var id: String { configuration.id }
-    public var name: String { configuration.id }  // containers have no separate name field today
+    public var name: String { configuration.name }
 
     public var creationDate: Date { configuration.creationDate }
 

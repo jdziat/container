@@ -189,11 +189,14 @@ public struct Flags {
             arch: String?,
             capAdd: [String],
             capDrop: [String],
+            devices: [String] = [],
             cidfile: String,
             detach: Bool,
             dns: Flags.DNS,
             dnsDisabled: Bool,
             entrypoint: String?,
+            hostname: String? = nil,
+            domainname: String? = nil,
             initImage: String?,
             kernel: String?,
             kernelArgs: [String],
@@ -213,6 +216,7 @@ public struct Flags {
             runtime: String?,
             ssh: Bool,
             shmSize: String?,
+            stopTimeout: Int32? = nil,
             tmpFs: [String],
             useInit: Bool,
             virtualization: Bool,
@@ -227,11 +231,14 @@ public struct Flags {
             self.arch = arch
             self.capAdd = capAdd
             self.capDrop = capDrop
+            self.devices = devices
             self.cidfile = cidfile
             self.detach = detach
             self.dns = dns
             self.dnsDisabled = dnsDisabled
             self.entrypoint = entrypoint
+            self.hostname = hostname
+            self.domainname = domainname
             self.initImage = initImage
             self.kernel = kernel
             self.kernelArgs = kernelArgs
@@ -251,6 +258,7 @@ public struct Flags {
             self.runtime = runtime
             self.ssh = ssh
             self.shmSize = shmSize
+            self.stopTimeout = stopTimeout
             self.tmpFs = tmpFs
             self.useInit = useInit
             self.virtualization = virtualization
@@ -278,6 +286,27 @@ public struct Flags {
         )
         public var capDrop: [String] = []
 
+        @Option(
+            name: .customLong("device"),
+            help: .init(
+                "Add a host character/block device (HOST[:CONTAINER[:MODE]]). Unrestricted by default; set CONTAINER_DEVICE_ALLOWLIST_ONLY=1 to restrict to /dev/null,/dev/zero,/dev/urandom,/dev/tty (extend via CONTAINER_DEVICE_ALLOWLIST)",
+                valueName: "spec"
+            )
+        )
+        public var devices: [String] = []
+
+        @Option(
+            name: .customLong("hostname"),
+            help: .init("Container UTS hostname (does not change the network DNS name from --name)", valueName: "name")
+        )
+        public var hostname: String?
+
+        @Option(
+            name: .customLong("domainname"),
+            help: .init("Container domain name (resolv.conf domain/search + FQDN hosts alias)", valueName: "name")
+        )
+        public var domainname: String?
+
         @Option(name: .long, help: "Write the container ID to the path provided")
         public var cidfile = ""
 
@@ -298,6 +327,41 @@ public struct Flags {
 
         @Flag(name: .customLong("init"), help: "Run an init process inside the container that forwards signals and reaps processes")
         public var useInit = false
+
+        @Option(name: .customLong("add-host"), help: .init("Add a custom host-to-IP mapping to /etc/hosts (format: host:ip)", valueName: "host:ip"))
+        public var addHosts: [String] = []
+
+        @Option(name: .customLong("sysctl"), help: .init("Set a namespaced kernel parameter in the guest (format: key=value)", valueName: "key=value"))
+        public var sysctls: [String] = []
+
+        @Option(name: .customLong("stop-signal"), help: .init("Signal sent to the container on stop (name or number, e.g. SIGTERM)", valueName: "signal"))
+        public var stopSignal: String?
+
+        // Docker flags that the per-container-VM model cannot honor. They are accepted so
+        // scripts keep working, and each prints one warning explaining the difference.
+        @Flag(name: .customLong("privileged"), help: "Accepted for compatibility; each container already runs in its own VM (see warning)")
+        public var privileged = false
+
+        @Option(name: .customLong("security-opt"), help: .init("Accepted for compatibility; ignored with a warning", valueName: "opt"))
+        public var securityOpts: [String] = []
+
+        @Option(name: .customLong("pids-limit"), help: .init("Accepted for compatibility; ignored with a warning", valueName: "n"))
+        public var pidsLimit: String?
+
+        @Option(name: .customLong("expose"), help: .init("Accepted for compatibility; metadata only, use --publish to expose ports", valueName: "port"))
+        public var expose: [String] = []
+
+        @Option(name: .customLong("pid"), help: .init("Accepted for compatibility; host PID namespace is not available", valueName: "ns"))
+        public var pidMode: String?
+
+        @Option(name: .customLong("ipc"), help: .init("Accepted for compatibility; host IPC namespace is not available", valueName: "ns"))
+        public var ipcMode: String?
+
+        @Option(name: .customLong("log-driver"), help: .init("Accepted for compatibility; logs always use the built-in driver", valueName: "driver"))
+        public var logDriver: String?
+
+        @Option(name: .customLong("gpus"), help: .init("Accepted for compatibility; GPU passthrough is not available", valueName: "spec"))
+        public var gpus: String?
 
         @Option(
             name: .long,
@@ -343,7 +407,10 @@ public struct Flags {
         @Option(name: .long, help: "Use the specified name as the container ID")
         public var name: String?
 
-        @Option(name: [.customLong("network")], help: "Attach the container to a network (format: <name>[,mac=XX:XX:XX:XX:XX:XX][,mtu=VALUE][,alias=NAME]...)")
+        @Option(
+            name: [.customLong("network"), .customLong("net")],
+            help: "Attach the container to a network (format: <name>[,mac=XX:XX:XX:XX:XX:XX][,mtu=VALUE][,alias=NAME]...)"
+        )
         public var networks: [String] = []
 
         @Flag(name: [.customLong("no-dns")], help: "Do not configure DNS in the container")
@@ -400,6 +467,12 @@ public struct Flags {
 
         @Option(name: .customLong("shm-size"), help: "Size of /dev/shm (e.g. 64M, 1G)")
         public var shmSize: String?
+
+        @Option(
+            name: .customLong("stop-timeout"),
+            help: .init("Default seconds to wait on stop before killing (Compose stop_grace_period)", valueName: "seconds")
+        )
+        public var stopTimeout: Int32?
 
         @Option(name: .customLong("tmpfs"), help: "Add a tmpfs mount to the container at the given path")
         public var tmpFs: [String] = []

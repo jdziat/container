@@ -311,10 +311,12 @@ public actor NetworksService {
     ///
     /// - Parameter hostname: A canonical DNS hostname with a trailing dot (e.g. `"example.com."`).
     public func lookup(hostname: String) async throws -> Attachment? {
+        // Sort by network id so equal-quality matches (hostname/alias on two nets)
+        // resolve deterministically rather than by Dictionary iteration order.
         let sources = self.serviceStates.map { id, entry in
             let client = entry.client
             return (name: id, lookup: { @Sendable in try await client.lookup(name: hostname) })
-        }
+        }.sorted { $0.name < $1.name }
         let log = self.log
         let match = await NetworkMatchSelector.select(from: sources) { network, error in
             log.warning(

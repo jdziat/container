@@ -100,7 +100,7 @@ extension Application {
         public static let configuration = CommandConfiguration(
             commandName: "delete",
             abstract: "Delete one or more images",
-            aliases: ["rm"])
+            aliases: ["rm", "rmi"])
 
         public init() {}
 

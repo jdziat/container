@@ -1,0 +1,33 @@
+# Classic two-tier shape (WordPress-like) without pulling multi-GB images.
+name: corpus-wp
+services:
+  db:
+    image: docker.io/library/alpine:3.20
+    environment:
+      MYSQL_DATABASE: wordpress
+      MYSQL_USER: wp
+      MYSQL_PASSWORD: wppass
+    command: ["sh", "-c", "echo db-ready && sleep 60"]
+    volumes:
+      - dbdata:/var/lib/mysql
+  wordpress:
+    image: docker.io/library/alpine:3.20
+    depends_on:
+      - db
+    ports:
+      - target: 80
+        published: "18080"
+        protocol: tcp
+    environment:
+      WORDPRESS_DB_HOST: db
+      WORDPRESS_DB_USER: wp
+      WORDPRESS_DB_PASSWORD: wppass
+      WORDPRESS_DB_NAME: wordpress
+    volumes:
+      - type: volume
+        source: wpdata
+        target: /var/www/html
+    command: ["sh", "-c", "echo wp-ok && sleep 30"]
+volumes:
+  dbdata:
+  wpdata:

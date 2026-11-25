@@ -29,23 +29,52 @@ extension ContainerClient {
         guard !ids.isEmpty else {
             return ([], [])
         }
-        var filters = filters
-        filters.ids = ids
-        let byId = Dictionary(uniqueKeysWithValues: try await list(filters: filters).map { ($0.id, $0) })
+        // Server `ids` filter is Id-only. Resolve Id or Name client-side (Name≠Id).
+        // Prefer exact Id match over Name so a Name that equals another container's Id
+        // cannot silently resolve to the wrong snapshot.
+        let listed = try await list(filters: filters)
+        var byId: [String: ContainerSnapshot] = [:]
+        var byName: [String: [ContainerSnapshot]] = [:]
+        for container in listed {
+            byId[container.id] = container
+            let name = container.configuration.name
+            if !name.isEmpty {
+                byName[name, default: []].append(container)
+            }
+        }
 
-        let found = ids.compactMap { byId[$0] }
-        let notFoundErrors: [any Error] = ids.filter { byId[$0] == nil }.map { id in
-            ContainerizationError(.notFound, message: "container with ID \(id) not found")
+        var found: [ContainerSnapshot] = []
+        var notFoundErrors: [any Error] = []
+        for key in ids {
+            if let snap = byId[key] {
+                found.append(snap)
+            } else if let named = byName[key] {
+                if named.count == 1, let snap = named.first {
+                    found.append(snap)
+                } else {
+                    notFoundErrors.append(
+                        ContainerizationError(
+                            .invalidArgument,
+                            message:
+                                "container name \(key) is ambiguous (\(named.count) matches); use a unique ID"
+                        )
+                    )
+                }
+            } else {
+                notFoundErrors.append(
+                    ContainerizationError(.notFound, message: "container with ID or name \(key) not found")
+                )
+            }
         }
         return (found, notFoundErrors)
     }
 
     /// Looks up a single container through `filters`, throwing a not-found error if it doesn't exist
-    /// or `filters` hides it.
+    /// or `filters` hides it. Accepts stable Id or Name.
     func findContainer(id: String, filters: ContainerListFilters) async throws -> ContainerSnapshot {
         let (found, _) = try await findContainers(named: [id], filters: filters)
         guard let container = found.first else {
-            throw ContainerizationError(.notFound, message: "container with ID \(id) not found")
+            throw ContainerizationError(.notFound, message: "container with ID or name \(id) not found")
         }
         return container
     }

@@ -44,17 +44,17 @@ struct NetworkMatchSelectorTests {
         #expect(NetworkMatchSelector().best == nil)
     }
 
-    @Test func testHostnameIsDecisive() throws {
+    @Test func testHostnameIsPreferredButNotGloballyDecisive() throws {
         var selector = NetworkMatchSelector()
 
-        #expect(selector.offer(try match("a", .hostname)))
+        #expect(!selector.offer(try match("a", .hostname)))
         #expect(selector.best?.attachment.network == "a")
     }
 
-    @Test func testExactAliasIsDecisive() throws {
+    @Test func testExactAliasIsPreferredButNotGloballyDecisive() throws {
         var selector = NetworkMatchSelector()
 
-        #expect(selector.offer(try match("a", .alias)))
+        #expect(!selector.offer(try match("a", .alias)))
         #expect(selector.best?.attachment.network == "a")
     }
 
@@ -96,7 +96,7 @@ struct NetworkMatchSelectorTests {
         var selector = NetworkMatchSelector()
 
         #expect(!selector.offer(try match("subtree", .subtree(baseLabelCount: 4))))
-        #expect(selector.offer(try match("exact", .hostname)))
+        #expect(!selector.offer(try match("exact", .hostname)))
 
         #expect(selector.best?.attachment.network == "exact")
     }
@@ -127,11 +127,11 @@ struct NetworkMatchSelectorTests {
         }
     }
 
-    @Test func testSubtreeAfterADecisiveMatchDoesNotReplaceIt() throws {
+    @Test func testSubtreeAfterHostnameDoesNotReplaceIt() throws {
         var selector = NetworkMatchSelector()
 
         selector.offer(try match("exact", .hostname))
-        #expect(selector.offer(try match("subtree", .subtree(baseLabelCount: 5))))
+        #expect(!selector.offer(try match("subtree", .subtree(baseLabelCount: 5))))
 
         #expect(selector.best?.attachment.network == "exact")
     }
@@ -177,7 +177,7 @@ struct NetworkMatchSelectorTests {
         #expect(asked.names == ["a", "b", "c"])
     }
 
-    @Test func testSelectStopsAtTheFirstDecisiveMatch() async throws {
+    @Test func testSelectScansAllNetworksPreferringAliasOverSubtree() async throws {
         let asked = Asked()
         let subtree = try match("subtree", .subtree(baseLabelCount: 3))
         let exact = try match("exact", .alias)
@@ -192,7 +192,7 @@ struct NetworkMatchSelectorTests {
         )
 
         #expect(selected?.attachment.network == "exact")
-        #expect(asked.names == ["a", "b"])
+        #expect(asked.names == ["a", "b", "c"])
     }
 
     @Test func testSelectSkipsASourceThatFailsAndReportsIt() async throws {

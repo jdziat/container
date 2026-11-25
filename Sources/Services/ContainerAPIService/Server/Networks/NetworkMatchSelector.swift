@@ -18,48 +18,58 @@ import ContainerNetworkClient
 
 /// Chooses the best answer to a name from the matches that individual networks report.
 ///
-/// A hostname or an exact alias is decisive. Both are unique across all networks, so no other network
-/// can have a better match, and the search can stop. A subtree alias is not decisive: another network
-/// may have a hostname, an exact alias, or a subtree alias with a longer base, which is the most
-/// specific. Two different subtrees that match a name and have the same number of labels in the base
-/// must have the same base, and a base belongs to one container, so there is no tie to break.
+/// Exact hostnames and aliases are unique **per network** (L3), so the same name may exist on
+/// more than one network. Preference within a cross-network scan: hostname, then exact alias,
+/// then the subtree alias with the longest base. When two networks offer the same kind, the
+/// first reported wins — callers should pass sources in a stable order (e.g. sorted network
+/// ids) so ties are deterministic. Guests normally query DNS for a single attached network;
+/// this aggregator is for host-side lookups across all networks.
 struct NetworkMatchSelector {
     /// The best match offered so far.
     private(set) var best: NetworkMatch?
 
     /// Considers a match reported by a network.
     ///
-    /// - Returns: `true` if the match is decisive and the search can stop.
+    /// - Returns: always `false` so the caller scans every network (names are not globally unique).
     @discardableResult
     mutating func offer(_ match: NetworkMatch) -> Bool {
         switch match.kind {
-        case .hostname, .alias:
-            best = match
-            return true
+        case .hostname:
+            switch best?.kind {
+            case .hostname?:
+                break
+            default:
+                best = match
+            }
+        case .alias:
+            switch best?.kind {
+            case .hostname?, .alias?:
+                break
+            default:
+                best = match
+            }
         case .subtree(let baseLabelCount):
             switch best?.kind {
             case .hostname?, .alias?:
-                // A decisive match was already found, and nothing beats it.
-                return true
+                break
             case .subtree(let bestBaseLabelCount)?:
-                if bestBaseLabelCount >= baseLabelCount {
-                    return false
+                if baseLabelCount > bestBaseLabelCount {
+                    best = match
                 }
             case nil:
-                break
+                best = match
             }
-            best = match
-            return false
         }
+        return false
     }
 }
 
 extension NetworkMatchSelector {
     /// Looks the name up on each source, and returns the best match.
     ///
-    /// The sources are asked in order, and the search stops at the first decisive match. A source that
-    /// throws is skipped, and reported to `onFailure`. A network whose helper is starting up or shutting
-    /// down cannot answer, and it should not make the answers of the other networks fail.
+    /// Every source is asked. A source that throws is skipped, and reported to `onFailure`. A network
+    /// whose helper is starting up or shutting down cannot answer, and it should not make the answers
+    /// of the other networks fail.
     ///
     /// - Parameters:
     ///   - sources: The networks to ask, each with a name for reporting and a function that does the lookup.

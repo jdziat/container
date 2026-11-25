@@ -74,9 +74,14 @@ struct AliasPolicyTests {
         expectViolation("more than once", ["api.test", "API.test."])
     }
 
-    @Test("An exact alias needs at least two labels", arguments: ["api", "localhost", "API."])
-    func exactNeedsTwoLabels(alias: String) {
-        expectViolation("fully qualified", [alias])
+    @Test("An exact single-label alias is accepted for guest hosts/DNS", arguments: ["api", "redis", "API."])
+    func exactSingleLabelAllowed(alias: String) throws {
+        #expect(try validate([alias]).count == 1)
+    }
+
+    @Test("Reserved single-label aliases are rejected", arguments: ["localhost", "LOCALHOST", "localdomain"])
+    func reservedExactAliasRejected(alias: String) {
+        expectViolation("reserved", [alias])
     }
 
     @Test("An exact alias cannot be the hostname of the attachment")

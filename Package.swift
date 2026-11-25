@@ -24,11 +24,18 @@ let releaseVersion = ProcessInfo.processInfo.environment["RELEASE_VERSION"] ?? "
 let gitCommit = ProcessInfo.processInfo.environment["GIT_COMMIT"] ?? "unspecified"
 let builderShimVersion = "0.13.3"
 let scVersion = "0.54.0"
+/// Set `CONTAINER_VMM_CR=1` to link CRVirtualization dual-backend (path deps).
+let enableCRVMM = ProcessInfo.processInfo.environment["CONTAINER_VMM_CR"] == "1"
 
-let package = Package(
+let containerizationDependency: Package.Dependency = enableCRVMM
+    ? .package(path: "../virtualization.framework/Vendor/containerization")
+    : .package(url: "https://github.com/apple/containerization.git", exact: Version(stringLiteral: scVersion))
+
+var package = Package(
     name: "container",
     platforms: [.macOS("15")],
     products: [
+        .executable(name: "container-gui", targets: ["container-gui"]),
         .library(name: "ContainerCommands", targets: ["ContainerCommands"]),
         .library(name: "ContainerBuild", targets: ["ContainerBuild"]),
         .library(name: "ContainerAPIService", targets: ["ContainerAPIService"]),
@@ -56,7 +63,7 @@ let package = Package(
         .library(name: "ContainerCluster", targets: ["ContainerCluster"]),
     ],
     dependencies: [
-        .package(url: "https://github.com/apple/containerization.git", exact: Version(stringLiteral: scVersion)),
+        containerizationDependency,
         .package(url: "https://github.com/apple/swift-argument-parser.git", from: "1.7.0"),
         .package(url: "https://github.com/apple/swift-collections.git", from: "1.2.0"),
         .package(url: "https://github.com/apple/swift-configuration", from: "1.0.0"),
@@ -72,7 +79,7 @@ let package = Package(
         .package(url: "https://github.com/mattt/swift-toml.git", from: "2.0.0"),
         .package(url: "https://github.com/mattt/swift-configuration-toml", from: "2.0.0"),
         .package(url: "https://github.com/jpsim/Yams.git", from: "6.2.1"),
-    ],
+    ] + (enableCRVMM ? [.package(path: "../virtualization.framework")] : []),
     targets: [
         .executableTarget(
             name: "container",
@@ -539,23 +546,31 @@ let package = Package(
         ),
         .target(
             name: "ContainerRuntimeLinuxServer",
-            dependencies: [
-                .product(name: "Logging", package: "swift-log"),
-                .product(name: "Containerization", package: "containerization"),
-                .product(name: "ContainerizationExtras", package: "containerization"),
-                .product(name: "ContainerizationOS", package: "containerization"),
-                .product(name: "ArgumentParser", package: "swift-argument-parser"),
-                "ContainerAPIClient",
-                "ContainerNetworkClient",
-                "ContainerOS",
-                "ContainerPersistence",
-                "ContainerResource",
-                "ContainerRuntimeClient",
-                "ContainerRuntimeLinuxClient",
-                "ContainerXPC",
-                "SocketForwarder",
-            ],
-            path: "Sources/Services/RuntimeLinux/Server"
+            dependencies: {
+                var deps: [Target.Dependency] = [
+                    .product(name: "Logging", package: "swift-log"),
+                    .product(name: "Containerization", package: "containerization"),
+                    .product(name: "ContainerizationExtras", package: "containerization"),
+                    .product(name: "ContainerizationOS", package: "containerization"),
+                    .product(name: "ArgumentParser", package: "swift-argument-parser"),
+                    "ContainerAPIClient",
+                    "ContainerNetworkClient",
+                    "ContainerOS",
+                    "ContainerPersistence",
+                    "ContainerResource",
+                    "ContainerRuntimeClient",
+                    "ContainerRuntimeLinuxClient",
+                    "ContainerXPC",
+                    "SocketForwarder",
+                ]
+                if enableCRVMM {
+                    // Path package identity is the directory name.
+                    deps.append(.product(name: "CRContainerization", package: "virtualization.framework"))
+                }
+                return deps
+            }(),
+            path: "Sources/Services/RuntimeLinux/Server",
+            swiftSettings: enableCRVMM ? [.define("CONTAINER_VMM_CR")] : []
         ),
         .target(
             name: "ContainerRuntimeClient",
@@ -836,6 +851,14 @@ let package = Package(
             ],
             path: "Sources/Plugins/ContainerCompose",
             exclude: ["config.toml"]
+        ),
+        .executableTarget(
+            name: "container-gui",
+            dependencies: [
+                "ContainerAPIClient",
+                "ContainerResource",
+            ],
+            path: "Sources/ContainerGUI"
         ),
         .executableTarget(
             name: "container-docker-api-bridge",

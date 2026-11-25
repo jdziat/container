@@ -32,6 +32,11 @@ public final class ContainerSystemConfig: Codable, Sendable, Initable {
     public let network: NetworkConfig
     public let registry: RegistryConfig
     public let vminit: VminitConfig
+    /// When true (default), apiserver spawns docker-api-bridge with `--privileged-sock`
+    /// so `/var/run/docker.sock` is available for IDE/TC discovery. Set
+    /// `enginePrivilegedSock = false` or `CONTAINER_INCORE_DOCKER_SOCK=0` to opt out.
+    /// Application Support Recipe A sock remains available either way.
+    public let enginePrivilegedSock: Bool
 
     public init(
         build: BuildConfig = .init(),
@@ -41,7 +46,8 @@ public final class ContainerSystemConfig: Codable, Sendable, Initable {
         machine: MachineConfig = MachineConfig.default,
         network: NetworkConfig = .init(),
         registry: RegistryConfig = .init(),
-        vminit: VminitConfig = .init()
+        vminit: VminitConfig = .init(),
+        enginePrivilegedSock: Bool = true
     ) {
         self.build = build
         self.container = container
@@ -51,6 +57,7 @@ public final class ContainerSystemConfig: Codable, Sendable, Initable {
         self.network = network
         self.registry = registry
         self.vminit = vminit
+        self.enginePrivilegedSock = enginePrivilegedSock
     }
 
     public init() {
@@ -62,6 +69,7 @@ public final class ContainerSystemConfig: Codable, Sendable, Initable {
         self.network = .init()
         self.registry = .init()
         self.vminit = .init()
+        self.enginePrivilegedSock = true
     }
 
     public init(from decoder: any Decoder) throws {
@@ -74,6 +82,23 @@ public final class ContainerSystemConfig: Codable, Sendable, Initable {
         self.network = try container.decodeIfPresent(NetworkConfig.self, forKey: .network) ?? .init()
         self.registry = try container.decodeIfPresent(RegistryConfig.self, forKey: .registry) ?? .init()
         self.vminit = try container.decodeIfPresent(VminitConfig.self, forKey: .vminit) ?? .init()
+        self.enginePrivilegedSock = try container.decodeIfPresent(Bool.self, forKey: .enginePrivilegedSock) ?? true
+    }
+
+    /// True unless explicitly opted out (`CONTAINER_INCORE_DOCKER_SOCK=0` / false / no,
+    /// or `enginePrivilegedSock = false` with no forcing env).
+    public static func wantsInCoreDockerSock(
+        config: ContainerSystemConfig,
+        environment: [String: String] = ProcessInfo.processInfo.environment
+    ) -> Bool {
+        let raw = environment["CONTAINER_INCORE_DOCKER_SOCK"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased()
+        if let raw, !raw.isEmpty {
+            if raw == "0" || raw == "false" || raw == "no" { return false }
+            if raw == "1" || raw == "true" || raw == "yes" { return true }
+        }
+        return config.enginePrivilegedSock
     }
 }
 

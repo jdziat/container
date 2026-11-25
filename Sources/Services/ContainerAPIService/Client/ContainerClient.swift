@@ -107,16 +107,26 @@ public struct ContainerClient: Sendable {
         }
     }
 
-    /// Get the container for the provided id.
+    /// Get the container for the provided Id or Name (Name≠Id).
     public func get(id: String) async throws -> ContainerSnapshot {
         let containers = try await list(filters: ContainerListFilters(ids: [id]))
-        guard let container = containers.first else {
+        guard !containers.isEmpty else {
             throw ContainerizationError(
                 .notFound,
                 message: "get failed: container \(id) not found"
             )
         }
-        return container
+        // Prefer a stable Id hit. Multiple Name matches without an Id hit are ambiguous.
+        if let byId = containers.first(where: { $0.configuration.id == id }) {
+            return byId
+        }
+        guard containers.count == 1 else {
+            throw ContainerizationError(
+                .invalidArgument,
+                message: "get failed: container name \(id) matches \(containers.count) containers"
+            )
+        }
+        return containers[0]
     }
 
     /// Bootstrap the container's init process.
@@ -292,6 +302,168 @@ public struct ContainerClient: Sendable {
             throw ContainerizationError(
                 .internalError,
                 message: "failed to get logs for container \(id)",
+                cause: error
+            )
+        }
+    }
+
+    /// Connect a container to a network.
+    public func networkConnect(
+        id: String,
+        network: String,
+        aliases: [String] = [],
+        restartIfRunning: Bool = false
+    ) async throws {
+        let request = XPCMessage(route: .containerNetworkConnect)
+        request.set(key: .id, value: id)
+        request.set(key: .networkId, value: network)
+        request.set(key: .networkAliases, value: try JSONEncoder().encode(aliases))
+        request.set(key: .restartIfRunning, value: restartIfRunning)
+        do {
+            try await xpcSend(message: request, timeout: .seconds(300))
+        } catch {
+            throw ContainerizationError(
+                .internalError,
+                message: "failed to connect container \(id) to network \(network)",
+                cause: error
+            )
+        }
+    }
+
+    /// Disconnect a container from a network.
+    public func networkDisconnect(
+        id: String,
+        network: String,
+        restartIfRunning: Bool = false,
+        force: Bool = false
+    ) async throws {
+        let request = XPCMessage(route: .containerNetworkDisconnect)
+        request.set(key: .id, value: id)
+        request.set(key: .networkId, value: network)
+        request.set(key: .restartIfRunning, value: restartIfRunning)
+        request.set(key: .forceDelete, value: force)
+        do {
+            try await xpcSend(message: request, timeout: .seconds(300))
+        } catch {
+            throw ContainerizationError(
+                .internalError,
+                message: "failed to disconnect container \(id) from network \(network)",
+                cause: error
+            )
+        }
+    }
+
+    /// Update mutable container configuration fields.
+    public func update(
+        id: String,
+        cpus: Int? = nil,
+        memoryInBytes: UInt64? = nil,
+        restartPolicy: RestartPolicy? = nil,
+        restartMaxRetries: UInt64? = nil
+    ) async throws {
+        let request = ContainerUpdateRequest(
+            cpus: cpus,
+            memoryInBytes: memoryInBytes,
+            restartPolicy: restartPolicy,
+            restartMaxRetries: restartMaxRetries
+        )
+        let message = XPCMessage(route: .containerUpdate)
+        message.set(key: .id, value: id)
+        message.set(key: .updateConfig, value: try JSONEncoder().encode(request))
+        do {
+            try await xpcSend(message: message)
+        } catch {
+            throw ContainerizationError(
+                .internalError,
+                message: "failed to update container \(id)",
+                cause: error
+            )
+        }
+    }
+
+    /// Rename a container (Id stays fixed; Name changes).
+    public func rename(id: String, newName: String) async throws {
+        let request = XPCMessage(route: .containerRename)
+        request.set(key: .id, value: id)
+        request.set(key: .newName, value: newName)
+        do {
+            try await xpcSend(message: request)
+        } catch {
+            throw ContainerizationError(
+                .internalError,
+                message: "failed to rename container \(id)",
+                cause: error
+            )
+        }
+    }
+
+    /// Pause a running container (suspend its VM).
+    public func pause(id: String) async throws {
+        let request = XPCMessage(route: .containerPause)
+        request.set(key: .id, value: id)
+        do {
+            try await xpcSend(message: request)
+        } catch {
+            throw ContainerizationError(
+                .internalError,
+                message: "failed to pause container \(id)",
+                cause: error
+            )
+        }
+    }
+
+    /// Unpause a paused container.
+    public func unpause(id: String) async throws {
+        let request = XPCMessage(route: .containerUnpause)
+        request.set(key: .id, value: id)
+        do {
+            try await xpcSend(message: request)
+        } catch {
+            throw ContainerizationError(
+                .internalError,
+                message: "failed to unpause container \(id)",
+                cause: error
+            )
+        }
+    }
+
+    /// Filesystem changes versus the image snapshot.
+    public func diff(id: String) async throws -> [ContainerDiffChange] {
+        let request = XPCMessage(route: .containerDiff)
+        request.set(key: .id, value: id)
+        do {
+            let response = try await xpcSend(message: request, timeout: .seconds(300))
+            guard let data = response.dataNoCopy(key: .containerDiff) else {
+                throw ContainerizationError(
+                    .internalError, message: "diff response missing containerDiff payload")
+            }
+            return try JSONDecoder().decode([ContainerDiffChange].self, from: data)
+        } catch {
+            throw ContainerizationError(
+                .internalError,
+                message: "failed to diff container \(id)",
+                cause: error
+            )
+        }
+    }
+
+    /// Long-poll for lifecycle events with id greater than `since`.
+    ///
+    /// - Parameter timeout: Per-poll XPC timeout. Bridge clients should use a shorter
+    ///   value so a disconnected stream can observe cancellation between polls.
+    public func events(since: UInt64, timeout: Duration = .seconds(60)) async throws -> [ContainerEvent] {
+        let request = XPCMessage(route: .containerEvent)
+        request.set(key: .eventSince, value: since)
+        do {
+            let response = try await xpcSend(message: request, timeout: timeout)
+            guard let data = response.dataNoCopy(key: .containerEvents) else {
+                return []
+            }
+            return try JSONDecoder().decode([ContainerEvent].self, from: data)
+        } catch {
+            throw ContainerizationError(
+                .internalError,
+                message: "failed to wait for container events",
                 cause: error
             )
         }

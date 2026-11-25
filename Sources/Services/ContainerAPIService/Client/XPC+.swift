@@ -42,6 +42,20 @@ public enum XPCKeys: String {
     case exitedAt
     /// An event that occurred in a container
     case containerEvent
+    /// Encoded `[ContainerEvent]` batch for `container events`
+    case containerEvents
+    /// Exclusive lower bound event id for `container events` long-poll
+    case eventSince
+    /// New container name for rename
+    case newName
+    /// Encoded partial update payload for `container update`
+    case updateConfig
+    /// Encoded `[ContainerDiffChange]` for `container diff`
+    case containerDiff
+    /// Network aliases for connect
+    case networkAliases
+    /// Restart running container after network change
+    case restartIfRunning
     /// Error key.
     case error
     /// FD to a container resource key.
@@ -166,6 +180,13 @@ public enum XPCRoute: String {
     case containerCopyOut
     case containerExport
     case containerClean
+    case containerRename
+    case containerUpdate
+    case containerPause
+    case containerUnpause
+    case containerDiff
+    case containerNetworkConnect
+    case containerNetworkDisconnect
 
     case pluginLoad
     case pluginGet

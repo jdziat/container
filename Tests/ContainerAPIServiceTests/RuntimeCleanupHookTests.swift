@@ -40,6 +40,22 @@ struct RuntimeCleanupHookTests {
         return try #require(pid_t(text.trimmingCharacters(in: .whitespacesAndNewlines)))
     }
 
+    // Under parallel load the hook may be killed before the shell flushes the pid file;
+    // poll briefly so a late write still counts.
+    private static func waitForPid(in dir: URL, file: String) async throws -> pid_t {
+        let deadline = ContinuousClock.now + .seconds(2)
+        var lastError: Error?
+        while ContinuousClock.now < deadline {
+            do {
+                return try pid(in: dir, file: file)
+            } catch {
+                lastError = error
+                try await Task.sleep(for: .milliseconds(20))
+            }
+        }
+        throw lastError ?? CocoaError(.fileReadNoSuchFile)
+    }
+
     // An orphaned child is reaped by launchd asynchronously, so poll.
     private static func isGone(_ pid: pid_t) async throws -> Bool {
         let deadline = ContinuousClock.now + .seconds(2)
@@ -83,22 +99,26 @@ struct RuntimeCleanupHookTests {
 
     @Test
     func killsAHungPlugin() async throws {
+        // Write the pid before sleeping so a short timeout under load still leaves a file to assert on.
+        // Timeout is generous enough for shell startup under parallel test contention, but still
+        // well under the 5s upper bound below.
         let (plugin, dir) = try Self.script(#"echo $$ > "$(dirname "$0")/pid"; trap '' TERM; sleep 30"#)
         defer { try? FileManager.default.removeItem(at: dir) }
 
         let start = ContinuousClock.now
-        #expect(await !RuntimeCleanupHook.run(plugin: Self.plugin(plugin), root: dir, id: "abc", log: Logger(label: "test"), timeout: .milliseconds(300)))
+        #expect(await !RuntimeCleanupHook.run(plugin: Self.plugin(plugin), root: dir, id: "abc", log: Logger(label: "test"), timeout: .seconds(1)))
         #expect(ContinuousClock.now - start < .seconds(5))
-        #expect(try await Self.isGone(Self.pid(in: dir, file: "pid")))
+        #expect(try await Self.isGone(try await Self.waitForPid(in: dir, file: "pid")))
     }
 
     @Test
     func killsThePluginsChildren() async throws {
+        // Direct child of the plugin shell.
         let (plugin, dir) = try Self.script(#"sleep 30 & echo $! > "$(dirname "$0")/child"; wait"#)
         defer { try? FileManager.default.removeItem(at: dir) }
 
-        #expect(await !RuntimeCleanupHook.run(plugin: Self.plugin(plugin), root: dir, id: "abc", log: Logger(label: "test"), timeout: .milliseconds(300)))
-        #expect(try await Self.isGone(Self.pid(in: dir, file: "child")))
+        #expect(await !RuntimeCleanupHook.run(plugin: Self.plugin(plugin), root: dir, id: "abc", log: Logger(label: "test"), timeout: .seconds(1)))
+        #expect(try await Self.isGone(try await Self.waitForPid(in: dir, file: "child")))
     }
 
     @Test

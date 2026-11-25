@@ -1,0 +1,79 @@
+# Core of production Nextcloud (postgres+redis+app+cron), adapted from
+# heyvaldemar/nextcloud-traefik-letsencrypt-docker-compose (no Traefik/LE/docker.sock).
+name: prod-nextcloud
+services:
+  postgres:
+    container_name: prod-nc-postgres
+    image: docker.io/library/postgres:16
+    restart: unless-stopped
+    stop_grace_period: 60s
+    environment:
+      POSTGRES_DB: nextclouddb
+      POSTGRES_USER: nextcloud
+      POSTGRES_PASSWORD: nc_db_pass_prod_test_7c2e
+      # Named volumes often include lost+found; official image supports PGDATA subdir.
+      PGDATA: /var/lib/postgresql/data/pgdata
+    volumes:
+      - nc_pg:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U nextcloud -d nextclouddb"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+  redis:
+    container_name: prod-nc-redis
+    image: docker.io/library/redis:7.4-alpine
+    restart: unless-stopped
+    command: ["redis-server", "--requirepass", "nc_redis_pass_prod_test_7c2e"]
+    environment:
+      REDISCLI_AUTH: nc_redis_pass_prod_test_7c2e
+    volumes:
+      - nc_redis:/data
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli ping | grep -q PONG"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+  nextcloud:
+    container_name: prod-nc-app
+    image: docker.io/library/nextcloud:30-apache
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    ports:
+      - "18081:80"
+    environment:
+      POSTGRES_HOST: postgres
+      POSTGRES_DB: nextclouddb
+      POSTGRES_USER: nextcloud
+      POSTGRES_PASSWORD: nc_db_pass_prod_test_7c2e
+      REDIS_HOST: redis
+      REDIS_HOST_PASSWORD: nc_redis_pass_prod_test_7c2e
+      NEXTCLOUD_ADMIN_USER: admin
+      NEXTCLOUD_ADMIN_PASSWORD: nc_admin_pass_prod_test_7c2e
+      NEXTCLOUD_TRUSTED_DOMAINS: localhost 127.0.0.1
+    volumes:
+      - nc_data:/var/www/html
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1/status.php >/dev/null || curl -fsS http://127.0.0.1/ >/dev/null || exit 1"]
+      interval: 15s
+      timeout: 10s
+      retries: 40
+      start_period: 120s
+  nextcloud-cron:
+    container_name: prod-nc-cron
+    image: docker.io/library/nextcloud:30-apache
+    restart: unless-stopped
+    entrypoint: /cron.sh
+    depends_on:
+      - nextcloud
+    volumes:
+      - nc_data:/var/www/html
+volumes:
+  nc_pg:
+  nc_redis:
+  nc_data:

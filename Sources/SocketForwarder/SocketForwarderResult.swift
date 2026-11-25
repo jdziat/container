@@ -14,24 +14,43 @@
 // limitations under the License.
 //===----------------------------------------------------------------------===//
 
+import Foundation
 import NIO
 
 public struct SocketForwarderResult: Sendable {
     private let channel: any Channel
+    private let closeState: CloseState
+
+    private final class CloseState: @unchecked Sendable {
+        private let lock = NSLock()
+        private var closed = false
+        func markClosed() -> Bool {
+            lock.lock()
+            defer { lock.unlock() }
+            if closed { return false }
+            closed = true
+            return true
+        }
+    }
 
     public init(channel: Channel) {
         self.channel = channel
+        self.closeState = CloseState()
     }
 
     public var proxyAddress: SocketAddress? { self.channel.localAddress }
 
     public func close() {
-        self.channel.eventLoop.execute {
-            _ = channel.close()
-        }
+        guard closeState.markClosed() else { return }
+        // Only close while the channel reports active. Closing an already-torn-down
+        // listen FD races with EventLoopGroup shutdown and can EBADF-trap in Posix.close.
+        guard channel.isActive else { return }
+        channel.close(mode: .all, promise: nil)
     }
 
     public func wait() async throws {
-        try await self.channel.closeFuture.get()
+        // Always await closeFuture so callers that close() then wait() still
+        // observe full teardown (isActive may already be false).
+        try await channel.closeFuture.get()
     }
 }
