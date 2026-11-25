@@ -450,7 +450,8 @@ extension APIServer {
             try? await Task.sleep(for: .milliseconds(400))
             if !process.isRunning {
                 let errData = errPipe.fileHandleForReading.readDataToEndOfFile()
-                let errText = String(data: errData, encoding: .utf8)?
+                let errText =
+                    String(data: errData, encoding: .utf8)?
                     .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
                 log.warning(
                     "in-core /var/run/docker.sock bind failed; continuing with Application Support sock only",

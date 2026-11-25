@@ -1341,7 +1341,6 @@ public actor ContainersService {
         self.pendingPeerHostsRefresh.append(value)
     }
 
-
     private func drainPendingPeerHostsRefresh() -> [(id: String, networks: Set<String>, retiredIPs: Set<String>)] {
         let values = self.pendingPeerHostsRefresh
         self.pendingPeerHostsRefresh = []
@@ -2330,9 +2329,10 @@ public actor ContainersService {
             var state = try await self.getContainerState(id: id, context: context)
             let before = state.snapshot.configuration.networks.count
             let primaryNetwork = state.snapshot.configuration.networks.first?.network
-            guard let index = state.snapshot.configuration.networks.firstIndex(where: {
-                $0.network == networkID || $0.network == network
-            })
+            guard
+                let index = state.snapshot.configuration.networks.firstIndex(where: {
+                    $0.network == networkID || $0.network == network
+                })
             else {
                 if force { return nil }
                 throw ContainerizationError(

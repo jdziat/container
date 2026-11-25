@@ -75,7 +75,11 @@ struct GoTemplateTests {
     }
 
     @Test func renderedTemplateRunsTheRealEncodeThenRenderPath() throws {
-        struct Row: Encodable { let id: String; let configuration: Cfg; struct Cfg: Encodable { let name: String } }
+        struct Row: Encodable {
+            let id: String
+            let configuration: Cfg
+            struct Cfg: Encodable { let name: String }
+        }
         let payload = [Row(id: "1", configuration: .init(name: "a")), Row(id: "2", configuration: .init(name: "b"))]
         #expect(try Output.renderedTemplate("{{.Names}}", payload: payload) == "a\nb")
     }

@@ -1009,8 +1009,9 @@ struct ComposePlanner {
             let existing = Set(rows.compactMap { ($0["configuration"] as? [String: Any])?["name"] as? String })
             for svc in services {
                 for name in Self.plannedContainerNames(svc) where existing.contains(name) && !owned.contains(name) {
-                    FileHandle.standardError.write(Data(
-                        "warning: container '\(name)' exists but is not labeled for project '\(project)'; not touching it (delete it manually if it is yours)\n".utf8))
+                    FileHandle.standardError.write(
+                        Data(
+                            "warning: container '\(name)' exists but is not labeled for project '\(project)'; not touching it (delete it manually if it is yours)\n".utf8))
                 }
             }
         }
@@ -1457,11 +1458,10 @@ struct ComposePlanner {
             let build = try parseBuild(body["build"], service: name, base: composeDir)
             var image = body["image"] as? String
             if image == nil {
-                if build != nil {
-                    image = "\(projectName)_\(name):latest"
-                } else {
+                guard build != nil else {
                     throw ComposeError.invalid("service \(name) requires image: or build:")
                 }
+                image = "\(projectName)_\(name):latest"
             }
 
             var environment = try parseEnvironment(body["environment"], service: name)
@@ -1923,19 +1923,18 @@ private func artifactMounts(
 ) throws -> [String] {
     guard let raw else { return [] }
     var refs: [(name: String, target: String)] = []
-    if let list = raw as? [Any] {
-        for item in list {
-            if let s = item as? String {
-                refs.append((s, "\(defaultTarget)/\(s)"))
-            } else if let m = item as? [String: Any], let source = m["source"] as? String {
-                let target = (m["target"] as? String) ?? "\(defaultTarget)/\(source)"
-                refs.append((source, target))
-            } else {
-                throw ComposeError.invalid("service \(service): invalid configs/secrets entry")
-            }
-        }
-    } else {
+    guard let list = raw as? [Any] else {
         throw ComposeError.invalid("service \(service): configs/secrets must be a list")
+    }
+    for item in list {
+        if let s = item as? String {
+            refs.append((s, "\(defaultTarget)/\(s)"))
+        } else if let m = item as? [String: Any], let source = m["source"] as? String {
+            let target = (m["target"] as? String) ?? "\(defaultTarget)/\(source)"
+            refs.append((source, target))
+        } else {
+            throw ComposeError.invalid("service \(service): invalid configs/secrets entry")
+        }
     }
     var mounts: [String] = []
     for ref in refs {
@@ -2284,7 +2283,8 @@ private func parseEnvironment(_ raw: Any?, service: String) throws -> [String: S
                 throw ComposeError.invalid("service \(service): environment list entries must have a non-empty key")
             }
             // Compose list form `FOO` (no `=`) resolves from the host environment.
-            environment[key] = parts.count == 1
+            environment[key] =
+                parts.count == 1
                 ? (ProcessInfo.processInfo.environment[key] ?? "")
                 : parts[1]
         }
@@ -2297,7 +2297,8 @@ private func parseEnvironment(_ raw: Any?, service: String) throws -> [String: S
             guard let key = parts.first, !key.isEmpty else {
                 throw ComposeError.invalid("service \(service): environment list entries must have a non-empty key")
             }
-            environment[key] = parts.count == 1
+            environment[key] =
+                parts.count == 1
                 ? (ProcessInfo.processInfo.environment[key] ?? "")
                 : parts[1]
         }
@@ -2349,11 +2350,10 @@ private func parseCommand(_ raw: Any?, service: String) throws -> [String] {
     if let cmdAny = raw as? [Any] {
         var parsed: [String] = []
         for (idx, el) in cmdAny.enumerated() {
-            if let s = stringifyScalar(el) {
-                parsed.append(s)
-            } else {
+            guard let s = stringifyScalar(el) else {
                 throw ComposeError.invalid("service \(service): command[\(idx)] must be a string or number")
             }
+            parsed.append(s)
         }
         return parsed
     }
@@ -2454,11 +2454,10 @@ func interpolateComposeString(_ input: String, env: [String: String]) throws -> 
             nameEnd = input.index(after: nameEnd)
             while nameEnd < input.endIndex {
                 let c = input[nameEnd]
-                if c.isLetter || c.isNumber || c == "_" {
-                    nameEnd = input.index(after: nameEnd)
-                } else {
+                guard c.isLetter || c.isNumber || c == "_" else {
                     break
                 }
+                nameEnd = input.index(after: nameEnd)
             }
             let name = String(input[afterDollar..<nameEnd])
             out.append(env[name] ?? "")
@@ -2783,10 +2782,12 @@ func inspectRow(_ id: String) throws -> InspectRow {
     }
     let cfg = first["configuration"] as? [String: Any]
     let name = (cfg?["id"] as? String) ?? id
-    let image = (cfg?["image"] as? [String: Any])?["reference"] as? String
+    let image =
+        (cfg?["image"] as? [String: Any])?["reference"] as? String
         ?? cfg?["image"] as? String
         ?? "?"
-    let status = (first["status"] as? String)
+    let status =
+        (first["status"] as? String)
         ?? (first["status"] as? [String: Any])?["state"] as? String
         ?? "?"
     return InspectRow(name: name, image: image, status: status)

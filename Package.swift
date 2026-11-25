@@ -27,7 +27,8 @@ let scVersion = "0.54.0"
 /// Set `CONTAINER_VMM_CR=1` to link CRVirtualization dual-backend (path deps).
 let enableCRVMM = ProcessInfo.processInfo.environment["CONTAINER_VMM_CR"] == "1"
 
-let containerizationDependency: Package.Dependency = enableCRVMM
+let containerizationDependency: Package.Dependency =
+    enableCRVMM
     ? .package(path: "../virtualization.framework/Vendor/containerization")
     : .package(url: "https://github.com/apple/containerization.git", exact: Version(stringLiteral: scVersion))
 

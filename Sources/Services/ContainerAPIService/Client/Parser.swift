@@ -1287,7 +1287,8 @@ public struct Parser {
                 throw ContainerizationError(
                     .invalidArgument, message: "--add-host '\(spec)': host-gateway is not supported; use the gateway IP")
             }
-            var v4 = in_addr(), v6 = in6_addr()
+            var v4 = in_addr()
+            var v6 = in6_addr()
             guard inet_pton(AF_INET, address, &v4) == 1 || inet_pton(AF_INET6, address, &v6) == 1 else {
                 throw ContainerizationError(.invalidArgument, message: "--add-host '\(spec)' has an invalid IP address")
             }

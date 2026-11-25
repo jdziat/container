@@ -32,7 +32,8 @@ import NIOPosix
 struct DockerAPIBridgeServer: Sendable {
     static let defaultSocketPath: String = {
         let home = FileManager.default.homeDirectoryForCurrentUser
-        return home
+        return
+            home
             .appendingPathComponent("Library/Application Support/com.apple.container/docker-api-bridge.sock")
             .path
     }()
@@ -1199,9 +1200,15 @@ struct DockerAPIBridgeServer: Sendable {
         let credits = DispatchSemaphore(value: 64)
         private let lock = NSLock()
         private var isStopped = false
-        var stopped: Bool { lock.lock(); defer { lock.unlock() }; return isStopped }
+        var stopped: Bool {
+            lock.lock()
+            defer { lock.unlock() }
+            return isStopped
+        }
         func stop() {
-            lock.lock(); isStopped = true; lock.unlock()
+            lock.lock()
+            isStopped = true
+            lock.unlock()
             for _ in 0..<64 { credits.signal() }  // release any reader parked on backpressure
         }
     }
@@ -1694,9 +1701,10 @@ struct DockerAPIBridgeServer: Sendable {
             lines.append(try JSONSerialization.data(withJSONObject: obj))
         }
         lines.append(
-            try JSONSerialization.data(withJSONObject: [
-                "aux": ["ID": primaryTag]
-            ] as [String: Any]))
+            try JSONSerialization.data(
+                withJSONObject: [
+                    "aux": ["ID": primaryTag]
+                ] as [String: Any]))
         lines.append(try JSONSerialization.data(withJSONObject: ["stream": "Successfully built \(primaryTag)\n"]))
         var payload = Data()
         for line in lines {

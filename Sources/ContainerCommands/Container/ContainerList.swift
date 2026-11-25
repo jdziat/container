@@ -59,7 +59,6 @@ extension Application {
     }
 }
 
-
 /// Docker-style `--filter key=value` for `ps`.
 struct ContainerFilter {
     var status: RuntimeStatus?

@@ -76,7 +76,8 @@ struct ComposeScopeTests {
         // project container looked like an orphan. A UUID-named container of a declared service
         // must survive.
         let json = list([
-            container(id: "8f3c2a10-1111-2222-3333-444455556666", name: "web",
+            container(
+                id: "8f3c2a10-1111-2222-3333-444455556666", name: "web",
                 labels: ["com.docker.compose.project": "p", "com.docker.compose.service": "web"])
         ])
         #expect(try ComposeScope.orphanContainerIDs(listJSON: json, project: "p", declaredServices: ["web"]).isEmpty)

@@ -205,7 +205,6 @@ public actor RuntimeService {
                 logger: self.log
             )
 
-
             var sessions: [XPCClientSession] = []
             var attachments: [Attachment] = []
             var interfaces: [Interface] = []
@@ -1780,7 +1779,8 @@ public actor RuntimeService {
 
         // Prefer explicit UTS hostname (--hostname / Compose hostname). Network
         // attachment hostnames stay tied to --name for peer DNS / hosts injection.
-        let hostnameSource = config.hostname
+        let hostnameSource =
+            config.hostname
             ?? config.networks.first?.options.hostname
             ?? config.id
         let shortHostname =
@@ -2278,7 +2278,8 @@ public actor RuntimeService {
     /// file `vmm-backend` next to the runtime binary (install writes `cr`).
     private static func resolveVMMBackend() -> String {
         if let env = Foundation.ProcessInfo.processInfo.environment["CONTAINER_VMM_BACKEND"],
-           !env.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            !env.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        {
             return env.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         }
         let exe = URL(fileURLWithPath: CommandLine.arguments[0])

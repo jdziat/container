@@ -143,10 +143,12 @@ extension Application {
             guard humanReadable else { return value }
             let formatter = ISO8601DateFormatter()
             formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-            let date = formatter.date(from: value) ?? {
-                formatter.formatOptions = [.withInternetDateTime]
-                return formatter.date(from: value)
-            }()
+            let date =
+                formatter.date(from: value)
+                ?? {
+                    formatter.formatOptions = [.withInternetDateTime]
+                    return formatter.date(from: value)
+                }()
             guard let date else { return value }
             let rel = RelativeDateTimeFormatter()
             rel.unitsStyle = .full

@@ -70,7 +70,8 @@ public enum GoTemplate {
     }
 
     public static func render(_ template: String, row: Any) throws -> String {
-        let source = template
+        let source =
+            template
             .replacingOccurrences(of: "\\t", with: "\t")
             .replacingOccurrences(of: "\\n", with: "\n")
         var output = ""
@@ -134,9 +135,16 @@ public enum GoTemplate {
         var current = ""
         var quoted = false
         for character in action {
-            if character == "\"" { quoted.toggle(); current.append(character); continue }
+            if character == "\"" {
+                quoted.toggle()
+                current.append(character)
+                continue
+            }
             if character == " " && !quoted {
-                if !current.isEmpty { tokens.append(current); current = "" }
+                if !current.isEmpty {
+                    tokens.append(current)
+                    current = ""
+                }
             } else {
                 current.append(character)
             }
