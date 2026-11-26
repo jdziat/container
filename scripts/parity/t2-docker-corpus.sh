@@ -185,7 +185,15 @@ cc -f "${LF}/c.yml" -p "${PROJ}" start >/dev/null; sleep 2
 out="$(cc -f "${LF}/c.yml" -p "${PROJ}" port svc 2>&1)"
 [[ "${out}" == *"18080"* && "${out}" == *"80"* ]] && pass "compose port reports the published mapping" || fail "compose port did not report 18080->80: ${out:0:160}"
 [[ "$(cc "-f${LF}/c.yml" -p"${PROJ}" logs svc)" == *"from-svc"* ]] && pass "compose logs works with attached -fFILE/-pNAME forms" || fail "compose logs / attached short options"
-[[ "$(cc -f "${LF}/c.yml" -f "${LF}/c.yml" up 2>&1)" == *"multiple -f"* ]] && pass "repeating -f is rejected, not silently ignored" || fail "repeated -f accepted"
+# Several -f files merge (Compose Spec rules). `config` prints the merged plan without starting anything.
+printf 'services:\n  svc:\n    environment: {FROM_OVERRIDE: present, LEVEL: over}\n' >"${LF}/o.yml"
+printf 'services:\n  svc:\n    image: %s\n    environment: {LEVEL: base, KEEP: me}\n' "${IMAGE}" >"${LF}/b.yml"
+merged_cfg="$(cc -f "${LF}/b.yml" -f "${LF}/o.yml" -p "${PROJ}m" config)"
+if [[ "${merged_cfg}" == *"LEVEL=over"* && "${merged_cfg}" == *"KEEP=me"* && "${merged_cfg}" == *"FROM_OVERRIDE=present"* ]]; then
+    pass "several -f files are merged (later wins, earlier keys kept)"
+else
+    fail "-f base -f override did not merge: ${merged_cfg:0:200}"
+fi
 cc -f "${LF}/c.yml" -p "${PROJ}" rm -f -s svc >/dev/null; [[ -z "$(cstate)" ]] && pass "compose rm -f -s removes the container" || fail "compose rm: '$(cstate)'"
 # Containers are named after the service, so these must run once the first project's `svc` is gone.
 CP="${PROJ}c"

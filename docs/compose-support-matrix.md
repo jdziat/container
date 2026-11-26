@@ -19,7 +19,10 @@ Status values match [parity-matrix.md](parity-matrix.md). This page is the Compo
 | `stop` / `start` / `restart` / `rm` / `kill` / `pause` / `unpause` | same names | `done` | Act on the project's containers (all, or the named services). `stop`/`restart` take `-t`; `rm` takes `-f`/`-s`; `kill` takes `-s`. |
 | `top` / `port` / `create` | same names | `done` | `top` runs `ps aux` in the guest; `create` plans and creates without starting. |
 | `cp` / `watch` | - | `wontfix` | Not implemented. Use `container copy`. |
-| Global `-f FILE` / `-p NAME` / `--profile` | before the subcommand (`compose -f x.yml up`) | `done` | Hoisted behind the subcommand by the plugin entrypoint, so `logs -f` still means follow. Repeating `-f` to merge files is rejected; use `extends`. |
+| Global `-f FILE` / `-p NAME` / `--profile` / `--env-file` / `--project-directory` | before the subcommand (`compose -f x.yml up`) | `done` | Hoisted behind the subcommand by the plugin entrypoint, so `logs -f` still means follow. Attached forms (`-fx.yml`, `-pname`) work. |
+| Several `-f` files | `-f base.yml -f override.yml` | `done` | Merged in order by the Compose Spec rules: maps merge, later scalars win, `command`/`entrypoint` replace, `ports`/`dns`/`env_file`/`expose` append, `volumes`/`devices`/`secrets` merge by target/source. Relative paths resolve against the **first** file's directory (or `--project-directory`). `extends: file:` is relative to that same directory |
+| Default files | no `-f` | `done` | `compose.yaml`, `compose.yml`, `docker-compose.yaml`, `docker-compose.yml` in that order, plus the matching `*.override.*`. `COMPOSE_FILE` (`:` separated, or `COMPOSE_PATH_SEPARATOR`) is used when no `-f` is given |
+| `COMPOSE_PROJECT_NAME` | env or `.env` | `done` | Precedence: `-p`, `COMPOSE_PROJECT_NAME`, top-level `name:`, directory name |
 
 ## Top-level keys
 
@@ -91,3 +94,12 @@ Status values match [parity-matrix.md](parity-matrix.md). This page is the Compo
 | volume | `done` | Named + anonymous |
 | tmpfs | `done` | |
 | nfs | `done` | Guest NFS; corpus `06-nfs` via `nfs-guest-server.sh` + NFS-enabled kernel |
+
+## Known divergences from Docker Compose
+
+- **Unquoted YAML booleans:** `FOO: yes`, `on`, `off`, `no` are read as booleans, so `FOO` becomes `true`/`false`.
+  Docker Compose keeps them as the strings `yes`/`on`/... Quote the value (`FOO: "yes"`) to be safe.
+- **`up` detaches:** `compose up` always returns once the services are started (`-d` is accepted).
+- **`tty` / `stdin_open`:** accepted with a warning and no effect; a detached container's stdio is closed after start.
+- **Replicas are capped at 3** (`deploy.replicas`, `scale`).
+- **`extends: file:`** and relative paths resolve against the first compose file's directory (or `--project-directory`).

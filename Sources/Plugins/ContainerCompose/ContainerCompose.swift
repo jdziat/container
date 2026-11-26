@@ -55,37 +55,30 @@ struct ContainerCompose: AsyncParsableCommand {
         let valued: [String: String] = [
             "-f": "--file", "--file": "--file",
             "-p": "--project", "--project-name": "--project", "--project": "--project",
-            "--profile": "--profile",
+            "--profile": "--profile", "--env-file": "--env-file", "--project-directory": "--project-directory",
         ]
         var hoisted: [String] = []
-        var files = 0
         var index = 0
         while index < args.count {
             let token = args[index]
             guard token.hasPrefix("-"), token != "--help", token != "-h" else { break }
             if let eq = token.firstIndex(of: "="), let target = valued[String(token[..<eq])] {
-                if target == "--file" { files += 1 }
                 hoisted.append("\(target)=\(token[token.index(after: eq)...])")
                 index += 1
             } else if let target = valued[token] {
                 guard index + 1 < args.count else {
                     throw ValidationError("option '\(token)' requires a value")
                 }
-                if target == "--file" { files += 1 }
                 hoisted.append("\(target)=\(args[index + 1])")
                 index += 2
             } else if token.count > 2, !token.hasPrefix("--"), let target = valued[String(token.prefix(2))] {
                 // Attached short form: `-fFILE`, `-pNAME` (Docker accepts these).
-                if target == "--file" { files += 1 }
                 hoisted.append("\(target)=\(token.dropFirst(2))")
                 index += 1
             } else {
                 // Unknown leading option (for example --help): leave everything for ArgumentParser.
                 return args
             }
-        }
-        guard files <= 1 else {
-            throw ValidationError("multiple -f/--file values are not supported (merge the files first, or use `extends`)")
         }
         guard index < args.count else { return hoisted + args[index...] }
         // args[index] is the subcommand; global options follow it.
@@ -95,8 +88,14 @@ struct ContainerCompose: AsyncParsableCommand {
 
 extension ContainerCompose {
     struct SharedOptions: ParsableArguments {
-        @Option(name: .customLong("file"), help: "Compose file path")
-        var file: String = "compose.yaml"
+        @Option(name: .customLong("file"), help: "Compose file (repeatable; later files override earlier ones)")
+        var file: [String] = []
+
+        @Option(name: .customLong("env-file"), help: "Environment file for interpolation (repeatable; replaces .env)")
+        var envFile: [String] = []
+
+        @Option(name: .customLong("project-directory"), help: "Base directory for relative paths (default: first file's directory)")
+        var projectDirectory: String?
 
         @Option(name: .shortAndLong, help: "Project name (default: directory name)")
         var project: String?
@@ -129,11 +128,7 @@ extension ContainerCompose {
         var removeOrphans = false
 
         func run() async throws {
-            let plan = try ComposePlanner.plan(
-                fileURL: URL(fileURLWithPath: shared.file),
-                project: shared.project,
-                profiles: shared.profile
-            )
+            let plan = try ContainerCompose.loadPlan(shared)
             try plan.reportUnsupported()
             _ = (detach, build, wait)
             if forceRecreate { try await plan.removeExisting() }
@@ -157,11 +152,7 @@ extension ContainerCompose {
         var removeOrphans = false
 
         func run() async throws {
-            let plan = try ComposePlanner.plan(
-                fileURL: URL(fileURLWithPath: shared.file),
-                project: shared.project,
-                profiles: shared.profile
-            )
+            let plan = try ContainerCompose.loadPlan(shared)
             try await plan.down(minimumStopTimeout: timeout)
             if volumes { try plan.removeProjectVolumes() }
         }
@@ -173,11 +164,7 @@ extension ContainerCompose {
         @OptionGroup var shared: SharedOptions
 
         func run() async throws {
-            let plan = try ComposePlanner.plan(
-                fileURL: URL(fileURLWithPath: shared.file),
-                project: shared.project,
-                profiles: shared.profile
-            )
+            let plan = try ContainerCompose.loadPlan(shared)
             try plan.reportUnsupported()
             print(try plan.summary())
         }
@@ -195,11 +182,7 @@ extension ContainerCompose {
         var strict = false
 
         func run() async throws {
-            let plan = try ComposePlanner.plan(
-                fileURL: URL(fileURLWithPath: shared.file),
-                project: shared.project,
-                profiles: shared.profile
-            )
+            let plan = try ContainerCompose.loadPlan(shared)
             let findings = plan.doctorFindings()
             if findings.isEmpty {
                 print("compose doctor: ok (no loud-edge findings)")
@@ -227,11 +210,7 @@ extension ContainerCompose {
         var quiet = false
 
         func run() async throws {
-            let plan = try ComposePlanner.plan(
-                fileURL: URL(fileURLWithPath: shared.file),
-                project: shared.project,
-                profiles: shared.profile
-            )
+            let plan = try ContainerCompose.loadPlan(shared)
             let ids = try plan.projectContainerIDs()
             if quiet {
                 for id in ids.sorted() { print(id) }
@@ -266,11 +245,7 @@ extension ContainerCompose {
         var tail: Int?
 
         func run() async throws {
-            let plan = try ComposePlanner.plan(
-                fileURL: URL(fileURLWithPath: shared.file),
-                project: shared.project,
-                profiles: shared.profile
-            )
+            let plan = try ContainerCompose.loadPlan(shared)
             let name = try plan.containerName(for: service)
             var args = ["logs"]
             if follow { args.append("--follow") }
@@ -292,11 +267,7 @@ extension ContainerCompose {
         var command: [String] = []
 
         func run() async throws {
-            let plan = try ComposePlanner.plan(
-                fileURL: URL(fileURLWithPath: shared.file),
-                project: shared.project,
-                profiles: shared.profile
-            )
+            let plan = try ContainerCompose.loadPlan(shared)
             let name = try plan.containerName(for: service)
             guard !command.isEmpty else {
                 throw ComposeError.invalid("compose exec requires a command")
@@ -320,11 +291,7 @@ extension ContainerCompose {
         var command: [String] = []
 
         func run() async throws {
-            let plan = try ComposePlanner.plan(
-                fileURL: URL(fileURLWithPath: shared.file),
-                project: shared.project,
-                profiles: shared.profile
-            )
+            let plan = try ContainerCompose.loadPlan(shared)
             try plan.reportUnsupported()
             try await plan.runOneOff(service: service, command: command)
         }
@@ -342,11 +309,7 @@ extension ContainerCompose {
         var services: [String] = []
 
         func run() async throws {
-            let plan = try ComposePlanner.plan(
-                fileURL: URL(fileURLWithPath: shared.file),
-                project: shared.project,
-                profiles: shared.profile
-            )
+            let plan = try ContainerCompose.loadPlan(shared)
             try plan.reportUnsupported()
             try plan.build(only: services.isEmpty ? nil : Set(services), noCache: noCache)
         }
@@ -364,11 +327,7 @@ extension ContainerCompose {
         var services: [String] = []
 
         func run() async throws {
-            let plan = try ComposePlanner.plan(
-                fileURL: URL(fileURLWithPath: shared.file),
-                project: shared.project,
-                profiles: shared.profile
-            )
+            let plan = try ContainerCompose.loadPlan(shared)
             try plan.reportUnsupported()
             _ = ignorePullFailures
             try plan.pull(only: services.isEmpty ? nil : Set(services))
@@ -381,11 +340,7 @@ extension ContainerCompose {
         @OptionGroup var shared: SharedOptions
 
         func run() async throws {
-            let plan = try ComposePlanner.plan(
-                fileURL: URL(fileURLWithPath: shared.file),
-                project: shared.project,
-                profiles: shared.profile
-            )
+            let plan = try ContainerCompose.loadPlan(shared)
             print("CONTAINER\tREPOSITORY\tTAG")
             for service in plan.services {
                 for name in ComposePlanner.Plan.plannedContainerNames(service) {
@@ -420,8 +375,13 @@ extension ContainerCompose {
     }
 
     static func loadPlan(_ shared: SharedOptions) throws -> ComposePlanner.Plan {
-        try ComposePlanner.plan(
-            fileURL: URL(fileURLWithPath: shared.file), project: shared.project, profiles: shared.profile)
+        let directory = URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
+        let files = try ComposeFiles.resolve(
+            explicit: shared.file, environment: ProcessInfo.processInfo.environment, directory: directory)
+        return try ComposePlanner.plan(
+            fileURLs: files, project: shared.project, profiles: shared.profile,
+            projectDirectory: shared.projectDirectory.map { ComposeFiles.url($0, in: directory) },
+            envFiles: shared.envFile.map { ComposeFiles.url($0, in: directory) })
     }
 
     struct Stop: AsyncParsableCommand {
@@ -1453,13 +1413,26 @@ struct ComposePlanner {
     }
 
     static func plan(fileURL: URL, project: String?, profiles: [String]) throws -> Plan {
-        let data = try Data(contentsOf: fileURL)
-        let rawText = String(data: data, encoding: .utf8) ?? ""
-        let composeDir = fileURL.deletingLastPathComponent()
-        let interpolationEnv = try composeInterpolationEnvironment(projectDir: composeDir)
-        let text = try interpolateComposeString(rawText, env: interpolationEnv)
-        guard let root = try Yams.load(yaml: text) as? [String: Any] else {
-            throw ComposeError.invalid("compose file is not a mapping")
+        try plan(fileURLs: [fileURL], project: project, profiles: profiles)
+    }
+
+    /// Plan from one or more compose files, merged in order (later files override earlier ones).
+    static func plan(
+        fileURLs: [URL], project: String?, profiles: [String], projectDirectory: URL? = nil, envFiles: [URL] = []
+    ) throws -> Plan {
+        guard let fileURL = fileURLs.first else { throw ComposeError.invalid("no compose file given") }
+        // Relative paths (build contexts, env_file, bind mounts) resolve against the project directory:
+        // --project-directory, else the directory of the FIRST file.
+        let composeDir = projectDirectory ?? fileURL.deletingLastPathComponent()
+        let interpolationEnv = try composeInterpolationEnvironment(projectDir: composeDir, envFiles: envFiles)
+        var root: [String: Any] = [:]
+        for (index, url) in fileURLs.enumerated() {
+            let data = try Data(contentsOf: url)
+            let text = try interpolateComposeString(String(data: data, encoding: .utf8) ?? "", env: interpolationEnv)
+            guard let document = try Yams.load(yaml: text) as? [String: Any] else {
+                throw ComposeError.invalid("compose file \(url.lastPathComponent) is not a mapping")
+            }
+            root = index == 0 ? document : ComposeMerge.merge(root, document)
         }
         var unsupported: [(service: String?, key: String, reason: String)] = []
         var composeWarnings: [String] = []
@@ -1474,6 +1447,7 @@ struct ComposePlanner {
 
         let projectName =
             project
+            ?? interpolationEnv["COMPOSE_PROJECT_NAME"].flatMap { $0.isEmpty ? nil : $0 }
             ?? (root["name"] as? String)
             ?? composeDir.lastPathComponent
         let defaultNetwork = "\(projectName)_default"
@@ -2491,11 +2465,16 @@ private func loadEnvFile(_ url: URL) throws -> [String: String] {
 
 /// Build the env map used for Compose `${VAR}` substitution: project `.env`, then
 /// process environment overrides (Docker Compose precedence).
-func composeInterpolationEnvironment(projectDir: URL) throws -> [String: String] {
+func composeInterpolationEnvironment(projectDir: URL, envFiles: [URL] = []) throws -> [String: String] {
     var env: [String: String] = [:]
-    let dotenv = projectDir.appendingPathComponent(".env")
-    if FileManager.default.fileExists(atPath: dotenv.path) {
-        env.merge(try loadEnvFile(dotenv)) { _, new in new }
+    if envFiles.isEmpty {
+        let dotenv = projectDir.appendingPathComponent(".env")
+        if FileManager.default.fileExists(atPath: dotenv.path) {
+            env.merge(try loadEnvFile(dotenv)) { _, new in new }
+        }
+    } else {
+        // --env-file replaces the default .env; later files win. A missing file is an error, as in Docker.
+        for file in envFiles { env.merge(try loadEnvFile(file)) { _, new in new } }
     }
     for (key, value) in ProcessInfo.processInfo.environment {
         env[key] = value
