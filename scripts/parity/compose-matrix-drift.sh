@@ -77,6 +77,15 @@ for line in cli.splitlines():
 for v in sorted(doc_verbs - code_verbs - {"up"}):
     problems.append(f"matrix documents `compose {v}` as done but no such subcommand is registered")
 
+# Harness lint: `-f FILE` is a GLOBAL option and must come before the subcommand
+# (`compose -f x.yml up`). `compose up -f x.yml` is rejected, and once silently broke the T3 corpus.
+import glob
+misplaced = re.compile(r"compose (?:config|up|ps|down|logs|exec|run|build|pull|stop|start|restart|rm|kill|pause|unpause|top|port|create) -f\s+(?:\"[^\"]*\"|\S+\.ya?ml)\s+-p\b")
+for script in sorted(glob.glob(f"{root}/scripts/parity/*.sh")):
+    for number, line in enumerate(open(script).read().splitlines(), 1):
+        if misplaced.search(line):
+            problems.append(f"{script.replace(root + '/', '')}:{number} passes -f after the subcommand; use `compose -f FILE -p NAME <subcommand>`")
+
 if problems:
     print("\n".join("FAIL: " + p for p in problems)); sys.exit(1)
 print(f"PASS: compose matrix and planner agree ({len(code_keys)} service keys, {len(doc_verbs)} documented verbs)")

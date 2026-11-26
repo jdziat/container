@@ -33,6 +33,19 @@ fail() { printf '[t3-compose] FAIL: %s\n' "$*" >&2; exit 1; }
 # Keep it pinned to the same binary the harness invoked.
 export CONTAINER_CLI="${CONTAINER_CLI:-${CONTAINER_BIN}}"
 
+# Isolation guard: this harness starts and removes containers, networks and volumes. Verify the RUNNING
+# apiserver's app root, not just an environment variable (an exported CONTAINER_APP_ROOT does not make a
+# running system isolated). `make parity-behavioral` starts an isolated system; set
+# PARITY_ALLOW_REAL_SYSTEM=1 only if you accept the risk.
+if [[ "${PARITY_ALLOW_REAL_SYSTEM:-0}" != "1" ]]; then
+  live_root="$("${CONTAINER_BIN}" system status 2>/dev/null | awk '$1=="paths.appRoot"{print $2}')"
+  if [[ -z "${CONTAINER_APP_ROOT:-}" || "${live_root%/}" != "${CONTAINER_APP_ROOT%/}" ]]; then
+    echo "refusing to run: the running system's app root is '${live_root}', not the isolated '${CONTAINER_APP_ROOT:-<unset>}'." >&2
+    echo "Use 'make parity-behavioral', or set PARITY_ALLOW_REAL_SYSTEM=1 if you accept the risk." >&2
+    exit 2
+  fi
+fi
+
 compose() {
   "${CONTAINER_BIN}" compose "$@"
 }
@@ -115,10 +128,10 @@ run_fixture() {
     sed -e "s|\${COMPOSE_NFS_SERVER}|${COMPOSE_NFS_SERVER}|g" \
         -e "s|\${COMPOSE_NFS_EXPORT}|${COMPOSE_NFS_EXPORT}|g" \
         compose.yaml > "${tmp}"
-    compose config -f "${tmp}" -p "${project}" >/dev/null
-    compose up -f "${tmp}" -p "${project}" || { compose down -f "${tmp}" -p "${project}" || true; fail "${name} up"; }
-    compose ps -f "${tmp}" -p "${project}" >/dev/null || true
-    compose down -f "${tmp}" -p "${project}" || fail "${name} down"
+    compose -f "${tmp}" -p "${project}" config >/dev/null
+    compose -f "${tmp}" -p "${project}" up || { compose -f "${tmp}" -p "${project}" down || true; fail "${name} up"; }
+    compose -f "${tmp}" -p "${project}" ps >/dev/null || true
+    compose -f "${tmp}" -p "${project}" down || fail "${name} down"
     rm -rf "${tmpdir}"
     popd >/dev/null
     log "OK ${name}"
@@ -143,7 +156,7 @@ run_fixture() {
   fi
 
   local config_out
-  config_out="$(compose config -f compose.yaml -p "${project}")" || fail "${name} config"
+  config_out="$(compose -f compose.yaml -p "${project}" config)" || fail "${name} config"
 
   # Immich proves ${VAR}/.env interpolation (image tag) and profile skip for ML.
   if [[ "${name}" == "10-immich" ]]; then
@@ -157,19 +170,19 @@ run_fixture() {
   local up_ok=0
   local attempt
   for attempt in 1 2 3 4 5; do
-    if compose up -f compose.yaml -p "${project}"; then
+    if compose -f compose.yaml -p "${project}" up; then
       up_ok=1
       break
     fi
     log "up attempt ${attempt} failed for ${name}; retrying after backoff"
-    compose down -f compose.yaml -p "${project}" || true
+    compose -f compose.yaml -p "${project}" down || true
     sleep $((attempt * 15))
   done
   if [[ "${up_ok}" -ne 1 ]]; then
-    compose down -f compose.yaml -p "${project}" || true
+    compose -f compose.yaml -p "${project}" down || true
     fail "${name} up"
   fi
-  compose ps -f compose.yaml -p "${project}" >/dev/null || true
+  compose -f compose.yaml -p "${project}" ps >/dev/null || true
 
   if is_production_fixture "${name}"; then
     # Health-gated apps need longer settle than alpine smoke fixtures.
@@ -177,24 +190,24 @@ run_fixture() {
     case "${name}" in
       08-wordpress)
         wait_http "http://127.0.0.1:18080/" "302" 180 \
-          || { compose logs -f compose.yaml -p "${project}" || true; compose down -f compose.yaml -p "${project}" || true; fail "${name} HTTP probe"; }
+          || { compose -f compose.yaml -p "${project}" logs || true; compose -f compose.yaml -p "${project}" down || true; fail "${name} HTTP probe"; }
         ;;
       09-nextcloud)
         wait_http "http://127.0.0.1:18081/" "" 240 \
-          || { compose logs -f compose.yaml -p "${project}" || true; compose down -f compose.yaml -p "${project}" || true; fail "${name} HTTP probe"; }
+          || { compose -f compose.yaml -p "${project}" logs || true; compose -f compose.yaml -p "${project}" down || true; fail "${name} HTTP probe"; }
         ;;
       10-immich)
         # Immich Nest bootstrap + geodata import; require a real HTTP 200 (no ps fallback).
         # Fixture sets IMMICH_HOST=0.0.0.0 so the published port is reachable on 127.0.0.1.
         wait_http "http://127.0.0.1:2283/" "200" 360 \
-          || { compose logs -f compose.yaml -p "${project}" || true; compose down -f compose.yaml -p "${project}" || true; fail "${name} HTTP probe (want 200)"; }
+          || { compose -f compose.yaml -p "${project}" logs || true; compose -f compose.yaml -p "${project}" down || true; fail "${name} HTTP probe (want 200)"; }
         ;;
     esac
   else
     sleep 2
   fi
 
-  compose down -f compose.yaml -p "${project}" || fail "${name} down"
+  compose -f compose.yaml -p "${project}" down || fail "${name} down"
   popd >/dev/null
   log "OK ${name}"
 }

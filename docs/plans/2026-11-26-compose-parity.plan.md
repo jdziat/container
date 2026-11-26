@@ -41,7 +41,8 @@ Podman pods and Quadlet; volume plugins beyond local and NFS.
 | | `ps` (`-a`, `--services`, `--status`, `--format json`); `logs` for all services, `--since`, `--no-log-prefix`; `exec`/`run` flags | todo |
 | | `config` (`--services`, `--volumes`, `--format`, `-q`); `down --rmi`; global `--dry-run` | todo |
 | | `watch` | **decision pending** (see below) |
-| **D. Gate** | T3 corpus (`t3-compose-corpus.sh`) in `make parity-behavioral`, with fixtures for the new keys | todo |
+| **D. Gate** | T3 corpus (`t3-compose-corpus.sh`) in `make parity-behavioral` | **wired** (01-07; production and NFS fixtures opt-in). Fixed on the way: T3 and `f2-compose-extends.sh` passed `-f` after the subcommand and were broken by the `-f` fix; a lint now fails any harness that does. **Live run pending.** |
+| | New fixtures exercising the Tier A-C keys and verbs | todo (the Tier A-C live checks live in `t2-docker-corpus.sh` for now) |
 
 ## Decisions and known divergences
 

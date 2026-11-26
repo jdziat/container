@@ -492,7 +492,7 @@ parity-behavioral: parity-cli-surface
 	@test -x "$(ROOT_DIR)/bin/container" || { echo "bin/container not installed: run 'make container' first" >&2; exit 2; }
 	@test -x "$(ROOT_DIR)/bin/docker" || { echo "bin/docker not installed: run 'make container' first" >&2; exit 2; }
 	@test -n "$(strip $(APP_ROOT))" || { echo "parity-behavioral refuses to run against the default system: set APP_ROOT to an isolated directory" >&2; exit 2; }
-	@chmod +x scripts/parity/t2-docker-corpus.sh scripts/parity/t2-bridge-streams.sh scripts/parity/t2-bridge-hostconfig.sh scripts/parity/t2-bridge-lifecycle.sh
+	@chmod +x scripts/parity/t2-docker-corpus.sh scripts/parity/t3-compose-corpus.sh scripts/parity/t2-bridge-streams.sh scripts/parity/t2-bridge-hostconfig.sh scripts/parity/t2-bridge-lifecycle.sh
 	@echo "Stopping any running system; parity harnesses run against an isolated root: $(APP_ROOT)"
 	@bin/container system stop || true
 	@sleep 3 && scripts/ensure-container-stopped.sh
@@ -500,8 +500,9 @@ parity-behavioral: parity-cli-surface
 	@bin/container --debug system start --timeout 60 --enable-kernel-install $(SYSTEM_START_OPTS) && \
 	{ \
 		export CONTAINER_APP_ROOT="$(APP_ROOT)" CONTAINER_BIN="$(ROOT_DIR)/bin/container" DOCKER_BIN="$(ROOT_DIR)/bin/docker" BRIDGE_BIN="$(BUILD_BIN_DIR)/container-docker-api-bridge" ; \
+		export COMPOSE_SKIP_PRODUCTION="$${COMPOSE_SKIP_PRODUCTION:-1}" COMPOSE_SKIP_NFS="$${COMPOSE_SKIP_NFS:-1}" ; \
 		rc=0 ; \
-		for h in t2-docker-corpus t2-bridge-streams t2-bridge-hostconfig t2-bridge-lifecycle ; do \
+		for h in t2-docker-corpus t3-compose-corpus t2-bridge-streams t2-bridge-hostconfig t2-bridge-lifecycle ; do \
 			echo "==> $$h" ; \
 			bash scripts/parity/$$h.sh || rc=1 ; \
 		done ; \
@@ -510,6 +511,10 @@ parity-behavioral: parity-cli-surface
 		exit $$rc ; \
 	}
 
+# T3 against the CURRENT system. The harness refuses unless the running apiserver's app root matches
+# CONTAINER_APP_ROOT (so it cannot touch a developer's real containers); `make parity-behavioral` runs it
+# on an isolated system, with the heavy 08-10 and NFS 06 fixtures skipped by default (set
+# COMPOSE_SKIP_PRODUCTION=0 / COMPOSE_SKIP_NFS=0 to include them). PARITY_ALLOW_REAL_SYSTEM=1 overrides.
 .PHONY: compose-parity
 compose-parity: container
 	@chmod +x scripts/parity/t3-compose-corpus.sh

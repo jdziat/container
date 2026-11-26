@@ -115,7 +115,7 @@ The scripts under `scripts/parity/` check the claims above against a running sys
 | T1 | Multi-service stack: network, named containers, name resolution | `scripts/parity/t1-stack-smoke.sh` | Available. Hosts injection + hosts-dns; `PARITY_STRICT_DNS=1` requires `nslookup` (not only getent). |
 | T2 | Ecosystem tools through Docker API bridge + `docker` shim | `t2-docker-corpus.sh`, `t2-bridge-streams.sh`, `t2-bridge-hostconfig.sh`, `t2-bridge-lifecycle.sh` (behavioral; `make parity-behavioral`) | `done`: bridge create/exec/pause/unpause/changes/stats/top/rename/networks/volumes/images; shim pull/images/run/ps/exec/rm. |
 | T3 | Lifecycle sugar: `restart`, `wait`, `port`, `attach` | CLI commands | `restart`/`wait`/`port`/`attach` done. |
-| T3-compose | Compose corpus (up/down/config) + optional NFS | `scripts/parity/t3-compose-corpus.sh` / `make compose-parity` | Available. Set `COMPOSE_NFS_SERVER` + `COMPOSE_NFS_EXPORT` for fixture `06-nfs`. |
+| T3-compose | Compose corpus (up/down/config) + optional NFS | `scripts/parity/t3-compose-corpus.sh` / `make compose-parity` | **In `make parity-behavioral`** (fixtures 01-07 on an isolated root; 06 NFS and 08-10 production-shaped are skipped by default: `COMPOSE_SKIP_NFS=0` / `COMPOSE_SKIP_PRODUCTION=0` to include them). Each fixture's `config` step was checked locally against the current plugin; the live `up`/`down` has **not yet run** since the compose changes landed, and the harness itself had to be fixed (it passed `-f` after the subcommand, which Docker and this plugin reject). Refuses to run unless the apiserver's app root is the isolated one |
 | T4 | Podman-shaped features | — | Not a goal. Use `machine` and `cluster`. |
 
 ## Keeping this page honest

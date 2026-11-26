@@ -59,7 +59,7 @@ grep -q 'concatenate\|concat' "${ROOT}/docs/compose-support-matrix.md" \
   || fail "compose-support-matrix must document list concat for extends"
 
 if [[ -x "${CONTAINER_BIN}" ]]; then
-  out="$("${CONTAINER_BIN}" compose config -f "${FIX_DIR}/compose.yaml" -p f2ext 2>&1)" \
+  out="$("${CONTAINER_BIN}" compose -f "${FIX_DIR}/compose.yaml" -p f2ext config 2>&1)" \
     || fail "compose config failed on extends fixture: ${out}"
   if printf '%s\n' "${out}" | grep -qi 'extends.*not implemented\|unsupported.*extends'; then
     fail "extends still treated as unsupported: ${out}"
