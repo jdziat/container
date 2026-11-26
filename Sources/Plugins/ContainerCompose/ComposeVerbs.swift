@@ -413,3 +413,37 @@ struct ComposeRunDependencies: Equatable {
         return result
     }
 }
+
+// MARK: - one-off names
+
+enum ComposeOneOffName {
+    /// The engine accepts container names of at most 63 characters, starting with a letter or digit and using
+    /// only letters, digits, `_`, `.` and `-`. `<project>_<service>_run_<uuid>` is 79 characters for even short
+    /// names, so every `compose run` was refused. Keep `<project>_<service>_run_<8 hex>` when it fits, and
+    /// shorten the project and service parts (never the unique suffix) when it does not.
+    static let limit = 63
+
+    static func make(project: String, service: String, unique: String) -> String {
+        let suffix = "_run_" + String(unique.filter { $0.isHexDigit }.prefix(8))
+        var head = "\(project)_\(service)"
+        if head.count + suffix.count > limit {
+            // Split the budget so a long project name cannot erase the service, and vice versa.
+            let budget = limit - suffix.count - 1
+            let half = budget / 2
+            var p = project
+            var s = service
+            if p.count + s.count + 1 > budget {
+                if p.count > half && s.count > half {
+                    p = String(p.prefix(half))
+                    s = String(s.prefix(budget - half))
+                } else if p.count > half {
+                    p = String(p.prefix(budget - s.count))
+                } else {
+                    s = String(s.prefix(budget - p.count))
+                }
+            }
+            head = "\(p)_\(s)"
+        }
+        return head + suffix
+    }
+}

@@ -399,4 +399,56 @@ struct ComposeVerbsTests {
         #expect(todo.create.isEmpty)
         #expect(todo.start == ["w-1"])
     }
+
+    // MARK: one-off container names
+
+    private func engineAccepts(_ name: String) -> Bool {
+        guard !name.isEmpty, name.count <= 63, let first = name.unicodeScalars.first,
+            ("a"..."z").contains(first) || ("A"..."Z").contains(first) || ("0"..."9").contains(first)
+        else { return false }
+        return name.unicodeScalars.allSatisfy {
+            ("a"..."z").contains($0) || ("A"..."Z").contains($0) || ("0"..."9").contains($0) || $0 == "_" || $0 == "." || $0 == "-"
+        }
+    }
+
+    @Test func oneOffNameIsKeptWhenItFits() {
+        #expect(ComposeOneOffName.make(project: "p", service: "web", unique: "a0cd6f0d-875f") == "p_web_run_a0cd6f0d")
+    }
+
+    @Test func oneOffNameAlwaysFitsTheEngineLimit() {
+        // The exact names from the live failure, plus extremes on either side.
+        let cases = [
+            ("corpusverbs7952", "vapi7952"), ("a", String(repeating: "s", count: 200)),
+            (String(repeating: "p", count: 200), "s"), (String(repeating: "p", count: 80), String(repeating: "s", count: 80)),
+            ("", "x"),
+        ]
+        for (project, service) in cases where !project.isEmpty {
+            let name = ComposeOneOffName.make(project: project, service: service, unique: "a0cd6f0d-875f-4bf2-9244-0dec7a07dd79")
+            #expect(engineAccepts(name), "\(name) (\(name.count) chars)")
+            #expect(name.hasSuffix("_run_a0cd6f0d"), "the unique suffix must survive: \(name)")
+        }
+    }
+
+    @Test func oneOffNamesStayUniqueWhenTheRestIsTruncated() {
+        let long = String(repeating: "x", count: 100)
+        let a = ComposeOneOffName.make(project: long, service: long, unique: "11111111-aaaa")
+        let b = ComposeOneOffName.make(project: long, service: long, unique: "22222222-bbbb")
+        #expect(a != b)
+    }
+
+    @Test func oneOffNameKeepsBothProjectAndServiceRecognisable() {
+        let name = ComposeOneOffName.make(project: String(repeating: "p", count: 80), service: "web", unique: "a0cd6f0d")
+        #expect(name.contains("_web_run_"), "a long project must not erase the service: \(name)")
+    }
+
+    @Test func whenBothPartsAreLongEachKeepsAShareOfTheName() {
+        let name = ComposeOneOffName.make(project: String(repeating: "p", count: 80), service: String(repeating: "s", count: 80), unique: "a0cd6f0d")
+        let parts = name.split(separator: "_", omittingEmptySubsequences: false).map(String.init)
+        // <project>_<service>_run_<hex>
+        #expect(parts.count == 4)
+        #expect(parts[0].allSatisfy { $0 == "p" } && !parts[0].isEmpty)
+        #expect(parts[1].allSatisfy { $0 == "s" } && !parts[1].isEmpty)
+        #expect(abs(parts[0].count - parts[1].count) <= 2, "neither side should take nearly all of the room: \(name)")
+        #expect(name.count <= 63)
+    }
 }

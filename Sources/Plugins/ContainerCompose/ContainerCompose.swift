@@ -1494,7 +1494,8 @@ struct ComposePlanner {
                 }
             }
             if oneOff.build != nil { try build(only: [oneOff.name]) }
-            oneOff.containerName = overrides.name ?? "\(project)_\(oneOff.name)_run_\(UUID().uuidString.lowercased())"
+            oneOff.containerName =
+                overrides.name ?? ComposeOneOffName.make(project: project, service: oneOff.name, unique: UUID().uuidString.lowercased())
             let args = try runArgs(for: oneOff, detach: detach, commandOverride: command.isEmpty ? nil : command, oneOff: true)
             if detach {
                 print(try runContainer(args).trimmingCharacters(in: .whitespacesAndNewlines))
