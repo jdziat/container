@@ -31,9 +31,9 @@ Podman pods and Quadlet; volume plugins beyond local and NFS.
 | **A. Service keys** | `ulimits`, `sysctls`, `extra_hosts`, `dns*`, `stop_signal`, `init`, `read_only`, `platform`, `cpus`, `mem_limit`/`deploy.resources.limits`, `mac_address`, `pull_policy`, `scale` | **done** (25 unit tests) |
 | | `network_mode`, `links`, `volumes_from`, `group_add`, lifecycle hooks: rejected with a reason | **done** |
 | | 31 resource/namespace keys + `tty`/`stdin_open`: accepted with one warning, no effect | **done** |
-| **B. Selecting and merging** | `up SERVICE...` with dependency closure, and `--no-deps` | todo |
-| | `up --scale svc=N`, `--no-start`, `--pull`, `--build`/`--no-build` honored | todo |
-| | `up --wait` really waits (running, and healthy where a healthcheck exists) | todo |
+| **B. Selecting and merging** | `up SERVICE...` with dependency closure, and `--no-deps` | **done** (13 unit tests) |
+| | `up --scale svc=N`, `--no-start`, `--pull`, `--no-build` honored | **done** (unit-tested; live checks in the corpus, not yet run) |
+| | `up --wait` really waits (running, and healthy where a healthcheck exists) | **implemented**; only checkable live (corpus check added, **not yet run**) |
 | | Several `-f` files merged in order; `compose.override.yaml` auto-loaded; default file discovery | **done** (32 tests) |
 | | `COMPOSE_FILE`, `COMPOSE_PROJECT_NAME`, `--env-file`, `--project-directory` | **done** |
 | | External networks/volumes; network `ipam`, `internal`, `labels` | todo |

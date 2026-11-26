@@ -109,31 +109,53 @@ extension ContainerCompose {
 
         @OptionGroup var shared: SharedOptions
 
+        @Argument(help: "Services to start, plus what they depend on (default: all)")
+        var services: [String] = []
+
         @Flag(name: [.customShort("d"), .customLong("detach")], help: "Detached mode (always on; accepted for CLI compatibility)")
         var detach = false
 
         @Flag(name: .long, help: "Build images before starting (services with build: are always built; accepted for compatibility)")
         var build = false
 
-        @Flag(name: .long, help: "Wait for services to be running/healthy (depends_on conditions are always honored)")
+        @Flag(name: .long, help: "Do not build images; use what is already present")
+        var noBuild = false
+
+        @Flag(name: .long, help: "Create the containers but do not start them")
+        var noStart = false
+
+        @Flag(name: .long, help: "Wait until services are running (and healthy, where they have a healthcheck)")
         var wait = false
+
+        @Option(name: .long, help: "Seconds to wait for --wait before giving up")
+        var waitTimeout: Int = 300
+
+        @Option(name: .long, help: "Pull policy for the selected services: always, missing or never")
+        var pull: String?
+
+        @Option(name: .long, help: "Run N instances of a service (SERVICE=N, repeatable; capped at 3)")
+        var scale: [String] = []
 
         @Flag(name: .long, help: "Recreate containers even if configuration is unchanged")
         var forceRecreate = false
 
-        @Flag(name: .long, help: "Do not start linked services (all services in the file are started)")
+        @Flag(name: .long, help: "Do not start the services the named ones depend on")
         var noDeps = false
 
         @Flag(name: .long, help: "Remove containers for services not defined in the compose file")
         var removeOrphans = false
 
         func run() async throws {
-            let plan = try ContainerCompose.loadPlan(shared)
+            var plan = try ContainerCompose.loadPlan(shared)
             try plan.reportUnsupported()
-            _ = (detach, build, wait)
+            _ = (detach, build)
+            plan = try plan.selecting(services, withDependencies: !noDeps)
+            plan = try plan.scaled(scale)
+            if let pull { plan = try plan.overridingPullPolicy(pull) }
             if forceRecreate { try await plan.removeExisting() }
             if removeOrphans { try await plan.removeOrphans() }
-            try await plan.up(detach: true)
+            try await plan.up(detach: true, startContainers: !noStart, buildImages: !noBuild)
+            if wait && !noStart { try await plan.waitForServices(timeoutSeconds: waitTimeout) }
         }
     }
 
@@ -1099,10 +1121,43 @@ struct ComposePlanner {
             }
         }
 
-        func up(detach: Bool, startContainers: Bool = true) async throws {
+        /// `up --wait`: block until every started container is running, and healthy where it has a
+        /// healthcheck. A container that already exited with status 0 counts as done (a one-shot
+        /// service); a non-zero exit or an unhealthy container is an error.
+        func waitForServices(timeoutSeconds: Int) async throws {
+            let deadline = Date().addingTimeInterval(TimeInterval(timeoutSeconds))
+            for service in services {
+                for name in Self.plannedContainerNames(service) {
+                    let needsHealth = service.healthcheck != nil
+                    while true {
+                        try Task.checkCancellation()
+                        let json = try runContainer(["inspect", name])
+                        let status = try inspectRow(name).status
+                        if status == "running" {
+                            if !needsHealth { break }
+                            let health = healthStatus(fromInspectJSON: json)
+                            if health == "healthy" { break }
+                            if health == "unhealthy" {
+                                throw ComposeError.commandFailed("\(name) is unhealthy")
+                            }
+                        } else if status == "stopped", let code = exitCode(fromInspectJSON: json) {
+                            if code == 0 { break }
+                            throw ComposeError.commandFailed("\(name) exited with code \(code)")
+                        }
+                        guard Date() < deadline else {
+                            throw ComposeError.commandFailed(
+                                "timed out after \(timeoutSeconds)s waiting for \(name) (status \(status))")
+                        }
+                        try await Task.sleep(for: .seconds(1))
+                    }
+                }
+            }
+        }
+
+        func up(detach: Bool, startContainers: Bool = true, buildImages: Bool = true) async throws {
             try ensureNetworks()
             try ensureVolumes()
-            try build(only: nil)
+            if buildImages { try build(only: nil) }
 
             for service in services {
                 for dep in service.dependsOn {

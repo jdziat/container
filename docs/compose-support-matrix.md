@@ -6,7 +6,7 @@ Status values match [parity-matrix.md](parity-matrix.md). This page is the Compo
 
 | Docker Compose | `container compose` | Status | Notes |
 |----------------|---------------------|--------|-------|
-| `up` | `compose up` | `done` | Always detached; `-d`, `--build`, `--wait` accepted (builds and `depends_on` health waits always happen). `--force-recreate`, `--remove-orphans` act; `--no-deps` is accepted but all services start. `--scale` is not supported (use `deploy.replicas`). |
+| `up` | `compose up [SERVICE...]` | `done` | Always detached (`-d` accepted). Named services start with their `depends_on` chain; `--no-deps` starts only the named ones. `--scale SERVICE=N` (capped at 3), `--no-start`, `--no-build`, `--pull always\|missing\|never`, `--force-recreate` and `--remove-orphans` act. `--wait` blocks until each service is running (and healthy, where it has a healthcheck), with `--wait-timeout` (default 300s). Services are built on every `up` unless `--no-build` |
 | `down` | `compose down` | `done` | Stops/deletes project containers + default network. `-v` removes declared named volumes; `-t` sets the minimum stop timeout. |
 | `config` | `compose config` | `done` | Validates and prints plan summary |
 | `doctor` | `compose doctor` | `done` | Preflight loud edges (aliases, single-writer volumes, devices, NFS, docker.sock); `--strict` fails on warn |

@@ -207,6 +207,51 @@ cc -f "${LF}/c.yml" -p "${CP}" up -d --build --wait >/dev/null; sleep 2
 cc -f "${LF}/c.yml" -p "${CP}" down -t 1 >/dev/null
 cc -f "${LF}/c.yml" -p "${PROJ}" down -t 1 >/dev/null; rm -rf "${LF}"
 
+# --- compose up: service selection, --no-deps, --scale, --wait, --pull never -----------------------
+# Names carry the run's suffix so they cannot collide with anything else on the system.
+SELD="$(mktemp -d)"; SELP="corpussel${SUFFIX}"
+DB="seldb${SUFFIX}"; API="selapi${SUFFIX}"; WEB="selweb${SUFFIX}"
+printf 'services:\n  %s:\n    image: %s\n    command: ["sleep","300"]\n  %s:\n    image: %s\n    command: ["sleep","300"]\n    depends_on: [%s]\n  %s:\n    image: %s\n    command: ["sleep","300"]\n    depends_on: [%s]\n' \
+    "${DB}" "${IMAGE}" "${API}" "${IMAGE}" "${DB}" "${WEB}" "${IMAGE}" "${API}" >"${SELD}/c.yml"
+running_names() { "${CONTAINER_BIN}" ps --filter "label=com.docker.compose.project=${SELP}" --format '{{.Names}}' 2>/dev/null | grep -v '^Warning' | sort | tr '\n' ' '; }
+
+cc -f "${SELD}/c.yml" -p "${SELP}" up -d "${WEB}" >/dev/null; sleep 3
+got="$(running_names)"
+[[ "${got}" == *"${DB}"* && "${got}" == *"${API}"* && "${got}" == *"${WEB}"* ]] \
+    && pass "compose up SERVICE also starts what it depends on" || fail "up ${WEB}: running = '${got}'"
+cc -f "${SELD}/c.yml" -p "${SELP}" down -t 1 >/dev/null
+
+cc -f "${SELD}/c.yml" -p "${SELP}" up -d --no-deps "${WEB}" >/dev/null; sleep 3
+got="$(running_names)"
+[[ "${got}" == *"${WEB}"* && "${got}" != *"${DB}"* && "${got}" != *"${API}"* ]] \
+    && pass "compose up --no-deps starts only the named service" || fail "up --no-deps ${WEB}: running = '${got}'"
+cc -f "${SELD}/c.yml" -p "${SELP}" down -t 1 >/dev/null
+
+cc -f "${SELD}/c.yml" -p "${SELP}" up -d --scale "${DB}=2" "${DB}" >/dev/null; sleep 3
+count="$("${CONTAINER_BIN}" ps --filter "label=com.docker.compose.service=${DB}" --format '{{.Names}}' 2>/dev/null | grep -vc '^Warning')"
+[[ "${count}" == "2" ]] && pass "compose up --scale SERVICE=2 runs two instances" || fail "up --scale ${DB}=2: ${count} instance(s)"
+cc -f "${SELD}/c.yml" -p "${SELP}" down -t 1 >/dev/null
+
+# --wait must not return until the service is healthy: assert health IMMEDIATELY after it returns.
+HC="selhc${SUFFIX}"
+printf 'services:\n  %s:\n    image: %s\n    command: ["sleep","300"]\n    healthcheck:\n      test: ["CMD-SHELL", "true"]\n      interval: 1s\n      retries: 2\n' "${HC}" "${IMAGE}" >"${SELD}/h.yml"
+cc -f "${SELD}/h.yml" -p "${SELP}h" up -d --wait --wait-timeout 90 >/dev/null
+if "${CONTAINER_BIN}" inspect "${HC}" 2>/dev/null | grep -qE '"healthStatus" *: *"healthy"'; then
+    pass "compose up --wait returns only once the service is healthy"
+else
+    fail "up --wait returned before ${HC} was healthy"
+fi
+cc -f "${SELD}/h.yml" -p "${SELP}h" down -t 1 >/dev/null
+
+printf 'services:\n  nope:\n    image: localhost/definitely-not-present-%s:1\n    command: ["true"]\n' "${SUFFIX}" >"${SELD}/n.yml"
+out="$(cc -f "${SELD}/n.yml" -p "${SELP}n" up -d --pull never 2>&1)"
+[[ "${out}" == *"pull_policy is never"* && "${out}" == *"not present locally"* ]] \
+    && pass "compose up --pull never fails clearly when the image is absent" || fail "up --pull never: ${out:0:200}"
+out="$(cc -f "${SELD}/c.yml" -p "${SELP}" up -d no-such-service 2>&1)"
+[[ "${out}" == *"no such service: no-such-service"* ]] \
+    && pass "compose up with an unknown service names it" || fail "up unknown service: ${out:0:160}"
+rm -rf "${SELD}"
+
 # --- compose verbs must only ever act on THIS project's containers -------------------------------
 # `compose rm -f web` once resolved to any container named `web`. A same-named foreign container
 # (here, started with plain `run`) must survive every name-addressed verb run against a project
