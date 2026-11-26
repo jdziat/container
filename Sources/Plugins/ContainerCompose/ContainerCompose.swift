@@ -1643,14 +1643,17 @@ struct ComposePlanner {
             // the Compose service name, also publish the service name as an alias.
             // With replicas > 1, only instance 1 publishes the Compose service-name alias
             // (exact aliases are unique per network on the per-container VM model).
-            let publishServiceAlias = cname != service.name && containerNumber == 1
+            // A one-off (`compose run`) publishes NO aliases: exact aliases are unique per network and the
+            // project's own container for the service already holds the service name, `hostname` and any
+            // `aliases:`. Taking them again fails the run ("alias(es) already exist on the same network").
+            let publishServiceAlias = cname != service.name && containerNumber == 1 && !oneOff
             var networkArgs: [String] = []
             if service.networks.isEmpty {
                 var spec = network
                 if publishServiceAlias {
                     spec += ",alias=\(service.name)"
                 }
-                if containerNumber == 1, let hostname = service.hostname, hostname != service.name {
+                if containerNumber == 1, !oneOff, let hostname = service.hostname, hostname != service.name {
                     spec += ",alias=\(hostname)"
                 }
                 networkArgs.append(spec)
@@ -1663,11 +1666,13 @@ struct ComposePlanner {
                     if publishServiceAlias {
                         spec += ",alias=\(service.name)"
                     }
-                    if containerNumber == 1, let hostname = service.hostname, hostname != service.name {
+                    if containerNumber == 1, !oneOff, let hostname = service.hostname, hostname != service.name {
                         spec += ",alias=\(hostname)"
                     }
-                    for alias in extra.aliases {
-                        spec += ",alias=\(alias)"
+                    if !oneOff {
+                        for alias in extra.aliases {
+                            spec += ",alias=\(alias)"
+                        }
                     }
                     networkArgs.append(spec)
                 }

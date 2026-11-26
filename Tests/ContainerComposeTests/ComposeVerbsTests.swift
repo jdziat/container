@@ -451,4 +451,51 @@ struct ComposeVerbsTests {
         #expect(abs(parts[0].count - parts[1].count) <= 2, "neither side should take nearly all of the room: \(name)")
         #expect(name.count <= 63)
     }
+
+    // MARK: one-offs and network aliases
+
+    private let aliasYaml = """
+        services:
+          api:
+            image: x
+            hostname: api.internal
+            networks:
+              front:
+                aliases: [api-alias]
+              back: {}
+          plain:
+            image: x
+            hostname: plain.internal
+        networks:
+          front: {}
+          back: {}
+        """
+
+    private func networkSpecs(_ args: [String]) -> [String] {
+        args.indices.filter { args[$0] == "--network" }.map { args[$0 + 1] }
+    }
+
+    @Test func aOneOffPublishesNoAliasesBecauseTheProjectsContainerHoldsThem() throws {
+        let p = try plan(aliasYaml)
+        for name in ["api", "plain"] {
+            var svc = try p.oneOffService(name, overrides: RunOverrides(name: "custom-\(name)"), hostEnvironment: [:])
+            svc.containerName = "custom-\(name)"  // differs from the service name, which normally adds a service alias
+            let args = try p.runArgs(for: svc, detach: false, commandOverride: nil, oneOff: true)
+            let specs = networkSpecs(args)
+            #expect(!specs.isEmpty)
+            #expect(specs.allSatisfy { !$0.contains("alias=") }, "one-off of \(name) must not take aliases: \(specs)")
+        }
+    }
+
+    @Test func aRegularContainerStillPublishesItsAliases() throws {
+        let p = try plan(aliasYaml)
+        var svc = try #require(p.services.first { $0.name == "api" })
+        svc.containerName = "custom-api"
+        let specs = networkSpecs(try p.runArgs(for: svc, detach: true, commandOverride: nil, oneOff: false))
+        #expect(specs.contains { $0.contains("alias=api-alias") })
+        #expect(specs.contains { $0.contains("alias=api.internal") })
+        // Exactly the service name: "alias=api" is a prefix of the other two, so match whole alias tokens.
+        let aliases = Set(specs.flatMap { $0.split(separator: ",").compactMap { $0.hasPrefix("alias=") ? String($0.dropFirst(6)) : nil } })
+        #expect(aliases.contains("api"), "service-name alias missing: \(aliases)")
+    }
 }
