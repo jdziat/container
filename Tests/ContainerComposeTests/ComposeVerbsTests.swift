@@ -321,4 +321,29 @@ struct ComposeVerbsTests {
         #expect(ComposeDryRun.enabled)
         #expect(args == ["up", "--file=x.yml"])
     }
+
+    // MARK: command parsing
+
+    /// The guest command after the service keeps its own flags: `compose exec web sh -c 'x'` must not be read
+    /// as options of `exec`. This once failed live with "Unknown option '-c'".
+    @Test func commandAfterTheServiceKeepsItsOwnFlags() throws {
+        let run = try #require(
+            try ContainerCompose.parseAsRoot(["run", "-e", "A=1", "web", "sh", "-c", "echo hi"]) as? ContainerCompose.Run)
+        #expect(run.service == "web")
+        #expect(run.env == ["A=1"])
+        #expect(run.command == ["sh", "-c", "echo hi"])
+
+        let exec = try #require(
+            try ContainerCompose.parseAsRoot(["exec", "-u", "root", "web", "ls", "-l", "--color=never", "/"]) as? ContainerCompose.Exec)
+        #expect(exec.service == "web")
+        #expect(exec.user == "root")
+        #expect(exec.command == ["ls", "-l", "--color=never", "/"])
+    }
+
+    @Test func optionsBeforeTheServiceStillBelongToTheVerb() throws {
+        let run = try #require(try ContainerCompose.parseAsRoot(["run", "-d", "--no-deps", "-w", "/srv", "web", "sleep", "9"]) as? ContainerCompose.Run)
+        #expect(run.detach && run.noDeps)
+        #expect(run.workdir == "/srv")
+        #expect(run.command == ["sleep", "9"])
+    }
 }

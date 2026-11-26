@@ -512,7 +512,7 @@ extension ContainerCompose {
         @Argument(help: "Service name")
         var service: String
 
-        @Argument(parsing: .remaining, help: "Command to run")
+        @Argument(parsing: .captureForPassthrough, help: "Command to run")
         var command: [String] = []
 
         func run() async throws {
@@ -572,7 +572,7 @@ extension ContainerCompose {
         @Argument(help: "Service name")
         var service: String
 
-        @Argument(parsing: .remaining, help: "Command override")
+        @Argument(parsing: .captureForPassthrough, help: "Command override")
         var command: [String] = []
 
         func run() async throws {
