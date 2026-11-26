@@ -23,11 +23,11 @@ ok() { printf '[f2-extends] %s\n' "$*"; }
 cleanup() { rm -rf "${FIX_DIR}"; }
 trap cleanup EXIT
 
-grep -q 'resolveExtends' "${ROOT}/Sources/Plugins/ContainerCompose/main.swift" \
+grep -q 'resolveExtends' "${ROOT}/Sources/Plugins/ContainerCompose/ContainerCompose.swift" \
   || fail "resolveExtends missing"
-grep -q 'deepMergeComposeService' "${ROOT}/Sources/Plugins/ContainerCompose/main.swift" \
+grep -q 'deepMergeComposeService' "${ROOT}/Sources/Plugins/ContainerCompose/ContainerCompose.swift" \
   || fail "deepMergeComposeService missing"
-grep -q 'parseExtendsSpec' "${ROOT}/Sources/Plugins/ContainerCompose/main.swift" \
+grep -q 'parseExtendsSpec' "${ROOT}/Sources/Plugins/ContainerCompose/ContainerCompose.swift" \
   || fail "parseExtendsSpec missing"
 
 cat > "${FIX_DIR}/base.yaml" <<'EOF'
@@ -53,7 +53,7 @@ services:
 EOF
 
 # Static merge-bounds contract (child scalar wins; list env concatenates).
-grep -q 'child' "${ROOT}/Sources/Plugins/ContainerCompose/main.swift" \
+grep -q 'child' "${ROOT}/Sources/Plugins/ContainerCompose/ContainerCompose.swift" \
   || fail "deep-merge child-wins contract missing from compose sources"
 grep -q 'concatenate\|concat' "${ROOT}/docs/compose-support-matrix.md" \
   || fail "compose-support-matrix must document list concat for extends"

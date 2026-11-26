@@ -14,7 +14,7 @@
 # limitations under the License.
 
 # Compose doc-drift gate: docs/compose-support-matrix.md and the planner's accepted-key set
-# (`allowed` in Sources/Plugins/ContainerCompose/main.swift) must agree. A key the planner
+# (`allowed` in Sources/Plugins/ContainerCompose/ContainerCompose.swift) must agree. A key the planner
 # accepts but the matrix omits is undocumented; a key the matrix calls `done` but the planner
 # rejects is a false claim (this is how the `devices` contradiction slipped in). Needs no system.
 
@@ -24,13 +24,22 @@ ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 python3 - "${ROOT}" <<'PY'
 import re, sys
 root = sys.argv[1]
-src = open(f"{root}/Sources/Plugins/ContainerCompose/main.swift").read()
+src = open(f"{root}/Sources/Plugins/ContainerCompose/ContainerCompose.swift").read()
 doc = open(f"{root}/docs/compose-support-matrix.md").read()
 
 m = re.search(r"let allowed: Set<String> = \[(.*?)\]", src, re.S)
 if not m:
     print("FAIL: could not find the planner's `allowed` key set"); sys.exit(1)
 code_keys = set(re.findall(r'"([a-z_]+)"', m.group(1)))
+
+# Keys owned by ServiceOptionsParser: the ignored-with-warning table plus the explicit union list.
+opts = open(f"{root}/Sources/Plugins/ContainerCompose/ServiceOptions.swift").read()
+ign = re.search(r"static let ignoredWithWarning: \[String: String\] = \[(.*?)\n    \]", opts, re.S)
+acc = re.search(r"static let acceptedKeys: Set<String> = .*?\.union\(\[(.*?)\]\)", opts, re.S)
+if not ign or not acc:
+    print("FAIL: could not find ServiceOptionsParser's key tables"); sys.exit(1)
+code_keys |= set(re.findall(r'^\s*"([a-z_]+)":', ign.group(1), re.M))
+code_keys |= set(re.findall(r'"([a-z_]+)"', acc.group(1)))
 
 # Service-key rows only: the section between "## Service keys" and the next "##".
 section = doc.split("## Service keys", 1)[1].split("\n## ", 1)[0]

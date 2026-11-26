@@ -135,7 +135,7 @@ Success is: published jobs complete under harness; unsupported paths refuse earl
 - Fix any copy that implies unfinished work for intentional 501/wontfix
 **Out of scope:**
 - Implementing live hotplug or devices; changing HTTP status codes
-**Surfaces touched:** `Sources/Services/ContainerAPIService/Server/Containers/ContainersService.swift` (message text only if needed), `Sources/Plugins/ContainerCompose/main.swift`, `Sources/Plugins/DockerAPIBridge/BridgeServer.swift`, related docs
+**Surfaces touched:** `Sources/Services/ContainerAPIService/Server/Containers/ContainersService.swift` (message text only if needed), `Sources/Plugins/ContainerCompose/ContainerCompose.swift`, `Sources/Plugins/DockerAPIBridge/BridgeServer.swift`, related docs
 **Interfaces:** Existing error channels; 501 JSON `message` remains stable and points at `docker-api-bridge support`
 **Verification:** Manual or unit/integration asserts on key error strings; T2 harnesses still green
 **Next command:** `/eg-new-feature` implement T4 from `docs/plans/2026-11-19-job-catalog-docker-parity.prd.md`

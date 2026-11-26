@@ -25,7 +25,7 @@ grep -q 'unique per network' \
 grep -q 'hostnameOnDifferentNetworks\|aliasReuseAcrossNetworks\|aliasOnTwoNetworks' \
   "${ROOT}/Tests/ContainerAPIServiceTests/AttachmentNameValidatorTests.swift" \
   || fail "missing L3 unit tests for cross-network reuse"
-grep -q 'unique per network' "${ROOT}/Sources/Plugins/ContainerCompose/main.swift" \
+grep -q 'unique per network' "${ROOT}/Sources/Plugins/ContainerCompose/ContainerCompose.swift" \
   || fail "compose doctor must say unique per network"
 grep -q 'not globally unique\|per network' \
   "${ROOT}/Sources/Services/ContainerAPIService/Server/Networks/NetworkMatchSelector.swift" \

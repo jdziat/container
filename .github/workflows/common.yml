@@ -24,8 +24,9 @@ jobs:
   # containerization does for vminitd. The macOS job packages the artifact.
   buildClusterShim:
     name: Build cluster-shim
-    # Runs upstream, or on a fork that has set the repository variable LIVE_GATE_ENABLED=true AFTER
-    # registering a self-hosted runner with the labels below. Off by default, so forks are unchanged.
+    # Runs only when the repository variable LIVE_GATE_ENABLED is 'true', which should be set while a
+    # self-hosted runner with the labels below is registered. (The apple/container clause is a leftover
+    # from the project's origin; this repository is its own upstream.)
     if: github.repository == 'apple/container' || vars.LIVE_GATE_ENABLED == 'true'
     timeout-minutes: 30
     runs-on: ubuntu-24.04
@@ -54,8 +55,9 @@ jobs:
 
   buildAndTest:
     name: Build and test the project
-    # Runs upstream, or on a fork that has set the repository variable LIVE_GATE_ENABLED=true AFTER
-    # registering a self-hosted runner with the labels below. Off by default, so forks are unchanged.
+    # Runs only when the repository variable LIVE_GATE_ENABLED is 'true', which should be set while a
+    # self-hosted runner with the labels below is registered. (The apple/container clause is a leftover
+    # from the project's origin; this repository is its own upstream.)
     if: github.repository == 'apple/container' || vars.LIVE_GATE_ENABLED == 'true'
     needs: buildClusterShim
     timeout-minutes: 90
@@ -64,7 +66,7 @@ jobs:
       contents: read
       packages: read
     env:
-      # Upstream runners keep this Xcode here. A fork runner can point elsewhere by setting the
+      # The original runners kept this Xcode here. Another runner can point elsewhere by setting the
       # repository variable RUNNER_DEVELOPER_DIR (for example /Applications/Xcode.app/Contents/Developer).
       DEVELOPER_DIR: ${{ vars.RUNNER_DEVELOPER_DIR || '/Applications/Xcode_swift_6.3.app/Contents/Developer' }}
       # Package the cluster-shim artifact instead of building it in a container.
@@ -161,9 +163,9 @@ jobs:
       # the system left by the test step above and starts its own on the isolated APP_ROOT. This is what keeps the parity matrix
       # honest; the older grep-based targets pass even when the build is broken.
       # LIVE_GATE_ONLY=true (repository variable) skips upstream's long, VM-heavy integration/coverage
-      # suite and runs only the parity gate below. Intended for a fork whose self-hosted runner is also
+      # suite and runs only the parity gate below. Intended for a self-hosted runner that is also
       # someone's everyday machine: that suite is not this project's gate, runs 30+ minutes, and once
-      # coincided with the runner losing its network connection. Leave it unset upstream.
+      # coincided with the runner losing its network connection. Leave it unset where the full suite is wanted.
       - name: Docker parity (behavioral)
         # Runs even when the upstream test step above failed, so a failure there cannot hide whether
         # this gate passes. The job as a whole still fails if either step fails.

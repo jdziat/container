@@ -39,7 +39,7 @@ grep -q 'installPreferredNFSKernel' "${ROOT}/Sources/ContainerCommands/System/Sy
   || fail "SystemStart must call installPreferredNFSKernel when preference is nfs"
 
 # Doctor + annotate point at preferred path.
-grep -q 'CONTAINER_PREFERRED_KERNEL=nfs' "${ROOT}/Sources/Plugins/ContainerCompose/main.swift" \
+grep -q 'CONTAINER_PREFERRED_KERNEL=nfs' "${ROOT}/Sources/Plugins/ContainerCompose/ContainerCompose.swift" \
   || fail "compose doctor nfs-kernel message must mention CONTAINER_PREFERRED_KERNEL=nfs"
 grep -q 'CONTAINER_PREFERRED_KERNEL=nfs' "${ROOT}/Sources/Services/RuntimeLinux/Server/RuntimeService.swift" \
   || fail "annotateNFSKernelError must mention CONTAINER_PREFERRED_KERNEL=nfs"

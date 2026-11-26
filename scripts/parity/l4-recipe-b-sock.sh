@@ -48,7 +48,7 @@ grep -q 'install-engine-sock' "${ROOT}/docs/docker-job-catalog.md" \
   || fail "job catalog missing install-engine-sock Recipe B path"
 [[ -x "${ROOT}/scripts/install-engine-sock.sh" ]] \
   || fail "scripts/install-engine-sock.sh missing or not executable"
-grep -q 'Recipe B' "${ROOT}/Sources/Plugins/ContainerCompose/main.swift" \
+grep -q 'Recipe B' "${ROOT}/Sources/Plugins/ContainerCompose/ContainerCompose.swift" \
   || fail "compose doctor must mention Recipe B for docker-sock"
 
 if [[ -x "${CONTAINER_BIN}" ]]; then

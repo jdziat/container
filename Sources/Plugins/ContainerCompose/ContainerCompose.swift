@@ -719,6 +719,8 @@ struct ComposePlanner {
         var devices: [String]
         /// From `deploy.replicas` (interim subset; capped at 3 at plan time).
         var replicas: Int
+        /// Keys that map onto `container run` flags (ulimits, sysctls, dns, resources, ...).
+        var options = ServiceOptions()
     }
 
     struct Plan: Sendable {
@@ -732,6 +734,8 @@ struct ComposePlanner {
         /// Every service named in the file, including ones a profile left out of `services`. A container
         /// whose service is declared here is never an orphan.
         var declaredServices: Set<String> = []
+        /// Non-fatal notices (keys accepted with no effect, rounded values). Printed once by `plan`.
+        var warnings: [String] = []
 
         func reportUnsupported() throws {
             guard !unsupported.isEmpty else { return }
@@ -1109,6 +1113,32 @@ struct ComposePlanner {
             }
         }
 
+        /// True for the auto-named local build tag (`<project>_<service>[:tag]`), which is never pulled.
+        func isAutoBuiltImage(_ service: Service) -> Bool {
+            guard service.build != nil else { return false }
+            let auto = "\(project)_\(service.name)"
+            return service.image == auto || service.image.hasPrefix("\(auto):")
+        }
+
+        /// Honor `pull_policy` before a service starts: `always` pulls, `never` requires the image to
+        /// already be present (failing here, with a clear message, instead of letting `run` pull it).
+        func applyPullPolicy(_ service: Service) throws {
+            switch service.options.pullPolicy {
+            case .always:
+                guard !isAutoBuiltImage(service) else { return }
+                _ = try runContainer(["image", "pull", service.image])
+            case .never:
+                do {
+                    _ = try runContainer(["image", "inspect", service.image])
+                } catch {
+                    throw ComposeError.invalid(
+                        "service \(service.name): pull_policy is never and image \(service.image) is not present locally")
+                }
+            case .missing, .build, nil:
+                break
+            }
+        }
+
         func up(detach: Bool, startContainers: Bool = true) async throws {
             try ensureNetworks()
             try ensureVolumes()
@@ -1137,6 +1167,7 @@ struct ComposePlanner {
                     }
                 }
                 let runDetached = detach && !awaitedByCompleted
+                try applyPullPolicy(service)
                 for index in 1...service.replicas {
                     var instance = service
                     instance.containerName = Self.instanceContainerName(service, index: index)
@@ -1269,7 +1300,7 @@ struct ComposePlanner {
             }
         }
 
-        private func runArgs(
+        func runArgs(
             for service: Service,
             detach: Bool,
             commandOverride: [String]?,
@@ -1318,6 +1349,10 @@ struct ComposePlanner {
                     networkArgs.append(spec)
                 }
             }
+            // mac_address belongs to the service's first network attachment.
+            if let mac = service.options.macAddress, !networkArgs.isEmpty {
+                networkArgs[0] += ",mac=\(mac)"
+            }
             for n in networkArgs {
                 args += ["--network", n]
             }
@@ -1344,6 +1379,7 @@ struct ComposePlanner {
             for device in service.devices {
                 args += ["--device", device]
             }
+            args += service.options.runFlags()
 
             for (key, value) in service.environment.sorted(by: { $0.key < $1.key }) {
                 args += ["-e", "\(key)=\(value)"]
@@ -1426,6 +1462,7 @@ struct ComposePlanner {
             throw ComposeError.invalid("compose file is not a mapping")
         }
         var unsupported: [(service: String?, key: String, reason: String)] = []
+        var composeWarnings: [String] = []
 
         let allowedTop: Set<String> = [
             "services", "networks", "volumes", "name", "version", "configs", "secrets",
@@ -1485,10 +1522,15 @@ struct ComposePlanner {
             ]
             for key in body.keys {
                 if key.hasPrefix("x-") || key.hasPrefix("X-") { continue }
-                if !allowed.contains(key) {
-                    unsupported.append((name, key, "not implemented"))
+                if !allowed.contains(key) && !ServiceOptionsParser.acceptedKeys.contains(key) {
+                    unsupported.append(
+                        (name, key, ServiceOptionsParser.rejectedReasons[key] ?? "not implemented"))
                 }
             }
+
+            let optionsParse = try ServiceOptionsParser.parse(body: body, service: name)
+            for item in optionsParse.unsupported { unsupported.append((name, item.key, item.reason)) }
+            composeWarnings += optionsParse.warnings
 
             let build = try parseBuild(body["build"], service: name, base: composeDir)
             var image = body["image"] as? String
@@ -1531,7 +1573,14 @@ struct ComposePlanner {
             let networks = try parseServiceNetworks(body["networks"], service: name)
             let command = try parseCommand(body["command"], service: name)
             let entrypoint = try parseEntrypoint(body["entrypoint"], service: name)
-            let (replicas, deployRestart) = try parseDeploySubset(body["deploy"], service: name)
+            // `scale: N` is the service-level spelling of deploy.replicas; deploy.replicas wins if both are set.
+            var deployBody = body["deploy"]
+            if let scale = body["scale"], (body["deploy"] as? [String: Any])?["replicas"] == nil {
+                var merged = (body["deploy"] as? [String: Any]) ?? [:]
+                merged["replicas"] = scale
+                deployBody = merged
+            }
+            let (replicas, deployRestart) = try parseDeploySubset(deployBody, service: name)
             var restart = body["restart"] as? String
             if restart == nil {
                 restart = deployRestart
@@ -1574,11 +1623,16 @@ struct ComposePlanner {
                     capAdd: stringList(body["cap_add"]),
                     capDrop: stringList(body["cap_drop"]),
                     devices: try parseComposeDevices(body["devices"], service: name),
-                    replicas: replicas
+                    replicas: replicas,
+                    options: optionsParse.options
                 ))
         }
 
         services = try topoSortServices(services)
+
+        for warning in composeWarnings {
+            FileHandle.standardError.write(Data("WARN: \(warning)\n".utf8))
+        }
 
         return Plan(
             project: projectName,
@@ -1588,7 +1642,8 @@ struct ComposePlanner {
             volumes: projectVolumes,
             networks: projectNetworks,
             unsupported: unsupported,
-            declaredServices: Set(servicesMap.keys)
+            declaredServices: Set(servicesMap.keys),
+            warnings: composeWarnings
         )
     }
 

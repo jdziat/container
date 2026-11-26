@@ -65,6 +65,23 @@ Status values match [parity-matrix.md](parity-matrix.md). This page is the Compo
 | `deploy` | `done (interim)` | Subset: `replicas` (create `service-1..N`, cap 3 with WARN) and `restart_policy.condition` (`none`→`no`, `on-failure`, `any`→`always`) → `--restart` when service-level `restart` is unset; other `deploy.*` keys ignored |
 | `extends` | `done` | Same-file or `file:` relative to the compose project dir; deep-merge (child scalars win); `ports`/`volumes`/list env concatenate; env key conflicts → child wins |
 | `devices` | `done (interim)` | **Unrestricted by default**: any absolute character or block device path maps to `run --device` (`Parser.devices`). Set `CONTAINER_DEVICE_ALLOWLIST_ONLY=1` for the old fail-closed allowlist (`/dev/null`, `/dev/zero`, `/dev/urandom`, `/dev/tty`; extend via `CONTAINER_DEVICE_ALLOWLIST`). Character devices are surfaced through a virtiofs file mount; the OCI `linux.devices` mknod path exists only in `CONTAINER_VMM_CR=1` builds. Superseded: [plans/cto-devices-allowlist-2026-11-21.md](plans/cto-devices-allowlist-2026-11-21.md) |
+| `ulimits` | `done` | `nofile: 1024` or `{soft, hard}` -> `--ulimit` |
+| `sysctls` | `done` | Mapping or `k=v` list -> `--sysctl` (set inside the guest) |
+| `extra_hosts` | `done` | Mapping or list, `host:ip` or `host=ip` -> `--add-host`. `host-gateway` is rejected (use the gateway IP) |
+| `dns` / `dns_search` / `dns_opt` | `done` | -> `--dns` / `--dns-search` / `--dns-option` |
+| `stop_signal` | `done` | -> `--stop-signal` |
+| `init` | `done` | -> `--init` |
+| `read_only` | `done` | -> `--read-only` |
+| `platform` | `done` | -> `--platform` |
+| `cpus` | `done (interim)` | Whole CPUs only: a fractional value is rounded **up**, with a warning |
+| `mem_limit` | `done` | Also `deploy.resources.limits.memory` (the service-level key wins). `512m`, `1g`, `1gb` or bytes; rounded up to whole MiB with a warning. `deploy.resources.limits.cpus` is read like `cpus` |
+| `mac_address` | `done` | Applied to the service's first network |
+| `pull_policy` | `done (interim)` | `always` pulls before start, `never` fails if the image is absent, `missing`/`build` are the default. `daily`, `weekly`, `every_*` are treated as `missing` with a warning |
+| `scale` | `done (interim)` | Same as `deploy.replicas` (which wins if both are set); capped at 3 with a warning |
+| `network_mode` | `wontfix` | `bridge`/`default` are accepted; `host`, `none`, `service:*`, `container:*` are rejected (each container is its own VM) |
+| `links`, `external_links`, `volumes_from`, `group_add` | `wontfix` | Rejected with a reason. Use networks and service names, a shared named volume, or `user:` |
+| `privileged`, `security_opt`, `pid`, `ipc`, `uts`, `cgroup`, `cgroup_parent`, `logging`, `expose`, `userns_mode`, `isolation`, `oom_score_adj`, `oom_kill_disable`, `cpu_shares`, `cpu_quota`, `cpu_period`, `cpu_rt_runtime`, `cpu_rt_period`, `cpuset`, `cpu_count`, `cpu_percent`, `mem_reservation`, `memswap_limit`, `mem_swappiness`, `blkio_config`, `pids_limit`, `runtime`, `storage_opt`, `annotations`, `develop` | `done (interim)` | Accepted with **no effect**: one warning is printed when the key is set to a non-default value, naming why. Nothing is silently dropped |
+| `tty`, `stdin_open` | `done (interim)` | Accepted with a warning and **no effect**: a detached container's stdio is closed after start, so a bare `sh` still exits (use `sleep infinity`) |
 
 ## Mount types (engine)
 

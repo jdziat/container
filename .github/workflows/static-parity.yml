@@ -1,6 +1,6 @@
 name: static parity checks
 
-# Runs on GitHub-hosted macOS, so it works on forks with no self-hosted runner.
+# Runs on GitHub-hosted macOS, so it needs no self-hosted runner.
 #
 # WHAT THIS IS: build, unit tests, the CLI-surface walk (every command's --help must parse), and
 # the compose doc-drift check. These catch compile breaks, argument-definition bugs and doc drift.

@@ -17,7 +17,7 @@ in one user collide: the gate runs `container system stop`, which tears down the
 separate macOS user has its own launchd domain, and that is what made the first green run possible.
 It needs a real login session (log in once with Fast User Switching), not just `su`.
 
-## Enable it on a fork
+## Enable it
 
 1. Register a self-hosted runner on the repository: **macOS 26, Apple silicon**, with Xcode 26.4+
    and the labels `self-hosted, macos, goldengate, ARM64` (the labels `common.yml` requests).
@@ -26,7 +26,7 @@ It needs a real login session (log in once with Fast User Switching), not just `
 3. Open or update a pull request. `Build and test the project` now runs, including the
    `Docker parity (behavioral)` step.
 
-Until step 2, the jobs are skipped on forks exactly as before (they run only for `apple/container`).
+Until step 2 the build jobs are skipped, so a push never queues a job that waits for a runner that is not there.
 
 ## Safety
 

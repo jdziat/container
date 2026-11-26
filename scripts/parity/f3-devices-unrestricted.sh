@@ -22,7 +22,7 @@ ok() { printf '[f3-devices] %s\n' "$*"; }
 PARSER="${ROOT}/Sources/Services/ContainerAPIService/Client/Parser.swift"
 grep -q 'CONTAINER_DEVICE_ALLOWLIST_ONLY' "$PARSER" || fail "Parser missing ALLOWLIST_ONLY opt-out"
 grep -q 'Unrestricted by default' "$PARSER" || fail "Parser missing unrestricted claim"
-COMPOSE="${ROOT}/Sources/Plugins/ContainerCompose/main.swift"
+COMPOSE="${ROOT}/Sources/Plugins/ContainerCompose/ContainerCompose.swift"
 grep -q 'CONTAINER_DEVICE_ALLOWLIST_ONLY' "$COMPOSE" || fail "Compose missing ALLOWLIST_ONLY"
 RUNTIME="${ROOT}/Sources/Services/RuntimeLinux/Server/RuntimeService.swift"
 grep -q 'R2: unrestricted host devices' "$RUNTIME" || fail "RuntimeService missing device mounts"
