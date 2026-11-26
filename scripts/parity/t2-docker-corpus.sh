@@ -163,7 +163,10 @@ cc() { "${CONTAINER_BIN}" compose "$@" 2>&1 | grep -v '^Warning! Running debug b
 cstate() { "${CONTAINER_BIN}" ps -a --filter "label=com.docker.compose.project=${PROJ}" --format '{{.Status}}' 2>/dev/null | grep -v '^Warning' | head -1; }
 cc -f "${LF}/c.yml" -p "${PROJ}" up -d >/dev/null; sleep 3
 [[ "$(cstate)" == "running" ]] && pass "compose -f FILE -p NAME up -d (Docker-style global options)" || fail "compose up: state='$(cstate)'"
-[[ "$(cc -f "${LF}/c.yml" -p "${PROJ}" ps -q | grep -c .)" == "1" ]] && pass "compose ps -q lists the project's container" || fail "compose ps -q"
+# Must equal the project's real container (by name or id). Counting lines would pass on an error message.
+psq="$(cc -f "${LF}/c.yml" -p "${PROJ}" ps -q)"
+real="$("${CONTAINER_BIN}" ps -a --filter "label=com.docker.compose.project=${PROJ}" --format '{{.Names}} {{.ID}}' 2>/dev/null | grep -v '^Warning')"
+if [[ -n "${psq}" && -n "${real}" && "${real}" == *"${psq}"* && "${psq}" != *"rror"* ]]; then pass "compose ps -q lists the project's container"; else fail "compose ps -q: got '${psq:0:100}', expected one of '${real:0:100}'"; fi
 cc -f "${LF}/c.yml" -p "${PROJ}" stop -t 1 >/dev/null; [[ "$(cstate)" == "stopped" ]] && pass "compose stop" || fail "compose stop: '$(cstate)'"
 cc -f "${LF}/c.yml" -p "${PROJ}" start >/dev/null; sleep 2; [[ "$(cstate)" == "running" ]] && pass "compose start" || fail "compose start: '$(cstate)'"
 cc -f "${LF}/c.yml" -p "${PROJ}" pause >/dev/null; [[ "$(cstate)" == "paused" ]] && pass "compose pause" || fail "compose pause: '$(cstate)'"

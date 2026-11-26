@@ -551,6 +551,41 @@ extension ContainerCompose {
     }
 }
 
+// MARK: - Locating the `container` CLI (pure; unit-tested)
+
+/// Which `container` binary the plugin drives. Resolved from the plugin's OWN install tree so a
+/// stale `container` elsewhere on PATH (an older build, a different version) is never used by
+/// accident, and so it works on a machine where `container` is not on PATH at all (CI).
+enum ContainerCLI {
+    /// 1. `CONTAINER_CLI` if set (explicit override).
+    /// 2. The nearest `<ancestor>/bin/container` above the plugin executable.
+    /// 3. Plain `container`, resolved through PATH by `env`.
+    static func resolve(
+        environment: [String: String],
+        pluginExecutable: String,
+        isExecutable: (String) -> Bool = { FileManager.default.isExecutableFile(atPath: $0) }
+    ) -> String {
+        if let explicit = environment["CONTAINER_CLI"], !explicit.isEmpty { return explicit }
+        var directory = URL(fileURLWithPath: pluginExecutable).deletingLastPathComponent()
+        for _ in 0..<8 {
+            let candidate = directory.appendingPathComponent("bin/container").path
+            if isExecutable(candidate) { return candidate }
+            let parent = directory.deletingLastPathComponent()
+            if parent.path == directory.path { break }
+            directory = parent
+        }
+        return "container"
+    }
+
+    /// The resolution for this process.
+    static var current: String {
+        let executable = Bundle.main.executablePath ?? CommandLine.arguments.first ?? ""
+        return resolve(
+            environment: ProcessInfo.processInfo.environment,
+            pluginExecutable: URL(fileURLWithPath: executable).resolvingSymlinksInPath().path)
+    }
+}
+
 // MARK: - Project scoping (pure; unit-tested)
 
 /// Decides which containers and volumes belong to a compose project. Kept free of I/O so the
@@ -2840,7 +2875,7 @@ func splitImageRepositoryTag(_ image: String) -> (repository: String, tag: Strin
 func runContainerStreaming(_ args: [String]) throws {
     let process = Process()
     process.executableURL = URL(fileURLWithPath: "/usr/bin/env")
-    let exe = ProcessInfo.processInfo.environment["CONTAINER_CLI"] ?? "container"
+    let exe = ContainerCLI.current
     process.arguments = [exe] + args
     process.standardInput = FileHandle.standardInput
     process.standardOutput = FileHandle.standardOutput
@@ -2856,8 +2891,7 @@ func runContainerStreaming(_ args: [String]) throws {
 func runContainer(_ args: [String]) throws -> String {
     let process = Process()
     process.executableURL = URL(fileURLWithPath: "/usr/bin/env")
-    // Prefer the same binary tree as the plugin when available.
-    let exe = ProcessInfo.processInfo.environment["CONTAINER_CLI"] ?? "container"
+    let exe = ContainerCLI.current
     process.arguments = [exe] + args
     let out = Pipe()
     let err = Pipe()

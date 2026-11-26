@@ -96,4 +96,53 @@ struct ComposeScopeTests {
             listJSON: json, project: "p", declared: ["p_data", "shared", "p_data2"])
         #expect(removable == ["p_data"])
     }
+
+    // MARK: locating the container CLI
+
+    @Test func explicitOverrideWins() {
+        let cli = ContainerCLI.resolve(
+            environment: ["CONTAINER_CLI": "/opt/x/container"],
+            pluginExecutable: "/r/libexec/container/plugins/compose/bin/compose", isExecutable: { _ in true })
+        #expect(cli == "/opt/x/container")
+    }
+
+    @Test func usesTheContainerFromThePluginsOwnInstallTree() {
+        // The plugin lives at <root>/libexec/container/plugins/compose/bin/compose; the CLI at <root>/bin/container.
+        // A different `container` on PATH must not be preferred (this is the stale-binary bug).
+        let present: Set<String> = ["/work/container/bin/container", "/usr/local/bin/container"]
+        let cli = ContainerCLI.resolve(
+            environment: [:],
+            pluginExecutable: "/work/container/libexec/container/plugins/compose/bin/compose",
+            isExecutable: { present.contains($0) })
+        #expect(cli == "/work/container/bin/container")
+    }
+
+    @Test func worksForTheAlternateLibexecLayout() {
+        let cli = ContainerCLI.resolve(
+            environment: [:],
+            pluginExecutable: "/work/c/libexec/container-plugins/compose/bin/compose",
+            isExecutable: { $0 == "/work/c/bin/container" })
+        #expect(cli == "/work/c/bin/container")
+    }
+
+    @Test func nearestAncestorWinsOverAFartherOne() {
+        let present: Set<String> = ["/a/bin/container", "/a/b/bin/container"]
+        let cli = ContainerCLI.resolve(
+            environment: [:], pluginExecutable: "/a/b/libexec/plugins/compose/bin/compose",
+            isExecutable: { present.contains($0) })
+        #expect(cli == "/a/b/bin/container")
+    }
+
+    @Test func fallsBackToPathLookupWhenNothingIsFound() {
+        #expect(
+            ContainerCLI.resolve(
+                environment: [:], pluginExecutable: "/x/y/compose", isExecutable: { _ in false }) == "container")
+    }
+
+    @Test func anEmptyOverrideIsIgnored() {
+        #expect(
+            ContainerCLI.resolve(
+                environment: ["CONTAINER_CLI": ""], pluginExecutable: "/r/bin/compose",
+                isExecutable: { $0 == "/r/bin/container" }) == "/r/bin/container")
+    }
 }
