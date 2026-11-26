@@ -36,7 +36,7 @@ Podman pods and Quadlet; volume plugins beyond local and NFS.
 | | `up --wait` really waits (running, and healthy where a healthcheck exists) | **implemented**; only checkable live (corpus check added, **not yet run**) |
 | | Several `-f` files merged in order; `compose.override.yaml` auto-loaded; default file discovery | **done** (32 tests) |
 | | `COMPOSE_FILE`, `COMPOSE_PROJECT_NAME`, `--env-file`, `--project-directory` | **done** |
-| | External networks/volumes; network `ipam`, `internal`, `labels` | todo |
+| | External networks/volumes (plain-key naming, existence check); network `ipam`, `internal`, `labels`, labeled create and label-scoped `down` | **done** (16 unit tests; live corpus checks added, **not yet run**) |
 | **C. Verbs** | `cp`, `ls`, `version`, `wait`, `push`, `export` | todo |
 | | `ps` (`-a`, `--services`, `--status`, `--format json`); `logs` for all services, `--since`, `--no-log-prefix`; `exec`/`run` flags | todo |
 | | `config` (`--services`, `--volumes`, `--format`, `-q`); `down --rmi`; global `--dry-run` | todo |

@@ -252,6 +252,53 @@ out="$(cc -f "${SELD}/c.yml" -p "${SELP}" up -d no-such-service 2>&1)"
     && pass "compose up with an unknown service names it" || fail "up unknown service: ${out:0:160}"
 rm -rf "${SELD}"
 
+# --- compose networks: labeled create, label-scoped down, external, internal + ipam ----------------
+NETD="$(mktemp -d)"; NP="corpusnet${SUFFIX}"; EXT="extnet${SUFFIX}"
+SUBNET="10.$((100 + SUFFIX % 100)).$((SUFFIX % 250)).0/24"
+net_exists() { "${CONTAINER_BIN}" network list --format json 2>/dev/null | grep -v '^Warning' | grep -q "\"name\" *: *\"$1\""; }
+cleanup_nets() { for n in "${NP}_default" "${NP}_back" "${EXT}"; do "${CONTAINER_BIN}" network delete "$n" >/dev/null 2>&1; done; }
+
+# A same-named network that this project did not create (no compose label) must survive `down`.
+"${CONTAINER_BIN}" network create "${NP}_default" >/dev/null 2>&1
+printf 'services:\n  n1:\n    image: %s\n    command: ["sleep","300"]\n' "${IMAGE}" >"${NETD}/c.yml"
+cc -f "${NETD}/c.yml" -p "${NP}" up -d >/dev/null; sleep 2; cc -f "${NETD}/c.yml" -p "${NP}" down -t 1 >/dev/null
+net_exists "${NP}_default" && pass "compose down leaves a same-named network it did not create" \
+    || fail "compose down deleted an unlabeled network named ${NP}_default"
+"${CONTAINER_BIN}" network delete "${NP}_default" >/dev/null 2>&1
+
+# A network the project creates is labeled, and `down` removes it.
+cc -f "${NETD}/c.yml" -p "${NP}" up -d >/dev/null; sleep 2
+if "${CONTAINER_BIN}" network list --format json 2>/dev/null | grep -v '^Warning' | grep -q "com.docker.compose.project\" *: *\"${NP}\""; then
+    pass "compose labels the networks it creates with the project"
+else
+    fail "the network created by compose up carries no project label"
+fi
+cc -f "${NETD}/c.yml" -p "${NP}" down -t 1 >/dev/null
+net_exists "${NP}_default" && fail "compose down did not remove its own labeled network" || pass "compose down removes the networks it created"
+
+# External network: attached by its plain name, never created or removed by compose.
+"${CONTAINER_BIN}" network create "${EXT}" >/dev/null 2>&1
+printf 'services:\n  n1:\n    image: %s\n    command: ["sleep","300"]\n    networks: [outside]\nnetworks:\n  outside:\n    external: true\n    name: %s\n' "${IMAGE}" "${EXT}" >"${NETD}/e.yml"
+cc -f "${NETD}/e.yml" -p "${NP}e" up -d >/dev/null; sleep 2
+if "${CONTAINER_BIN}" inspect n1 2>/dev/null | grep -q "\"network\" *: *\"${EXT}\""; then pass "an external network is attached by its plain name"; else fail "service is not attached to external network ${EXT}"; fi
+cc -f "${NETD}/e.yml" -p "${NP}e" down -t 1 >/dev/null
+net_exists "${EXT}" && pass "compose down never removes an external network" || fail "compose down deleted external network ${EXT}"
+"${CONTAINER_BIN}" network delete "${EXT}" >/dev/null 2>&1
+out="$(cc -f "${NETD}/e.yml" -p "${NP}e" up -d 2>&1)"
+[[ "${out}" == *"declared as external, but could not be found"* ]] \
+    && pass "a missing external network fails with a clear message" || fail "missing external network: ${out:0:160}"
+
+# internal + ipam subnet produce the network that was asked for.
+printf 'services:\n  n1:\n    image: %s\n    command: ["sleep","300"]\n    networks: [back]\nnetworks:\n  back:\n    internal: true\n    ipam:\n      config:\n        - subnet: %s\n' "${IMAGE}" "${SUBNET}" >"${NETD}/i.yml"
+cc -f "${NETD}/i.yml" -p "${NP}" up -d >/dev/null; sleep 2
+if "${CONTAINER_BIN}" network list --format json 2>/dev/null | grep -v '^Warning' | grep -q "\"ipv4Subnet\" *: *\"${SUBNET}\""; then
+    pass "ipam subnet is applied to the created network"
+else
+    fail "no network with subnet ${SUBNET} after up with ipam.config"
+fi
+cc -f "${NETD}/i.yml" -p "${NP}" down -t 1 >/dev/null
+cleanup_nets; rm -rf "${NETD}"
+
 # --- compose verbs must only ever act on THIS project's containers -------------------------------
 # `compose rm -f web` once resolved to any container named `web`. A same-named foreign container
 # (here, started with plain `run`) must survive every name-addressed verb run against a project

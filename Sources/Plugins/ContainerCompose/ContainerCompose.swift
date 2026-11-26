@@ -663,6 +663,11 @@ struct ComposePlanner {
         var driver: String?
         var external: Bool
         var aliases: [String]
+        var isInternal = false
+        var subnet: String?
+        var subnetV6: String?
+        var labels: [String: String] = [:]
+        var driverOpts: [String: String] = [:]
     }
 
     struct ServiceNetwork: Sendable {
@@ -1259,28 +1264,42 @@ struct ComposePlanner {
                 }
                 await group.waitForAll()
             }
+            // Only networks carrying this project's label, and only ones the file declares (plus the default).
+            // A same-named network somebody else created is left alone, as is one an older plugin made
+            // without a label (remove those with `container network delete`).
+            let owned =
+                (try? ComposeScope.ownedNetworkNames(
+                    listJSON: runContainer(["network", "list", "--format", "json"]), project: project)) ?? []
+            let candidates = Set(networks.values.filter { !$0.external }.map(\.name) + [network])
             await withTaskGroup(of: Void.self) { group in
-                for net in networks.values where !net.external {
-                    group.addTask { _ = try? runContainer(["network", "delete", net.name]) }
+                for name in candidates.intersection(owned).sorted() {
+                    group.addTask { _ = try? runContainer(["network", "delete", name]) }
                 }
-                group.addTask { _ = try? runContainer(["network", "delete", network]) }
                 await group.waitForAll()
             }
         }
 
         private func ensureNetworks() throws {
-            try ensureNetwork(named: network)
-            for net in networks.values where !net.external {
-                try ensureNetwork(named: net.name)
+            try ensureNetwork(named: network, key: "default", spec: nil, external: false)
+            for (key, net) in networks.sorted(by: { $0.key < $1.key }) {
+                try ensureNetwork(named: net.name, key: key, spec: net, external: net.external)
             }
         }
 
-        private func ensureNetwork(named name: String) throws {
+        private func ensureNetwork(named name: String, key: String, spec: ProjectNetwork?, external: Bool) throws {
+            if external {
+                do {
+                    _ = try runContainer(["network", "inspect", name])
+                } catch {
+                    throw ComposeError.invalid("network \(name) declared as external, but could not be found")
+                }
+                return
+            }
             do {
                 _ = try runContainer(["network", "inspect", name])
             } catch {
                 do {
-                    _ = try runContainer(["network", "create", name])
+                    _ = try runContainer(networkCreateArgs(name: name, key: key, spec: spec))
                 } catch let createError {
                     do {
                         _ = try runContainer(["network", "inspect", name])
@@ -1293,7 +1312,14 @@ struct ComposePlanner {
 
         private func ensureVolumes() throws {
             for vol in volumes.values {
-                if vol.external { continue }
+                if vol.external {
+                    do {
+                        _ = try runContainer(["volume", "inspect", vol.name])
+                    } catch {
+                        throw ComposeError.invalid("volume \(vol.name) declared as external, but could not be found")
+                    }
+                    continue
+                }
                 if vol.driver == "nfs" {
                     // Materialized as --mount type=nfs at run time; no local volume create.
                     continue
@@ -1510,7 +1536,8 @@ struct ComposePlanner {
         let activeProfiles = Set(profiles).union(profileEnv())
 
         let projectVolumes = try parseProjectVolumes(root["volumes"], project: projectName, unsupported: &unsupported)
-        let projectNetworks = try parseProjectNetworks(root["networks"], project: projectName, unsupported: &unsupported)
+        let projectNetworks = try parseProjectNetworks(
+            root["networks"], project: projectName, unsupported: &unsupported, warnings: &composeWarnings)
         let configs = try parseFileArtifacts(root["configs"], kind: "configs", base: composeDir, unsupported: &unsupported)
         let secrets = try parseFileArtifacts(root["secrets"], kind: "secrets", base: composeDir, unsupported: &unsupported)
 
@@ -1968,7 +1995,9 @@ private func parseProjectVolumes(
         if driver != "local", driver != "nfs" {
             unsupported.append((nil, "volumes.\(name).driver", "only local and nfs drivers are supported"))
         }
-        let volName = (body["name"] as? String) ?? fullName
+        // An external volume exists independently of the project, so it is looked up by `name:` or its plain
+        // key, never project-prefixed (as in Docker Compose).
+        let volName = (body["name"] as? String) ?? (external ? name : fullName)
         result[name] = .init(name: volName, driver: driver, driverOpts: opts, external: external)
     }
     return result
@@ -1977,28 +2006,19 @@ private func parseProjectVolumes(
 private func parseProjectNetworks(
     _ raw: Any?,
     project: String,
-    unsupported: inout [(service: String?, key: String, reason: String)]
+    unsupported: inout [(service: String?, key: String, reason: String)],
+    warnings: inout [String]
 ) throws -> [String: ComposePlanner.ProjectNetwork] {
     guard let raw else { return [:] }
     guard let map = raw as? [String: Any] else {
         throw ComposeError.invalid("networks must be a mapping")
     }
     var result: [String: ComposePlanner.ProjectNetwork] = [:]
-    for (name, value) in map {
-        let fullName = "\(project)_\(name)"
-        if value is NSNull {
-            result[name] = .init(name: fullName, driver: nil, external: false, aliases: [])
-            continue
-        }
-        guard let body = value as? [String: Any] else {
-            throw ComposeError.invalid("networks.\(name) must be a mapping")
-        }
-        let external = (body["external"] as? Bool) ?? false
-        let netName = (body["name"] as? String) ?? fullName
-        if body["ipam"] != nil {
-            unsupported.append((nil, "networks.\(name).ipam", "ipam is not implemented"))
-        }
-        result[name] = .init(name: netName, driver: body["driver"] as? String, external: external, aliases: [])
+    for (key, value) in map {
+        let parsed = try ComposeNetworkParser.parse(key: key, value: value, project: project)
+        for item in parsed.unsupported { unsupported.append((nil, item.key, item.reason)) }
+        warnings += parsed.warnings
+        result[key] = parsed.network
     }
     return result
 }

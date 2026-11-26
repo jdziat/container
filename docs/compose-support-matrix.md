@@ -31,8 +31,8 @@ Status values match [parity-matrix.md](parity-matrix.md). This page is the Compo
 | `services` | `done` | Required |
 | `name` | `done` | Project name |
 | `version` | `done` | Accepted, ignored |
-| `networks` | `done` | Creates named networks; default project network always used |
-| `volumes` | `done` | Named volumes created on up |
+| `networks` | `done` | Created as `<project>_<key>` (or `name:`) and labeled with the project. `internal: true` -> `--internal`; `ipam.config[].subnet` -> `--subnet` / `--subnet-v6` (one of each; `gateway`, `ip_range`, `aux_addresses` and non-default IPAM drivers are rejected); `labels` and `driver_opts` are passed through. Only the `bridge` driver exists. **`external: true`** networks are never created or removed, are looked up by `name:` or their plain key (not project-prefixed), and `up` fails with `network X declared as external, but could not be found` if absent. `down` removes only networks carrying this project's label, so a network an older plugin made without one is left in place (delete it with `container network delete`) |
+| `volumes` | `done` | Named volumes created on up (labeled with the project). **`external: true`** volumes are never created or removed, are looked up by `name:` or their plain key (not project-prefixed), and `up` fails with `volume X declared as external, but could not be found` if absent |
 | `configs` | `done` | File-based only |
 | `secrets` | `done` | File-based only |
 | `x-*` | `done` | Ignored by design |
