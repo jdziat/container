@@ -346,4 +346,57 @@ struct ComposeVerbsTests {
         #expect(run.workdir == "/srv")
         #expect(run.command == ["sleep", "9"])
     }
+
+    // MARK: run dependencies
+
+    private func depRows(_ pairs: [(String, String)]) -> [ComposePSRow] {
+        pairs.map { ComposePSRow(name: $0.0, id: $0.0, service: $0.0, image: "i", state: $0.1, oneOff: false) }
+    }
+
+    @Test func runCreatesMissingStartsStoppedAndLeavesRunningDependenciesAlone() throws {
+        let p = try plan(
+            """
+            services:
+              a: {image: x}
+              b: {image: x}
+              c: {image: x}
+              main:
+                image: x
+                depends_on: [a, b, c]
+            """)
+        let deps = try p.dependencies(of: "main").services
+        let todo = ComposeRunDependencies.decide(dependencies: deps, rows: depRows([("b", "exited"), ("c", "running")]))
+        #expect(todo.create == ["a"])
+        #expect(todo.start == ["b"])
+        #expect(todo.running == ["c"])
+    }
+
+    @Test func runWithNothingExistingCreatesEverything() throws {
+        let p = try plan(runYaml)
+        let todo = ComposeRunDependencies.decide(dependencies: try p.dependencies(of: "api").services, rows: [])
+        #expect(todo == ComposeRunDependencies(create: ["db"]))
+    }
+
+    @Test func runIgnoresAnotherProjectsContainerOfTheSameName() throws {
+        // rows are already scoped to this project by ComposePS.rows, so a foreign `db` never appears here.
+        let todo = ComposeRunDependencies.decide(dependencies: try plan(runYaml).dependencies(of: "api").services, rows: depRows([("other", "running")]))
+        #expect(todo.create == ["db"] && todo.start.isEmpty && todo.running.isEmpty)
+    }
+
+    @Test func runWithSomeReplicasPresentStartsThemRatherThanCreatingOverThem() throws {
+        let p = try plan(
+            """
+            services:
+              w:
+                image: x
+                deploy: {replicas: 2}
+              main:
+                image: x
+                depends_on: [w]
+            """)
+        let todo = ComposeRunDependencies.decide(dependencies: try p.dependencies(of: "main").services, rows: depRows([("w-1", "exited")]))
+        // Creating `w` would collide with the existing w-1, so the present replica is started and none created.
+        #expect(todo.create.isEmpty)
+        #expect(todo.start == ["w-1"])
+    }
 }

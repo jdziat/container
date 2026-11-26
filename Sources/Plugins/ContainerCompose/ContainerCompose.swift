@@ -1485,7 +1485,13 @@ struct ComposePlanner {
             try ensureVolumes()
             if withDependencies {
                 let deps = try dependencies(of: service)
-                if !deps.services.isEmpty { try await deps.up(detach: true) }
+                if !deps.services.isEmpty {
+                    let rows = try ComposePS.rows(
+                        listJSON: runContainer(["list", "-a", "--format", "json"]), project: project)
+                    let todo = ComposeRunDependencies.decide(dependencies: deps.services, rows: rows)
+                    if !todo.start.isEmpty { try runContainerStreaming(["start"] + todo.start) }
+                    if !todo.create.isEmpty { try await deps.selecting(todo.create, withDependencies: false).up(detach: true) }
+                }
             }
             if oneOff.build != nil { try build(only: [oneOff.name]) }
             oneOff.containerName = overrides.name ?? "\(project)_\(oneOff.name)_run_\(UUID().uuidString.lowercased())"

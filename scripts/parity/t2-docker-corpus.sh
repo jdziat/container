@@ -395,7 +395,7 @@ logs="$(vc logs)"
 # run: one-off, deps started, ports NOT published, hidden from `ps`, labelled.
 vc stop -t 1 >/dev/null
 runout="$(vc run -e ONE=off "${VAPI}" sh -c 'echo ran-$ONE')"
-[[ "${runout}" == *"ran-off"* ]] && pass "compose run executes a one-off command with -e" || fail "compose run: ${runout:0:160}"
+[[ "${runout}" == *"ran-off"* ]] && pass "compose run executes a one-off command with -e" || fail "compose run: ${runout:0:600}"
 [[ "$(vc ps | grep -c "${VDB}")" -ge 1 ]] && pass "compose run starts the service's dependencies" || fail "compose run did not start ${VDB}"
 vc run -d "${VAPI}" sleep 60 >/dev/null; sleep 2
 oneoff="$("${CONTAINER_BIN}" ps -a --filter "label=com.docker.compose.oneoff=True" --filter "label=com.docker.compose.project=${VP}" --format '{{.Names}}' 2>/dev/null | grep -v '^Warning' | head -1)"

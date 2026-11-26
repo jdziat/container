@@ -384,3 +384,32 @@ enum ComposeDryRun {
         "[dry-run] container " + args.map { $0.contains(" ") ? "'\($0)'" : $0 }.joined(separator: " ")
     }
 }
+
+// MARK: - run dependencies
+
+/// What `compose run` must do about each dependency, given the project's containers right now. Docker reuses a
+/// dependency that exists (starting it when stopped) and only creates what is missing; creating one whose
+/// name is taken fails with a name conflict.
+struct ComposeRunDependencies: Equatable {
+    var create: [String] = []  // services with no container yet
+    var start: [String] = []  // existing containers that are not running
+    var running: [String] = []  // already up, left alone
+
+    static func decide(dependencies: [ComposePlanner.Service], rows: [ComposePSRow]) -> ComposeRunDependencies {
+        let state = Dictionary(rows.map { ($0.name, $0.state) }, uniquingKeysWith: { first, _ in first })
+        var result = ComposeRunDependencies()
+        for service in dependencies {
+            let names = ComposePlanner.Plan.plannedContainerNames(service)
+            let missing = names.filter { state[$0] == nil }
+            if missing.count == names.count {
+                result.create.append(service.name)
+            } else {
+                // Every planned name exists (a partial set is treated the same: start what is there).
+                for name in names where state[name] != nil {
+                    if state[name] == "running" { result.running.append(name) } else { result.start.append(name) }
+                }
+            }
+        }
+        return result
+    }
+}
