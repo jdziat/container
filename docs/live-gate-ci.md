@@ -5,6 +5,18 @@ virtualization). It runs from `.github/workflows/common.yml` on a self-hosted ru
 `static-parity.yml` workflow is separate and is **not** evidence that behavior works; it only
 checks build, unit tests, that every command's `--help` parses, and compose doc drift.
 
+## Status
+
+The live gate has passed once in CI ([run 45771976687](https://github.com/jdziat/container/actions/runs/45771976687), commit `30ff94c`). `LIVE_GATE_ENABLED` is currently `false` and no runner is registered, so pushes do not queue a job that waits forever. Re-enable it only when a runner is up.
+
+## Use a dedicated macOS user for the runner
+
+Do not run the runner under the account you use interactively. `container` registers launchd services
+under fixed labels (`com.apple.container.*`) in the current user's domain, so two container systems
+in one user collide: the gate runs `container system stop`, which tears down the other one. A
+separate macOS user has its own launchd domain, and that is what made the first green run possible.
+It needs a real login session (log in once with Fast User Switching), not just `su`.
+
 ## Enable it on a fork
 
 1. Register a self-hosted runner on the repository: **macOS 26, Apple silicon**, with Xcode 26.4+

@@ -120,7 +120,11 @@ The scripts under `scripts/parity/` check the claims above against a running sys
 
 ## Keeping this page honest
 
-- **What CI covers today.** `.github/workflows/static-parity.yml` runs on a GitHub-hosted `macos-26` runner (build, 1140 unit tests, a walk of every command's `--help`, compose matrix drift) and was green on PR #3. That catches compile breaks, argument-definition bugs and doc drift. It does **not** boot VMs, so it is not evidence that any `done` row *behaves* as claimed. The live gate (`make parity-behavioral`, wired into `common.yml`) has passed locally on an isolated app root but has **not run in CI**: `common.yml`'s build jobs are gated to `apple/container` and need a self-hosted macOS 26 runner.
+- **What CI covers today.** Two things, with different weight:
+  - `.github/workflows/static-parity.yml` (GitHub-hosted `macos-26`): build, 1146+ unit tests, a walk of every command's `--help`, compose matrix drift. It does **not** boot VMs, so it is not evidence that any `done` row *behaves* as claimed.
+  - The **live gate**, `make parity-behavioral` (wired into `common.yml`), ran once in CI on a self-hosted macOS 26 Apple-silicon runner, on commit `30ff94c`: [run 45771976687](https://github.com/jdziat/container/actions/runs/45771976687). Result: docker corpus **60/60**, bridge streams, hostconfig and lifecycle all OK, cli-surface and matrix drift OK. That run used a **dedicated macOS user** (its own launchd domain) and `LIVE_GATE_ONLY=true`, which skips upstream's integration suite. It is a single run on one machine, not a standing guarantee: the runner is ephemeral and none is registered now. See [live-gate-ci.md](live-gate-ci.md).
+  - The `Build and test the project` job passed in that run; the run's overall status was "failure" only because `Upload artifact for GitHub Pages` fails on this fork (Pages is not enabled), which is unrelated to the gate.
+  - Known gap in that run: the preferred NFS-capable kernel install failed on the runner (`CONTAINERIZATION_ROOT` has no `kernel/`) and fell back to the Kata kernel, so NFS-mount behavior was not exercised.
 - **Static checks are not evidence.** `scripts/parity/{f3,f4,f5,c3,l1,l2,l3,l4}*.sh` and their `make` targets only `grep` source or docs for symbols and comments. They pass when the build is broken. Do not cite them as proof a row is `done`; only `make parity-behavioral` and the unit tests are evidence.
 
 - A row moves to `done` only when the command ships and is covered by a test or harness step.
