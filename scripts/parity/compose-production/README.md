@@ -24,9 +24,9 @@ Automated via corpus fixtures `08-wordpress`, `09-nextcloud`, `10-immich`
 
 ```bash
 export CONTAINER_CLI="$(pwd)/bin/container"
-bin/container compose up -f scripts/parity/compose-production/wordpress-mariadb-redis.yaml -p prod-wordpress
+bin/container compose -f scripts/parity/compose-production/wordpress-mariadb-redis.yaml -p prod-wordpress up
 # browse http://127.0.0.1:18080/
-bin/container compose down -f scripts/parity/compose-production/wordpress-mariadb-redis.yaml -p prod-wordpress
+bin/container compose -f scripts/parity/compose-production/wordpress-mariadb-redis.yaml -p prod-wordpress down
 ```
 
 Run Nextcloud **after** tearing down WordPress (global `redis`/`postgres` alias uniqueness).

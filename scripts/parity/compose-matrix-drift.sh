@@ -79,12 +79,22 @@ for v in sorted(doc_verbs - code_verbs - {"up"}):
 
 # Harness lint: `-f FILE` is a GLOBAL option and must come before the subcommand
 # (`compose -f x.yml up`). `compose up -f x.yml` is rejected, and once silently broke the T3 corpus.
+# `-p` is the project only before the subcommand; after `run` it means --publish.
 import glob
-misplaced = re.compile(r"compose (?:config|up|ps|down|logs|exec|run|build|pull|stop|start|restart|rm|kill|pause|unpause|top|port|create) -f\s+(?:\"[^\"]*\"|\S+\.ya?ml)\s+-p\b")
+verbs = "config|up|ps|down|logs|exec|run|build|pull|stop|start|restart|rm|kill|pause|unpause|top|port|create|doctor|ls|cp|wait|push|export"
+after_f = re.compile(r"compose (?:%s) [^|;&#]*?(?<![\w-])-f[ =]" % verbs)
+after_p = re.compile(r"compose (?:%s) [^|;&#]*?(?<![\w-])-p[ =]" % [v for v in [verbs.replace("|run", "")]][0])
 for script in sorted(glob.glob(f"{root}/scripts/parity/*.sh")):
+    if script.endswith("compose-matrix-drift.sh"):
+        continue
     for number, line in enumerate(open(script).read().splitlines(), 1):
-        if misplaced.search(line):
+        if line.lstrip().startswith("#"):
+            continue
+        # `logs -f` (follow) and `rm -f` (force) are legitimate; only a compose FILE argument is wrong.
+        if after_f.search(line) and not re.search(r"compose (?:logs|rm) ", line):
             problems.append(f"{script.replace(root + '/', '')}:{number} passes -f after the subcommand; use `compose -f FILE -p NAME <subcommand>`")
+        if after_p.search(line):
+            problems.append(f"{script.replace(root + '/', '')}:{number} passes -p after the subcommand; use `compose -f FILE -p NAME <subcommand>`")
 
 if problems:
     print("\n".join("FAIL: " + p for p in problems)); sys.exit(1)

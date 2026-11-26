@@ -52,7 +52,7 @@ grep -q 'Recipe B' "${ROOT}/Sources/Plugins/ContainerCompose/ContainerCompose.sw
   || fail "compose doctor must mention Recipe B for docker-sock"
 
 if [[ -x "${CONTAINER_BIN}" ]]; then
-  out="$("${CONTAINER_BIN}" compose doctor -f "${FIX}" -p l4-sock 2>&1)" || true
+  out="$("${CONTAINER_BIN}" compose -f "${FIX}" -p l4-sock doctor 2>&1)" || true
   printf '%s\n' "${out}" | grep -Fq "[docker-sock]" || fail "doctor missing [docker-sock]"
   printf '%s\n' "${out}" | grep -Fq "Recipe B" \
     || fail "live doctor lacks Recipe B (rebuild/install compose plugin: make container)"

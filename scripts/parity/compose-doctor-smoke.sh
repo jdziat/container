@@ -23,7 +23,7 @@ FIX="${ROOT}/scripts/parity/compose-doctor/loud-edges.yaml"
 fail() { printf 'compose-doctor-smoke FAIL: %s\n' "$*" >&2; exit 1; }
 [[ -x "${CONTAINER_BIN}" ]] || fail "missing ${CONTAINER_BIN} (build with make container)"
 
-out="$("${CONTAINER_BIN}" compose doctor -f "${FIX}" -p doctor-smoke 2>&1)" || true
+out="$("${CONTAINER_BIN}" compose -f "${FIX}" -p doctor-smoke doctor 2>&1)" || true
 printf '%s\n' "${out}"
 
 # Require the full loud-edge set in one pass (not partial success).
@@ -37,7 +37,7 @@ printf '%s\n' "${out}" | grep -Eq '\[(alias-clash-in-file|vm-lifecycle)\]' || mi
 
 # --strict must exit non-zero when warn findings exist (nfs-kernel / docker-sock),
 # and still emit the named-volume code (INFO for shared virtiofs plane).
-strict_out="$("${CONTAINER_BIN}" compose doctor -f "${FIX}" -p doctor-smoke --strict 2>&1)" && fail "expected --strict to fail on warn findings"
+strict_out="$("${CONTAINER_BIN}" compose -f "${FIX}" -p doctor-smoke doctor --strict 2>&1)" && fail "expected --strict to fail on warn findings"
 printf '%s\n' "${strict_out}" | grep -Fq "[named-volume-single-writer]" || fail "--strict failed without named-volume-single-writer diagnostic"
 printf '%s\n' "${out}" | grep -Eq 'INFO \[named-volume-single-writer\]' \
   || fail "named-volume-single-writer should be INFO (shared virtiofs plane)"

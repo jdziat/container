@@ -26,7 +26,7 @@ struct ContainerCompose: AsyncParsableCommand {
         subcommands: [
             Up.self, Down.self, Config.self, Doctor.self, Ps.self, Logs.self, Exec.self, Run.self, Build.self,
             Pull.self, Images.self, Stop.self, Start.self, Restart.self, Rm.self, Kill.self, Pause.self, Unpause.self,
-            Top.self, Port.self, Create.self,
+            Top.self, Port.self, Create.self, Ls.self, Cp.self, Version.self, Wait.self, Push.self, Export.self,
         ],
         defaultSubcommand: Up.self
     )
@@ -71,6 +71,9 @@ struct ContainerCompose: AsyncParsableCommand {
                 }
                 hoisted.append("\(target)=\(args[index + 1])")
                 index += 2
+            } else if token == "--dry-run" {
+                ComposeDryRun.enabled = true
+                index += 1
             } else if token.count > 2, !token.hasPrefix("--"), let target = valued[String(token.prefix(2))] {
                 // Attached short form: `-fFILE`, `-pNAME` (Docker accepts these).
                 hoisted.append("\(target)=\(token.dropFirst(2))")
@@ -97,7 +100,9 @@ extension ContainerCompose {
         @Option(name: .customLong("project-directory"), help: "Base directory for relative paths (default: first file's directory)")
         var projectDirectory: String?
 
-        @Option(name: .shortAndLong, help: "Project name (default: directory name)")
+        // Long-only: `-p` before the subcommand is the project (hoisted to --project=), but after one it is
+        // `run --publish`, as in Docker.
+        @Option(name: [.customLong("project"), .customLong("project-name")], help: "Project name (default: directory name)")
         var project: String?
 
         @Option(name: .long, help: "Activate profile (repeatable)")
@@ -173,10 +178,20 @@ extension ContainerCompose {
         @Flag(name: .long, help: "Remove containers for services not defined in the compose file")
         var removeOrphans = false
 
+        @Option(name: .long, help: "Remove images used by services: 'local' (built by compose) or 'all'")
+        var rmi: String?
+
         func run() async throws {
             let plan = try ContainerCompose.loadPlan(shared)
+            // Validate before tearing anything down: a typo must not leave a half-done `down`.
+            let images = try rmi.map { try plan.imagesToRemove(policy: $0) } ?? []
             try await plan.down(minimumStopTimeout: timeout)
             if volumes { try plan.removeProjectVolumes() }
+            for image in images {
+                do { _ = try runContainer(["image", "delete", image]) } catch {
+                    FileHandle.standardError.write(Data("compose down: could not remove image \(image): \(error)\n".utf8))
+                }
+            }
         }
     }
 
@@ -185,10 +200,33 @@ extension ContainerCompose {
 
         @OptionGroup var shared: SharedOptions
 
+        @Flag(name: .long, help: "Print the service names, one per line")
+        var services = false
+
+        @Flag(name: .long, help: "Print the volume names, one per line")
+        var volumes = false
+
+        @Flag(name: .shortAndLong, help: "Only validate the configuration, do not print anything")
+        var quiet = false
+
+        @Option(name: .long, help: "Output format: text (default) or json")
+        var format = "text"
+
         func run() async throws {
             let plan = try ContainerCompose.loadPlan(shared)
             try plan.reportUnsupported()
-            print(try plan.summary())
+            if quiet { return }
+            if services {
+                for name in plan.services.map(\.name).sorted() { print(name) }
+            } else if volumes {
+                for name in plan.volumes.keys.sorted() { print(name) }
+            } else if format == "json" {
+                print(try plan.summaryJSON())
+            } else if format == "text" {
+                print(try plan.summary())
+            } else {
+                throw ComposeError.invalid("--format must be text or json, got '\(format)'")
+            }
         }
     }
 
@@ -231,24 +269,173 @@ extension ContainerCompose {
         @Flag(name: .shortAndLong, help: "Only display container names")
         var quiet = false
 
+        @Flag(name: [.customShort("a"), .customLong("all")], help: "Show stopped containers and one-off runs too")
+        var all = false
+
+        @Flag(name: .long, help: "Display only the service names")
+        var services = false
+
+        @Option(name: .long, help: "Only containers in this state (repeatable): running, exited, paused, ...")
+        var status: [String] = []
+
+        @Option(name: .long, help: "Output format: table (default) or json")
+        var format = "table"
+
+        @Argument(help: "Only these services (default: all)")
+        var only: [String] = []
+
         func run() async throws {
             let plan = try ContainerCompose.loadPlan(shared)
-            let ids = try plan.projectContainerIDs()
+            for name in only where !plan.services.contains(where: { $0.name == name }) {
+                throw ComposeError.invalid("no such service: \(name)")
+            }
+            var rows = try ComposePS.filter(
+                ComposePS.rows(listJSON: runContainer(["list", "-a", "--format", "json"]), project: plan.project),
+                all: all, statuses: status)
+            if !only.isEmpty { rows = rows.filter { only.contains($0.service) } }
             if quiet {
-                for id in ids.sorted() { print(id) }
-                return
+                for row in rows { print(row.name) }
+            } else if services {
+                for name in Set(rows.map(\.service)).sorted() { print(name) }
+            } else if format == "json" {
+                print(try ComposePS.json(rows))
+            } else if format == "table" {
+                print(ComposePS.table(rows))
+            } else {
+                throw ComposeError.invalid("--format must be table or json, got '\(format)'")
             }
-            print("NAME\tIMAGE\tSTATUS")
-            if ids.isEmpty { return }
-            for id in ids.sorted() {
-                do {
-                    let row = try inspectRow(id)
-                    print("\(row.name)\t\(row.image)\t\(row.status)")
-                } catch {
-                    FileHandle.standardError.write(Data("compose ps: inspect \(id) failed: \(error)\n".utf8))
-                    print("\(id)\t?\t?")
-                }
+        }
+    }
+
+    /// Projects that have containers on this system, from the labels compose put on them.
+    struct Ls: AsyncParsableCommand {
+        static let configuration = CommandConfiguration(abstract: "List compose projects")
+
+        // Docker accepts the global -f/-p before any verb, including this one; they have no effect here.
+        @OptionGroup var shared: SharedOptions
+
+        @Flag(name: [.customShort("a"), .customLong("all")], help: "Include projects with nothing running")
+        var all = false
+
+        @Flag(name: .shortAndLong, help: "Only display project names")
+        var quiet = false
+
+        @Option(name: .long, help: "Output format: table (default) or json")
+        var format = "table"
+
+        func run() async throws {
+            let rows = try ComposeProjects.summaries(
+                listJSON: runContainer(["list", "-a", "--format", "json"]), all: all)
+            if quiet {
+                for row in rows { print(row.name) }
+            } else if format == "json" {
+                let encoder = JSONEncoder()
+                encoder.outputFormatting = [.sortedKeys, .withoutEscapingSlashes]
+                print(String(decoding: try encoder.encode(rows), as: UTF8.self))
+            } else if format == "table" {
+                print(ComposeProjects.table(rows))
+            } else {
+                throw ComposeError.invalid("--format must be table or json, got '\(format)'")
             }
+        }
+    }
+
+    struct Cp: AsyncParsableCommand {
+        static let configuration = CommandConfiguration(abstract: "Copy files between a service container and the local filesystem")
+
+        @OptionGroup var shared: SharedOptions
+
+        @Option(name: .long, help: "Which replica of the service (1-based)")
+        var index = 1
+
+        @Argument(help: "SERVICE:PATH or a local path")
+        var source: String
+
+        @Argument(help: "SERVICE:PATH or a local path")
+        var destination: String
+
+        func run() async throws {
+            let plan = try ContainerCompose.loadPlan(shared)
+            let owned = try plan.projectContainerNames()
+            let (from, to) = try plan.copyArguments(source: source, destination: destination, index: index, owned: owned)
+            try runContainerStreaming(["copy", from, to])
+        }
+    }
+
+    struct Version: ParsableCommand {
+        static let configuration = CommandConfiguration(abstract: "Show the compose plugin and container versions")
+
+        // Docker accepts the global -f/-p before any verb, including this one; they have no effect here.
+        @OptionGroup var shared: SharedOptions
+
+        @Flag(name: [.customShort("s"), .customLong("short")], help: "Print only the version number")
+        var short = false
+
+        func run() throws {
+            let version = (try? runContainer(["--version"]).trimmingCharacters(in: .whitespacesAndNewlines)) ?? "unknown"
+            print(short ? version : "container compose (\(version))")
+        }
+    }
+
+    struct Wait: AsyncParsableCommand {
+        static let configuration = CommandConfiguration(abstract: "Block until the services' containers stop")
+
+        @OptionGroup var shared: SharedOptions
+
+        @Argument(help: "Services to wait for (default: all)")
+        var services: [String] = []
+
+        func run() async throws {
+            let plan = try ContainerCompose.loadPlan(shared)
+            let owned = try plan.projectContainerNames()
+            let names = try plan.selecting(services, withDependencies: false).services
+                .flatMap { ComposePlanner.Plan.plannedContainerNames($0) }.filter { owned.contains($0) }
+            guard !names.isEmpty else { throw ComposeError.invalid("compose wait: no containers to wait for (is the project up?)") }
+            try runContainerStreaming(["wait"] + names)
+        }
+    }
+
+    struct Push: AsyncParsableCommand {
+        static let configuration = CommandConfiguration(abstract: "Push service images")
+
+        @OptionGroup var shared: SharedOptions
+
+        @Argument(help: "Services to push (default: all)")
+        var services: [String] = []
+
+        func run() async throws {
+            let plan = try ContainerCompose.loadPlan(shared)
+            let selected = try plan.selecting(services, withDependencies: false).services
+            // An image compose tags only locally has nowhere to go; say so rather than let the registry
+            // error be the explanation.
+            if let local = selected.first(where: plan.isAutoBuiltImage) {
+                throw ComposeError.invalid(
+                    "service \(local.name) builds to the local tag \(local.image); set `image:` to a registry name to push it")
+            }
+            for service in selected { try runContainerStreaming(["image", "push", service.image]) }
+        }
+    }
+
+    struct Export: AsyncParsableCommand {
+        static let configuration = CommandConfiguration(abstract: "Export a service container's filesystem as a tar archive")
+
+        @OptionGroup var shared: SharedOptions
+
+        @Option(name: .long, help: "Which replica of the service (1-based)")
+        var index = 1
+
+        @Option(name: .shortAndLong, help: "Write to this file instead of stdout")
+        var output: String?
+
+        @Argument(help: "Service name")
+        var service: String
+
+        func run() async throws {
+            let plan = try ContainerCompose.loadPlan(shared)
+            let name = try plan.replicaName(service: service, index: index, owned: plan.projectContainerNames())
+            var args = ["export"]
+            if let output { args += ["--output", output] }
+            try runContainerStreaming(args + [name])
         }
     }
 
@@ -257,8 +444,8 @@ extension ContainerCompose {
 
         @OptionGroup var shared: SharedOptions
 
-        @Argument(help: "Service name")
-        var service: String
+        @Argument(help: "Services (default: all)")
+        var services: [String] = []
 
         @Flag(name: .shortAndLong, help: "Follow log output")
         var follow = false
@@ -266,14 +453,36 @@ extension ContainerCompose {
         @Option(name: .long, help: "Number of lines to show from the end of the logs")
         var tail: Int?
 
+        @Flag(name: .long, help: "Do not prefix lines with the container name")
+        var noLogPrefix = false
+
         func run() async throws {
             let plan = try ContainerCompose.loadPlan(shared)
-            let name = try plan.containerName(for: service)
-            var args = ["logs"]
-            if follow { args.append("--follow") }
-            if let tail { args += ["-n", "\(tail)"] }
-            args.append(name)
-            try runContainerStreaming(args)
+            let owned = try plan.projectContainerNames()
+            let names = try ComposeLogs.targets(plan: plan, services: services, owned: owned)
+            guard !names.isEmpty else { throw ComposeError.invalid("compose logs: no containers to read (is the project up?)") }
+            func args(_ name: String) -> [String] {
+                var args = ["logs"]
+                if follow { args.append("--follow") }
+                if let tail { args += ["-n", "\(tail)"] }
+                return args + [name]
+            }
+            // One container: stream it straight through, no prefix machinery to get wrong.
+            if names.count == 1 && noLogPrefix {
+                try runContainerStreaming(args(names[0]))
+                return
+            }
+            let width = names.map(\.count).max() ?? 0
+            try await withThrowingTaskGroup(of: Void.self) { group in
+                for name in names {
+                    group.addTask {
+                        try ComposeLogStreamer.stream(args: args(name)) { line in
+                            ComposeLogs.prefix(line, name: name, width: width, enabled: !noLogPrefix)
+                        }
+                    }
+                }
+                try await group.waitForAll()
+            }
         }
     }
 
@@ -281,6 +490,24 @@ extension ContainerCompose {
         static let configuration = CommandConfiguration(abstract: "Execute a command in a running service")
 
         @OptionGroup var shared: SharedOptions
+
+        @Flag(name: [.customShort("d"), .customLong("detach")], help: "Run the command in the background")
+        var detach = false
+
+        @Option(name: [.customShort("e"), .customLong("env")], help: "Set environment variables (repeatable)")
+        var env: [String] = []
+
+        @Option(name: [.customShort("u"), .customLong("user")], help: "Run as this user")
+        var user: String?
+
+        @Option(name: [.customShort("w"), .customLong("workdir")], help: "Working directory inside the container")
+        var workdir: String?
+
+        @Option(name: .long, help: "Which replica of the service (1-based)")
+        var index = 1
+
+        @Flag(name: [.customShort("T"), .customLong("no-tty")], help: "Disable pseudo-TTY allocation")
+        var noTTY = false
 
         @Argument(help: "Service name")
         var service: String
@@ -290,11 +517,14 @@ extension ContainerCompose {
 
         func run() async throws {
             let plan = try ContainerCompose.loadPlan(shared)
-            let name = try plan.containerName(for: service)
             guard !command.isEmpty else {
                 throw ComposeError.invalid("compose exec requires a command")
             }
-            try runContainerStreaming(["exec", name] + command)
+            let name = try plan.replicaName(service: service, index: index, owned: plan.projectContainerNames())
+            try runContainerStreaming(
+                ComposeExec.arguments(
+                    container: name, command: command, detach: detach, env: env, user: user, workdir: workdir,
+                    tty: !noTTY && isatty(0) == 1 && isatty(1) == 1))
         }
     }
 
@@ -306,6 +536,39 @@ extension ContainerCompose {
         @Flag(name: .long, help: "Remove the one-off container after it exits (always on for compose run)")
         var rm = false
 
+        @Flag(name: [.customShort("d"), .customLong("detach")], help: "Run the container in the background and print its name")
+        var detach = false
+
+        @Flag(name: .long, help: "Do not start the services this one depends on")
+        var noDeps = false
+
+        @Flag(name: .long, help: "Publish the service's ports (off by default for run)")
+        var servicePorts = false
+
+        @Option(name: [.customShort("e"), .customLong("env")], help: "Set environment variables (repeatable)")
+        var env: [String] = []
+
+        @Option(name: [.customShort("u"), .customLong("user")], help: "Run as this user")
+        var user: String?
+
+        @Option(name: [.customShort("w"), .customLong("workdir")], help: "Working directory inside the container")
+        var workdir: String?
+
+        @Option(name: .long, help: "Override the image entrypoint")
+        var entrypoint: String?
+
+        @Option(name: [.customShort("p"), .customLong("publish")], help: "Publish a port (repeatable)")
+        var publish: [String] = []
+
+        @Option(name: .long, help: "Name for the container")
+        var name: String?
+
+        @Option(name: [.customShort("l"), .customLong("label")], help: "Add or override a label (repeatable)")
+        var label: [String] = []
+
+        @Flag(name: [.customShort("T"), .customLong("no-tty")], help: "Accepted for compatibility; run never allocates a TTY here")
+        var noTTY = false
+
         @Argument(help: "Service name")
         var service: String
 
@@ -315,7 +578,12 @@ extension ContainerCompose {
         func run() async throws {
             let plan = try ContainerCompose.loadPlan(shared)
             try plan.reportUnsupported()
-            try await plan.runOneOff(service: service, command: command)
+            try await plan.runOneOff(
+                service: service, command: command,
+                overrides: RunOverrides(
+                    environment: env, user: user, workdir: workdir, entrypoint: entrypoint, publish: publish,
+                    servicePorts: servicePorts, name: name, labels: label),
+                withDependencies: !noDeps, detach: detach)
         }
     }
 
@@ -578,10 +846,10 @@ enum ComposeScope {
     static let projectLabel = "com.docker.compose.project"
     static let serviceLabel = "com.docker.compose.service"
 
-    private static func rows(_ json: String) throws -> [[String: Any]] {
+    static func rows(_ json: String) throws -> [[String: Any]] {
         guard let data = json.data(using: .utf8),
-            let rows = try JSONSerialization.jsonObject(with: data) as? [[String: Any]]
-        else { throw ComposeError.commandFailed("list returned unparseable JSON") }
+            let rows = (try? JSONSerialization.jsonObject(with: data)) as? [[String: Any]]
+        else { throw ComposeError.commandFailed("container list returned unparseable JSON") }
         return rows
     }
 
@@ -1130,6 +1398,7 @@ struct ComposePlanner {
         /// healthcheck. A container that already exited with status 0 counts as done (a one-shot
         /// service); a non-zero exit or an unhealthy container is an error.
         func waitForServices(timeoutSeconds: Int) async throws {
+            if ComposeDryRun.enabled { return }  // nothing was started, so there is nothing to wait for
             let deadline = Date().addingTimeInterval(TimeInterval(timeoutSeconds))
             for service in services {
                 for name in Self.plannedContainerNames(service) {
@@ -1207,19 +1476,25 @@ struct ComposePlanner {
             }
         }
 
-        func runOneOff(service: String, command: [String]) async throws {
-            guard let svc = services.first(where: { $0.name == service }) else {
-                throw ComposeError.invalid("unknown service \(service)")
-            }
+        func runOneOff(
+            service: String, command: [String], overrides: RunOverrides = RunOverrides(), withDependencies: Bool = true,
+            detach: Bool = false
+        ) async throws {
+            var oneOff = try oneOffService(service, overrides: overrides, hostEnvironment: ProcessInfo.processInfo.environment)
             try ensureNetworks()
             try ensureVolumes()
-            if svc.build != nil {
-                try build(only: [svc.name])
+            if withDependencies {
+                let deps = try dependencies(of: service)
+                if !deps.services.isEmpty { try await deps.up(detach: true) }
             }
-            var oneOff = svc
-            oneOff.containerName = "\(project)_\(svc.name)_run_\(UUID().uuidString.lowercased())"
-            try runContainerStreaming(
-                runArgs(for: oneOff, detach: false, commandOverride: command.isEmpty ? nil : command, oneOff: true))
+            if oneOff.build != nil { try build(only: [oneOff.name]) }
+            oneOff.containerName = overrides.name ?? "\(project)_\(oneOff.name)_run_\(UUID().uuidString.lowercased())"
+            let args = try runArgs(for: oneOff, detach: detach, commandOverride: command.isEmpty ? nil : command, oneOff: true)
+            if detach {
+                print(try runContainer(args).trimmingCharacters(in: .whitespacesAndNewlines))
+            } else {
+                try runContainerStreaming(args)
+            }
         }
 
         func down(minimumStopTimeout: Int? = nil) async throws {
@@ -1460,6 +1735,7 @@ struct ComposePlanner {
             labels["com.docker.compose.project"] = project
             labels["com.docker.compose.service"] = service.name
             labels["com.docker.compose.container-number"] = "\(containerNumber)"
+            if oneOff { labels[ComposePS.oneOffLabel] = "True" }
             if let domain = service.domainname {
                 labels["com.docker.compose.domainname"] = domain
             }
@@ -2841,6 +3117,7 @@ extension ComposePlanner {
 // MARK: - Runtime helpers
 
 func waitUntilHealthy(_ containerId: String, timeoutSeconds: UInt64 = 300) async throws {
+    if ComposeDryRun.enabled { return }
     let deadline = Date().addingTimeInterval(TimeInterval(timeoutSeconds))
     while Date() < deadline {
         try Task.checkCancellation()
@@ -2857,6 +3134,7 @@ func waitUntilHealthy(_ containerId: String, timeoutSeconds: UInt64 = 300) async
 }
 
 func waitUntilExitedZero(_ containerId: String, timeoutSeconds: UInt64 = 300) async throws {
+    if ComposeDryRun.enabled { return }
     let deadline = Date().addingTimeInterval(TimeInterval(timeoutSeconds))
     while Date() < deadline {
         try Task.checkCancellation()
@@ -2982,6 +3260,10 @@ func splitImageRepositoryTag(_ image: String) -> (repository: String, tag: Strin
 
 /// Run `container` with inherited stdio (logs / exec / interactive run).
 func runContainerStreaming(_ args: [String]) throws {
+    if ComposeDryRun.enabled && ComposeDryRun.isMutating(args) {
+        print(ComposeDryRun.describe(args))
+        return
+    }
     let process = Process()
     process.executableURL = URL(fileURLWithPath: "/usr/bin/env")
     let exe = ContainerCLI.current
@@ -2998,6 +3280,10 @@ func runContainerStreaming(_ args: [String]) throws {
 
 @discardableResult
 func runContainer(_ args: [String]) throws -> String {
+    if ComposeDryRun.enabled && ComposeDryRun.isMutating(args) {
+        print(ComposeDryRun.describe(args))
+        return ""
+    }
     let process = Process()
     process.executableURL = URL(fileURLWithPath: "/usr/bin/env")
     let exe = ContainerCLI.current

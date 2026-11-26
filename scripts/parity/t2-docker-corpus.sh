@@ -358,6 +358,67 @@ else
 fi
 rm -rf "${SF}"
 
+# --- compose Tier C verbs: ls, ps, cp, run, exec, logs, wait, export, config, --dry-run -------------
+# Service names carry the run's suffix so containers (named after the service) cannot collide.
+VD="$(mktemp -d)"; VP="corpusverbs${SUFFIX}"; VDB="vdb${SUFFIX}"; VAPI="vapi${SUFFIX}"; VWAIT="vwait${SUFFIX}"
+printf 'services:\n  %s:\n    image: %s\n    command: ["sleep","300"]\n  %s:\n    image: %s\n    command: ["sh","-c","echo hello-%s; sleep 300"]\n    depends_on: [%s]\n    ports: ["18097:80"]\n    environment:\n      GREETING: hi\n  %s:\n    image: %s\n    command: ["sh","-c","sleep 3"]\n' \
+    "${VDB}" "${IMAGE}" "${VAPI}" "${IMAGE}" "${SUFFIX}" "${VDB}" "${VWAIT}" "${IMAGE}" >"${VD}/c.yml"
+vc() { cc -f "${VD}/c.yml" -p "${VP}" "$@"; }
+
+# --dry-run changes nothing: snapshot every container/network/volume before and after.
+snap() { for k in "ps -a" "network list" "volume list"; do "${CONTAINER_BIN}" ${k} 2>&1 | grep -v '^Warning'; done | cksum; }
+before="$(snap)"; dry="$(cc --dry-run -f "${VD}/c.yml" -p "${VP}" up -d "${VAPI}")"; after="$(snap)"
+[[ "${before}" == "${after}" && "${dry}" == *"[dry-run]"*"run"* ]] \
+    && pass "compose --dry-run prints the commands and changes nothing" || fail "--dry-run: state changed or nothing printed (${dry:0:120})"
+
+vc up -d "${VAPI}" >/dev/null; sleep 3
+[[ "$(vc ls | grep -c "^${VP} ")" == "1" && "$(cc ls | grep -c "^${VP} ")" == "1" ]] \
+    && pass "compose ls lists the running project (also with global -f/-p)" || fail "compose ls does not show ${VP} exactly once"
+out="$(vc ps)"
+[[ "${out}" == NAME* && "${out}" == *"${VDB}"* && "${out}" == *"${VAPI}"* ]] \
+    && pass "compose ps lists the project's services (dependency included)" || fail "compose ps: ${out:0:200}"
+[[ "$(vc ps --services)" == *"${VAPI}"* ]] && pass "compose ps --services" || fail "compose ps --services"
+[[ "$(vc ps --format json)" == *"\"Service\":\"${VAPI}\""* ]] && pass "compose ps --format json uses Compose field names" || fail "compose ps --format json"
+
+# cp is a real round trip: write a file in, read it back out, compare.
+printf 'roundtrip-%s' "${SUFFIX}" >"${VD}/in.txt"
+vc cp "${VD}/in.txt" "${VAPI}:/tmp/in.txt" >/dev/null && vc cp "${VAPI}:/tmp/in.txt" "${VD}/out.txt" >/dev/null
+[[ "$(cat "${VD}/out.txt" 2>/dev/null)" == "roundtrip-${SUFFIX}" ]] && pass "compose cp copies a file in and back out intact" || fail "compose cp round trip"
+
+[[ "$(vc exec -e PROBE=from-exec "${VAPI}" sh -c 'echo $PROBE')" == *"from-exec"* ]] \
+    && pass "compose exec -e sets the environment" || fail "compose exec -e"
+[[ "$(vc exec "${VAPI}" sh -c 'echo $GREETING')" == *"hi"* ]] && pass "compose exec runs in the service container" || fail "compose exec"
+logs="$(vc logs)"
+[[ "${logs}" == *"${VAPI}"*"|"*"hello-${SUFFIX}"* ]] && pass "compose logs (all services) prefixes lines with the container name" || fail "compose logs prefix: ${logs:0:160}"
+[[ "$(vc logs --no-log-prefix "${VAPI}")" == "hello-${SUFFIX}" ]] && pass "compose logs --no-log-prefix prints the bare line" || fail "compose logs --no-log-prefix"
+
+# run: one-off, deps started, ports NOT published, hidden from `ps`, labelled.
+vc stop -t 1 >/dev/null
+runout="$(vc run -e ONE=off "${VAPI}" sh -c 'echo ran-$ONE')"
+[[ "${runout}" == *"ran-off"* ]] && pass "compose run executes a one-off command with -e" || fail "compose run: ${runout:0:160}"
+[[ "$(vc ps | grep -c "${VDB}")" -ge 1 ]] && pass "compose run starts the service's dependencies" || fail "compose run did not start ${VDB}"
+vc run -d "${VAPI}" sleep 60 >/dev/null; sleep 2
+oneoff="$("${CONTAINER_BIN}" ps -a --filter "label=com.docker.compose.oneoff=True" --filter "label=com.docker.compose.project=${VP}" --format '{{.Names}}' 2>/dev/null | grep -v '^Warning' | head -1)"
+[[ -n "${oneoff}" ]] && pass "compose run labels the one-off container" || fail "no com.docker.compose.oneoff container"
+[[ "$(vc ps | grep -c '_run_')" == "0" && "$(vc ps -a | grep -c '_run_')" -ge 1 ]] \
+    && pass "compose ps hides a running one-off unless -a" || fail "compose ps one-off visibility"
+# Inspect the one-off itself: a forwarder with nothing behind it would also make a curl fail.
+oneoff_cfg="$("${CONTAINER_BIN}" inspect "${oneoff}" 2>/dev/null | grep -v '^Warning')"
+if [[ "${oneoff_cfg}" == *"${oneoff}"* && "${oneoff_cfg}" != *"18097"* ]]; then pass "compose run does not publish the service's ports"; else fail "compose run: one-off config mentions 18097 or could not be inspected"; fi
+"${CONTAINER_BIN}" delete -f "${oneoff}" >/dev/null 2>&1
+
+# wait + export + config
+vc up -d "${VWAIT}" >/dev/null; sleep 1
+vc wait "${VWAIT}" >/dev/null && pass "compose wait returns once the container stops" || fail "compose wait"
+vc export "${VWAIT}" -o "${VD}/fs.tar" >/dev/null 2>&1
+[[ -s "${VD}/fs.tar" ]] && tar -tf "${VD}/fs.tar" >/dev/null 2>&1 && pass "compose export writes a readable tar" || fail "compose export"
+[[ "$(vc ps -a --status exited | grep -c "${VWAIT}")" -ge 1 && "$(vc ps | grep -c "${VWAIT}")" == "0" ]] \
+    && pass "compose ps --status exited (Docker's word) finds the stopped container; default ps hides it" || fail "compose ps --status exited"
+[[ "$(vc config --services | sort | tr '\n' ' ')" == *"${VAPI}"*"${VDB}"* ]] && pass "compose config --services" || fail "compose config --services"
+[[ "$(vc config --format json)" == "{"* ]] && pass "compose config --format json is JSON" || fail "compose config --format json"
+[[ "$(cc version --short)" =~ [0-9] ]] && pass "compose version prints a version" || fail "compose version"
+vc down -t 1 >/dev/null; rm -rf "${VD}"
+
 # --- verbs with no equivalent must fail loudly with exit 2, naming an alternative ---------------
 for verb in "search x" "import -" "context ls" "buildx ls" "swarm init" "stack ls"; do
     # shellcheck disable=SC2086

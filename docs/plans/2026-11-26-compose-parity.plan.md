@@ -37,10 +37,10 @@ Podman pods and Quadlet; volume plugins beyond local and NFS.
 | | Several `-f` files merged in order; `compose.override.yaml` auto-loaded; default file discovery | **done** (32 tests) |
 | | `COMPOSE_FILE`, `COMPOSE_PROJECT_NAME`, `--env-file`, `--project-directory` | **done** |
 | | External networks/volumes (plain-key naming, existence check); network `ipam`, `internal`, `labels`, labeled create and label-scoped `down` | **done** (16 unit tests; live corpus checks added, **not yet run**) |
-| **C. Verbs** | `cp`, `ls`, `version`, `wait`, `push`, `export` | todo |
-| | `ps` (`-a`, `--services`, `--status`, `--format json`); `logs` for all services, `--since`, `--no-log-prefix`; `exec`/`run` flags | todo |
-| | `config` (`--services`, `--volumes`, `--format`, `-q`); `down --rmi`; global `--dry-run` | todo |
-| | `watch` | **decision pending** (see below) |
+| **C. Verbs** | `cp`, `ls`, `version`, `wait`, `push`, `export` | **implemented**; decisions unit-tested and mutation-checked, the `container` calls they make are **not yet run live** |
+| | `ps` (`-a`, `--services`, `--status`, `--format json`); `logs` for all services, `--no-log-prefix`; `exec`/`run` flags; `run` starts dependencies | **implemented** (same caveat). `logs --since/--until/--timestamps` not possible: the engine's `logs` has no such flags |
+| | `config` (`--services`, `--volumes`, `--format json`, `-q`); `down --rmi`; global `--dry-run` | **implemented**. `--dry-run` was also run end to end against the built binary: `up` and `down` printed their commands and the container, network and volume listings were byte-identical before and after. `config` still prints a summary, **not Docker's normalized YAML** |
+| | `watch` | **decided: `wontfix`** (see below) |
 | **D. Gate** | T3 corpus (`t3-compose-corpus.sh`) in `make parity-behavioral` | **wired** (01-07; production and NFS fixtures opt-in). Fixed on the way: T3 and `f2-compose-extends.sh` passed `-f` after the subcommand and were broken by the `-f` fix; a lint now fails any harness that does. **Live run pending.** |
 | | New fixtures exercising the Tier A-C keys and verbs | todo (the Tier A-C live checks live in `t2-docker-corpus.sh` for now) |
 
@@ -53,5 +53,12 @@ Podman pods and Quadlet; volume plugins beyond local and NFS.
 - **`replicas` / `scale`:** capped at 3 (existing interim limit), with a warning.
 - **Unquoted YAML booleans:** `FOO: yes` is read as `true` (Docker keeps `"yes"`). Pre-existing; documented in the matrix, not fixed.
 - **`up` without `-d`:** still detaches (documented). Foreground log-following is not planned in this pass.
-- **`watch`:** needs file-sync, rebuild and restart semantics plus a watcher. It is only worth shipping
-  if it can be verified; otherwise it stays `wontfix` with that reason recorded here.
+- **`watch`:** `wontfix`. It needs a file watcher plus sync, rebuild and restart rules, and there is no way
+  to verify those here; a half-working `watch` is worse than none. Use `up --build` on change.
+- **`compose run` ports:** the service's `ports:` are no longer published by `run` unless `--service-ports`
+  (Docker's behavior). Earlier versions published them, so a script that relied on that must add the flag.
+- **`compose exec` TTY:** allocated only when stdin and stdout are both terminals (Docker allocates by default),
+  so piped output is not corrupted.
+- **`compose logs` ordering:** several containers are read concurrently and interleave by arrival.
+- **`compose config`:** a summary, not Docker's normalized YAML. Writing a faithful normalizer is a separate piece
+  of work: the planner does not retain the merged document, so it would need to.
