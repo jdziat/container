@@ -159,7 +159,8 @@ out="$(d ps -aq --filter "name=corpus-")"
 # --- compose lifecycle: real state transitions through Docker-style global options ---------------
 LF="$(mktemp -d)"; PROJ="corpuslife${SUFFIX}"
 printf 'services:\n  svc:\n    image: %s\n    command: ["sh","-c","echo from-svc; sleep 300"]\n    ports: ["18080:80"]\n' "${IMAGE}" >"${LF}/c.yml"
-cc() { "${CONTAINER_BIN}" compose "$@" 2>&1 | grep -v '^Warning! Running debug build'; }
+# Every compose call is bounded: one `container network create` once hung for 47 minutes with no output.
+cc() { bash "$(dirname "$0")/with-timeout.sh" "${PARITY_CALL_TIMEOUT:-600}" "${CONTAINER_BIN}" compose "$@" 2>&1 | grep -v '^Warning! Running debug build'; }
 cstate() { "${CONTAINER_BIN}" ps -a --filter "label=com.docker.compose.project=${PROJ}" --format '{{.Status}}' 2>/dev/null | grep -v '^Warning' | head -1; }
 cc -f "${LF}/c.yml" -p "${PROJ}" up -d >/dev/null; sleep 3
 [[ "$(cstate)" == "running" ]] && pass "compose -f FILE -p NAME up -d (Docker-style global options)" || fail "compose up: state='$(cstate)'"

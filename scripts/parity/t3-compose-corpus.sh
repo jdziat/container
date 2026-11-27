@@ -46,8 +46,10 @@ if [[ "${PARITY_ALLOW_REAL_SYSTEM:-0}" != "1" ]]; then
   fi
 fi
 
+# Bounded, so a hung call fails with a message instead of stalling until the harness limit. Generous: an `up`
+# pulls images and waits for health checks.
 compose() {
-  "${CONTAINER_BIN}" compose "$@"
+  bash "${ROOT}/scripts/parity/with-timeout.sh" "${PARITY_CALL_TIMEOUT:-1800}" "${CONTAINER_BIN}" compose "$@"
 }
 
 project_for() {

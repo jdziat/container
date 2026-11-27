@@ -492,7 +492,7 @@ parity-behavioral: parity-cli-surface
 	@test -x "$(ROOT_DIR)/bin/container" || { echo "bin/container not installed: run 'make container' first" >&2; exit 2; }
 	@test -x "$(ROOT_DIR)/bin/docker" || { echo "bin/docker not installed: run 'make container' first" >&2; exit 2; }
 	@test -n "$(strip $(APP_ROOT))" || { echo "parity-behavioral refuses to run against the default system: set APP_ROOT to an isolated directory" >&2; exit 2; }
-	@chmod +x scripts/parity/t2-docker-corpus.sh scripts/parity/t3-compose-corpus.sh scripts/parity/t2-bridge-streams.sh scripts/parity/t2-bridge-hostconfig.sh scripts/parity/t2-bridge-lifecycle.sh
+	@chmod +x scripts/parity/with-timeout.sh scripts/parity/t2-docker-corpus.sh scripts/parity/t3-compose-corpus.sh scripts/parity/t2-bridge-streams.sh scripts/parity/t2-bridge-hostconfig.sh scripts/parity/t2-bridge-lifecycle.sh
 	@echo "Stopping any running system; parity harnesses run against an isolated root: $(APP_ROOT)"
 	@bin/container system stop || true
 	@sleep 3 && scripts/ensure-container-stopped.sh
@@ -504,7 +504,11 @@ parity-behavioral: parity-cli-surface
 		rc=0 ; \
 		for h in $(if $(strip $(PARITY_HARNESSES)),$(PARITY_HARNESSES),t2-docker-corpus t3-compose-corpus t2-bridge-streams t2-bridge-hostconfig t2-bridge-lifecycle) ; do \
 			echo "==> $$h" ; \
-			bash scripts/parity/$$h.sh || rc=1 ; \
+			lim="$${PARITY_HARNESS_TIMEOUT:-3600}" ; \
+			if [ "$$h" = t3-compose-corpus ] ; then lim="$${PARITY_T3_TIMEOUT:-14400}" ; fi ; \
+			bash scripts/parity/with-timeout.sh "$$lim" bash scripts/parity/$$h.sh ; hrc=$$? ; \
+			if [ $$hrc -ne 0 ] ; then rc=1 ; fi ; \
+			if [ $$hrc -eq 124 ] ; then echo "$$h: TIMED OUT after $${lim}s" ; fi ; \
 		done ; \
 		echo "Stopping the isolated system" ; \
 		scripts/ensure-container-stopped.sh ; \
