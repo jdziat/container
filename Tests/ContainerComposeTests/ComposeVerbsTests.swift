@@ -498,4 +498,17 @@ struct ComposeVerbsTests {
         let aliases = Set(specs.flatMap { $0.split(separator: ",").compactMap { $0.hasPrefix("alias=") ? String($0.dropFirst(6)) : nil } })
         #expect(aliases.contains("api"), "service-name alias missing: \(aliases)")
     }
+
+    // MARK: push
+
+    @Test func pushDefaultsToHTTPSAndPassesAnExplicitScheme() throws {
+        #expect(try ComposePush.arguments(image: "r/x:1", scheme: nil) == ["image", "push", "r/x:1"])
+        #expect(try ComposePush.arguments(image: "r/x:1", scheme: "http") == ["image", "push", "--scheme", "http", "r/x:1"])
+        #expect(try ComposePush.arguments(image: "r/x:1", scheme: "https") == ["image", "push", "--scheme", "https", "r/x:1"])
+    }
+
+    @Test func pushRejectsAnUnknownSchemeBeforeDoingAnything() {
+        #expect(throws: ComposeError.self) { try ComposePush.arguments(image: "r/x:1", scheme: "ftp") }
+        #expect(throws: ComposeError.self) { try ComposePush.arguments(image: "r/x:1", scheme: "") }
+    }
 }

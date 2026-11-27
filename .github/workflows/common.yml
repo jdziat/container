@@ -60,7 +60,7 @@ jobs:
     # from the project's origin; this repository is its own upstream.)
     if: github.repository == 'apple/container' || vars.LIVE_GATE_ENABLED == 'true'
     needs: buildClusterShim
-    timeout-minutes: 90
+    timeout-minutes: 240
     runs-on: [self-hosted, macos, goldengate, ARM64]
     permissions:
       contents: read
@@ -166,10 +166,33 @@ jobs:
       # suite and runs only the parity gate below. Intended for a self-hosted runner that is also
       # someone's everyday machine: that suite is not this project's gate, runs 30+ minutes, and once
       # coincided with the runner losing its network connection. Leave it unset where the full suite is wanted.
+      # The NFS fixture needs an NFS-capable guest kernel, which is built from apple/containerization's
+      # kernel/ directory at the revision this package pins. Only fetched when the NFS fixture is enabled
+      # (repository variable COMPOSE_SKIP_NFS=0). It goes in a stable cache path, NOT the sibling
+      # ../containerization that `system start` would find and try to build from before the builder works.
+      - name: Fetch containerization for the NFS kernel
+        if: ${{ !cancelled() && vars.COMPOSE_SKIP_NFS == '0' }}
+        run: |
+          rev="$(grep -A6 '"identity" : "containerization"' Package.resolved | sed -n 's/.*"revision" : "\([0-9a-f]*\)".*/\1/p' | head -1)"
+          [[ -n "${rev}" ]] || { echo "could not read the containerization revision from Package.resolved" >&2; exit 1; }
+          dest="${HOME}/.cache/container-parity/containerization"
+          mkdir -p "$(dirname "${dest}")"
+          [[ -d "${dest}/.git" ]] || git clone --filter=blob:none https://github.com/apple/containerization.git "${dest}"
+          git -C "${dest}" fetch --depth 1 origin "${rev}"
+          git -C "${dest}" checkout --force "${rev}"
+          echo "COMPOSE_NFS_CZ_ROOT=${dest}" >> "${GITHUB_ENV}"
+          echo "containerization ${rev} at ${dest}"
+
+      # The heavy fixtures (08-10 production images, 06 NFS) are off unless these repository variables opt in:
+      # COMPOSE_SKIP_PRODUCTION=0, COMPOSE_SKIP_NFS=0. COMPOSE_CORPUS_TIMEOUT (seconds) bounds the T3 corpus.
       - name: Docker parity (behavioral)
         # Runs even when the upstream test step above failed, so a failure there cannot hide whether
         # this gate passes. The job as a whole still fails if either step fails.
         if: ${{ !cancelled() }}
+        env:
+          COMPOSE_SKIP_PRODUCTION: ${{ vars.COMPOSE_SKIP_PRODUCTION }}
+          COMPOSE_SKIP_NFS: ${{ vars.COMPOSE_SKIP_NFS }}
+          COMPOSE_CORPUS_TIMEOUT: ${{ vars.COMPOSE_CORPUS_TIMEOUT }}
         run: make APP_ROOT="${APP_ROOT}" LOG_ROOT="${LOG_ROOT}" parity-behavioral
 
       - name: Extract coverage percentages

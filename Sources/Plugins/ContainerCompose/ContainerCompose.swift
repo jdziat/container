@@ -400,6 +400,9 @@ extension ContainerCompose {
 
         @OptionGroup var shared: SharedOptions
 
+        @Option(name: .long, help: "Registry scheme: https (default) or http for a plain-HTTP registry (this engine has no daemon-level insecure-registry setting)")
+        var scheme: String?
+
         @Argument(help: "Services to push (default: all)")
         var services: [String] = []
 
@@ -412,7 +415,9 @@ extension ContainerCompose {
                 throw ComposeError.invalid(
                     "service \(local.name) builds to the local tag \(local.image); set `image:` to a registry name to push it")
             }
-            for service in selected { try runContainerStreaming(["image", "push", service.image]) }
+            // Validate the scheme before pushing anything, so a typo cannot push half the services first.
+            let commands = try selected.map { try ComposePush.arguments(image: $0.image, scheme: scheme) }
+            for command in commands { try runContainerStreaming(command) }
         }
     }
 

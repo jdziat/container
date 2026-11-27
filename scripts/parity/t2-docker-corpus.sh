@@ -419,6 +419,80 @@ vc export "${VWAIT}" -o "${VD}/fs.tar" >/dev/null 2>&1
 [[ "$(cc version --short)" =~ [0-9] ]] && pass "compose version prints a version" || fail "compose version"
 vc down -t 1 >/dev/null; rm -rf "${VD}"
 
+# --- remaining live checks: down --rmi, config -q/--volumes, exec/run flags, internal networks, push -------
+GD="$(mktemp -d)"; GP="corpusgap${SUFFIX}"
+gc() { cc -f "${GD}/$1" -p "${2}" "${@:3}"; }
+
+# config -q prints nothing and succeeds; --volumes lists the declared names.
+printf 'services:\n  g:\n    image: %s\n    command: ["sleep","300"]\n    volumes: ["gv%s:/d"]\nvolumes:\n  gv%s: {}\n' "${IMAGE}" "${SUFFIX}" "${SUFFIX}" >"${GD}/v.yml"
+[[ -z "$(gc v.yml "${GP}" config -q)" ]] && pass "compose config -q prints nothing for a valid file" || fail "compose config -q printed output"
+[[ "$(gc v.yml "${GP}" config --volumes)" == "gv${SUFFIX}" ]] && pass "compose config --volumes lists the declared volume" || fail "compose config --volumes: $(gc v.yml "${GP}" config --volumes | head -2)"
+printf 'services:\n  g:\n    image: %s\n    bogus_key_xyz: 1\n' "${IMAGE}" >"${GD}/bad.yml"
+[[ -n "$(gc bad.yml "${GP}" config -q 2>&1)" ]] && pass "compose config -q still reports an invalid file" || fail "compose config -q was silent about an invalid key"
+
+# internal: true creates a host-only network (not a NAT one).
+printf 'services:\n  g:\n    image: %s\n    command: ["sleep","300"]\n    networks: [back]\nnetworks:\n  back:\n    internal: true\n' "${IMAGE}" >"${GD}/i.yml"
+gc i.yml "${GP}i" up -d >/dev/null; sleep 2
+"${CONTAINER_BIN}" network inspect "${GP}i_back" 2>/dev/null | grep -q hostOnly \
+    && pass "internal: true creates a host-only network" || fail "network ${GP}i_back is not host-only"
+gc i.yml "${GP}i" down -t 1 >/dev/null
+
+# exec flags: -w, -u, -d, --index (a scaled service has two replicas).
+printf 'services:\n  g:\n    image: %s\n    command: ["sleep","300"]\n' "${IMAGE}" >"${GD}/x.yml"
+gc x.yml "${GP}x" up -d --scale g=2 >/dev/null; sleep 3
+[[ "$(gc x.yml "${GP}x" exec -w /tmp g pwd)" == "/tmp" ]] && pass "compose exec -w sets the working directory" || fail "compose exec -w"
+[[ "$(gc x.yml "${GP}x" exec -u 1000 g id -u)" == "1000" ]] && pass "compose exec -u runs as that user" || fail "compose exec -u"
+gc x.yml "${GP}x" exec -d g sh -c 'sleep 1; echo detached > /tmp/d.txt' >/dev/null; sleep 4
+[[ "$(gc x.yml "${GP}x" exec g cat /tmp/d.txt 2>&1)" == *"detached"* ]] && pass "compose exec -d runs the command in the background" || fail "compose exec -d"
+gc x.yml "${GP}x" exec --index 2 g sh -c 'echo two > /tmp/idx' >/dev/null
+[[ "$(gc x.yml "${GP}x" exec --index 2 g cat /tmp/idx 2>&1)" == *"two"* && "$(gc x.yml "${GP}x" exec --index 1 g cat /tmp/idx 2>&1)" != *"two"* ]] \
+    && pass "compose exec --index selects the replica" || fail "compose exec --index"
+
+# run flags: -u, -w, --entrypoint, and -d/--name/-l/-p on one detached one-off.
+[[ "$(gc x.yml "${GP}x" run -u 1000 g id -u)" == *"1000"* ]] && pass "compose run -u runs as that user" || fail "compose run -u"
+[[ "$(gc x.yml "${GP}x" run -w /tmp g pwd)" == *"/tmp"* ]] && pass "compose run -w sets the working directory" || fail "compose run -w"
+[[ "$(gc x.yml "${GP}x" run --entrypoint /bin/echo g entrypoint-ok)" == *"entrypoint-ok"* ]] && pass "compose run --entrypoint overrides the entrypoint" || fail "compose run --entrypoint"
+gc x.yml "${GP}x" run -d --name "oo${SUFFIX}" -l "probe=yes" -p "$((18300 + SUFFIX % 90)):80" g sleep 60 >/dev/null; sleep 2
+cfg="$("${CONTAINER_BIN}" inspect "oo${SUFFIX}" 2>/dev/null | grep -v '^Warning')"
+if [[ "${cfg}" == *"oo${SUFFIX}"* && "${cfg}" == *"probe"* && "${cfg}" == *"$((18300 + SUFFIX % 90))"* ]]; then
+    pass "compose run -d --name -l -p applies the name, label and published port"
+else
+    fail "compose run -d --name/-l/-p: name/label/port missing from the one-off's config"
+fi
+"${CONTAINER_BIN}" delete -f "oo${SUFFIX}" >/dev/null 2>&1
+gc x.yml "${GP}x" down -t 1 >/dev/null
+
+# down --rmi: a typo is refused before anything is torn down; `local` removes only the image compose built.
+mkdir -p "${GD}/b"; printf 'FROM %s\nCMD ["sleep","300"]\n' "${IMAGE}" >"${GD}/b/Dockerfile"
+printf 'services:\n  bsvc:\n    build: ./b\n    command: ["sleep","300"]\n  other:\n    image: %s\n    command: ["sleep","300"]\n' "${IMAGE}" >"${GD}/r.yml"
+RP="${GP}r"
+gc r.yml "${RP}" up -d >/dev/null; sleep 3
+out="$(gc r.yml "${RP}" down --rmi bogus 2>&1)"
+[[ "${out}" == *"--rmi must be local or all"* && "$("${CONTAINER_BIN}" ps -q --filter "label=com.docker.compose.project=${RP}" 2>/dev/null | grep -vc '^Warning')" -ge 2 ]] \
+    && pass "compose down --rmi <typo> fails before stopping anything" || fail "compose down --rmi bogus: ${out:0:160}"
+"${CONTAINER_BIN}" image list 2>/dev/null | grep -q "${RP}_bsvc" || fail "the image compose built (${RP}_bsvc) is not present before down --rmi local"
+gc r.yml "${RP}" down -t 1 --rmi local >/dev/null
+if "${CONTAINER_BIN}" image list 2>/dev/null | grep -q "${RP}_bsvc"; then fail "down --rmi local left the image compose built"; else pass "compose down --rmi local removes the image compose built"; fi
+"${CONTAINER_BIN}" image list 2>/dev/null | grep -q "alpine" && pass "compose down --rmi local keeps images compose did not build" || fail "down --rmi local removed a registry image"
+
+# push: to a throwaway plain-HTTP registry in this isolated system, then read the tag back from its API.
+REGPORT=$((15000 + SUFFIX % 900)); REGNAME="corpusreg${SUFFIX}"
+"${CONTAINER_BIN}" run -d --name "${REGNAME}" -p "${REGPORT}:5000" docker.io/library/registry:2 >/dev/null 2>&1; sleep 4
+PIMG="localhost:${REGPORT}/corpus/push${SUFFIX}:1"
+"${CONTAINER_BIN}" image tag "${IMAGE}" "${PIMG}" >/dev/null 2>&1
+printf 'services:\n  p:\n    image: %s\n    command: ["sleep","300"]\n' "${PIMG}" >"${GD}/p.yml"
+if gc p.yml "${GP}p" push --scheme http >/dev/null 2>&1 && [[ "$(curl -s --max-time 10 "http://localhost:${REGPORT}/v2/corpus/push${SUFFIX}/tags/list")" == *'"1"'* ]]; then
+    pass "compose push --scheme http pushes the image to a registry"
+else
+    fail "compose push --scheme http: the registry has no corpus/push${SUFFIX}:1 tag"
+fi
+printf 'services:\n  p:\n    build: .\n' >"${GD}/q.yml"
+out="$(gc q.yml "${GP}q" push 2>&1)"
+[[ "${out}" == *"set \`image:\` to a registry name"* ]] && pass "compose push refuses a service that only has the local build tag" || fail "compose push local tag: ${out:0:160}"
+"${CONTAINER_BIN}" delete -f "${REGNAME}" >/dev/null 2>&1
+"${CONTAINER_BIN}" image delete "${PIMG}" >/dev/null 2>&1
+rm -rf "${GD}"
+
 # --- verbs with no equivalent must fail loudly with exit 2, naming an alternative ---------------
 for verb in "search x" "import -" "context ls" "buildx ls" "swarm init" "stack ls"; do
     # shellcheck disable=SC2086

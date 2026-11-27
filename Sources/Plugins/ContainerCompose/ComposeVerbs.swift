@@ -447,3 +447,20 @@ enum ComposeOneOffName {
         return head + suffix
     }
 }
+
+// MARK: - push
+
+enum ComposePush {
+    /// `container image push` arguments. Docker takes insecure-registry settings from the daemon; this engine
+    /// has none, so a plain-HTTP registry needs `--scheme http` per push (the default stays https).
+    static func arguments(image: String, scheme: String?) throws -> [String] {
+        var args = ["image", "push"]
+        if let scheme {
+            guard ["http", "https"].contains(scheme) else {
+                throw ComposeError.invalid("--scheme must be http or https, got '\(scheme)'")
+            }
+            args += ["--scheme", scheme]
+        }
+        return args + [image]
+    }
+}

@@ -54,6 +54,26 @@ project_for() {
   printf 'parity-%s' "$1"
 }
 
+# The NFS fixture needs a guest kernel with NFS (the stock/Kata kernel has none). If this guest lacks it, build
+# and install the NFS-capable one from COMPOSE_NFS_CZ_ROOT (an apple/containerization checkout). This runs AFTER
+# `system start`, because building the kernel needs a working builder, which needs a kernel to boot.
+nfs_kernel_ready() {
+  "${CONTAINER_BIN}" run --rm docker.io/library/alpine:3.20 grep -qw nfs /proc/filesystems >/dev/null 2>&1
+}
+
+ensure_nfs_kernel() {
+  if nfs_kernel_ready; then
+    log "guest kernel already has NFS"
+    return 0
+  fi
+  [[ -n "${COMPOSE_NFS_CZ_ROOT:-}" && -d "${COMPOSE_NFS_CZ_ROOT}/kernel" ]] \
+    || { log "guest kernel has no NFS and COMPOSE_NFS_CZ_ROOT is not an apple/containerization checkout"; return 1; }
+  log "building and installing an NFS-capable kernel from ${COMPOSE_NFS_CZ_ROOT} (this takes a while)"
+  CONTAINERIZATION_ROOT="${COMPOSE_NFS_CZ_ROOT}" CONTAINER_BIN="${CONTAINER_BIN}" "${ROOT}/scripts/install-nfs-kernel.sh" \
+    || { log "kernel install failed"; return 1; }
+  nfs_kernel_ready || { log "kernel installed but the guest still has no NFS"; return 1; }
+}
+
 is_production_fixture() {
   case "$1" in
     08-wordpress|09-nextcloud|10-immich) return 0 ;;
@@ -108,6 +128,7 @@ run_fixture() {
       popd >/dev/null
       return 0
     fi
+    ensure_nfs_kernel || fail "${name}: no NFS-capable guest kernel (set COMPOSE_SKIP_NFS=1 to skip this fixture)"
     # Always (re)start the in-guest server unless COMPOSE_NFS_KEEP=1 — stale
     # COMPOSE_NFS_SERVER from a prior session points at a dead address (ETIMEDOUT).
     if [[ "${COMPOSE_NFS_KEEP:-0}" != "1" ]] || [[ -z "${COMPOSE_NFS_SERVER:-}" ]] || [[ -z "${COMPOSE_NFS_EXPORT:-}" ]]; then
@@ -231,9 +252,9 @@ main() {
 
 # Soft timeout wrapper when available
 if command -v gtimeout >/dev/null 2>&1; then
-  gtimeout "${TIMEOUT_S}" bash -c "$(declare -f log fail compose project_for is_production_fixture http_probe wait_http run_fixture main); export CONTAINER_BIN CONTAINER_CLI CORPUS ROOT SKIP_NFS SKIP_PRODUCTION; main"
+  gtimeout "${TIMEOUT_S}" bash -c "$(declare -f log fail compose project_for nfs_kernel_ready ensure_nfs_kernel is_production_fixture http_probe wait_http run_fixture main); export CONTAINER_BIN CONTAINER_CLI CORPUS ROOT SKIP_NFS SKIP_PRODUCTION COMPOSE_NFS_CZ_ROOT; main"
 elif command -v timeout >/dev/null 2>&1; then
-  timeout "${TIMEOUT_S}" bash -c "$(declare -f log fail compose project_for is_production_fixture http_probe wait_http run_fixture main); export CONTAINER_BIN CONTAINER_CLI CORPUS ROOT SKIP_NFS SKIP_PRODUCTION; main"
+  timeout "${TIMEOUT_S}" bash -c "$(declare -f log fail compose project_for nfs_kernel_ready ensure_nfs_kernel is_production_fixture http_probe wait_http run_fixture main); export CONTAINER_BIN CONTAINER_CLI CORPUS ROOT SKIP_NFS SKIP_PRODUCTION COMPOSE_NFS_CZ_ROOT; main"
 else
   main
 fi
