@@ -96,44 +96,38 @@ extension XPCClient {
     }
 
     /// Send the provided message to the service.
+    ///
+    /// With a `responseTimeout`, this throws if the service has not replied in time, even when it never replies.
+    /// That used to be a task group racing the reply against a sleep, but the reply side is a continuation, which
+    /// cannot be cancelled: when the sleep won, the group still waited for the reply, so a service that never
+    /// answered (a helper stuck restarting) made the timeout itself hang. This resumes ONE continuation from
+    /// whichever finishes first and ignores the other.
     @discardableResult
     public func send(_ message: XPCMessage, responseTimeout: Duration? = nil) async throws -> XPCMessage {
-        try await withThrowingTaskGroup(of: XPCMessage.self, returning: XPCMessage.self) { group in
+        let race = ReplyRace()
+        let service = self.service
+        let route = message.string(key: XPCMessage.routeKey) ?? "nil"
+        return try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<XPCMessage, Error>) in
+            race.install(continuation)
             if let responseTimeout {
-                group.addTask {
-                    try await Task.sleep(for: responseTimeout)
-                    let route = message.string(key: XPCMessage.routeKey) ?? "nil"
-                    throw ContainerizationError(
-                        .internalError,
-                        message: "XPC timeout for request to \(self.service)/\(route)"
-                    )
+                let timer = Task {
+                    do { try await Task.sleep(for: responseTimeout) } catch { return }  // cancelled: a reply won
+                    race.finish(
+                        .failure(
+                            ContainerizationError(
+                                .internalError,
+                                message: "XPC timeout for request to \(service)/\(route)"
+                            )))
+                }
+                race.setTimer(timer)
+            }
+            xpc_connection_send_message_with_reply(self.connection, message.underlying, nil) { reply in
+                do {
+                    race.finish(.success(try self.parseReply(reply)))
+                } catch {
+                    race.finish(.failure(error))
                 }
             }
-
-            group.addTask {
-                try await withCheckedThrowingContinuation { cont in
-                    xpc_connection_send_message_with_reply(self.connection, message.underlying, nil) { reply in
-                        do {
-                            let message = try self.parseReply(reply)
-                            cont.resume(returning: message)
-                        } catch {
-                            cont.resume(throwing: error)
-                        }
-                    }
-                }
-            }
-
-            let response = try await group.next()
-            // once one task has finished, cancel the rest.
-            group.cancelAll()
-            // we don't really care about the second error here
-            // as it's most likely a `CancellationError`.
-            try? await group.waitForAll()
-
-            guard let response else {
-                throw ContainerizationError(.invalidState, message: "failed to receive XPC response")
-            }
-            return response
         }
     }
 
@@ -156,6 +150,50 @@ extension XPCClient {
         default:
             fatalError("unhandled xpc object type: \(xpc_get_type(reply))")
         }
+    }
+}
+
+/// Resumes a continuation at most once, from either the XPC reply or the timeout, and cancels the timer when a
+/// reply wins so it does not linger for the whole timeout.
+private final class ReplyRace: @unchecked Sendable {
+    private let lock = NSLock()
+    private var continuation: CheckedContinuation<XPCMessage, Error>?
+    private var timer: Task<Void, Never>?
+    /// Set once the race is decided, so a timer registered after that is cancelled instead of left sleeping.
+    private var finished = false
+
+    func install(_ continuation: CheckedContinuation<XPCMessage, Error>) {
+        lock.lock()
+        self.continuation = continuation
+        lock.unlock()
+    }
+
+    func setTimer(_ timer: Task<Void, Never>) {
+        lock.lock()
+        if finished {
+            lock.unlock()
+            timer.cancel()
+            return
+        }
+        self.timer = timer
+        lock.unlock()
+    }
+
+    func finish(_ result: Result<XPCMessage, Error>) {
+        lock.lock()
+        // The continuation is the once-only guard: it is cleared before it is resumed, so the loser of the race
+        // (a late reply after a timeout, or a late timeout after a reply) finds nothing to resume.
+        guard let continuation else {
+            lock.unlock()
+            return
+        }
+        finished = true
+        self.continuation = nil
+        let timer = self.timer
+        self.timer = nil
+        lock.unlock()
+        timer?.cancel()
+        continuation.resume(with: result)
     }
 }
 
