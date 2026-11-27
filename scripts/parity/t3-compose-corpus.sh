@@ -68,12 +68,51 @@ ensure_nfs_kernel() {
   fi
   [[ -n "${COMPOSE_NFS_CZ_ROOT:-}" && -d "${COMPOSE_NFS_CZ_ROOT}/kernel" ]] \
     || { log "guest kernel has no NFS and COMPOSE_NFS_CZ_ROOT is not an apple/containerization checkout"; return 1; }
+  # A kernel build downloads packages in the builder. If the guest cannot resolve names, say so now instead of
+  # failing 30 seconds into apt-get.
+  if ! "${CONTAINER_BIN}" run --rm docker.io/library/alpine:3.20 sh -c 'nslookup ports.ubuntu.com >/dev/null 2>&1'; then
+    log "guest DNS cannot resolve ports.ubuntu.com; the kernel build would fail in apt-get (see the docker corpus networking checks)"
+    return 1
+  fi
   log "building and installing an NFS-capable kernel from ${COMPOSE_NFS_CZ_ROOT} (this takes a while)"
   # The kernel Makefile runs `container` by bare name, so the binary under test must be first on PATH.
   PATH="$(dirname "${CONTAINER_BIN}"):${PATH}" CONTAINERIZATION_ROOT="${COMPOSE_NFS_CZ_ROOT}" CONTAINER_BIN="${CONTAINER_BIN}" \
     "${ROOT}/scripts/install-nfs-kernel.sh" \
     || { log "kernel install failed"; return 1; }
   nfs_kernel_ready || { log "kernel installed but the guest still has no NFS"; return 1; }
+}
+
+# What to print when a fixture fails, so a CI log explains the failure instead of just stating it: the project's
+# containers, the tail of every service's log, each container's health state, and who is listening on the
+# fixture's published host ports (the runner shares the host's network with other things).
+diagnose() {
+  local file="$1" project="$2" port
+  log "---- diagnostics for ${project} ----"
+  "${CONTAINER_BIN}" compose -f "${file}" -p "${project}" ps -a 2>&1 | grep -v '^Warning' | head -20 || true
+  "${CONTAINER_BIN}" compose -f "${file}" -p "${project}" logs --tail 25 2>&1 | grep -v '^Warning' | tail -80 || true
+  for c in $("${CONTAINER_BIN}" ps -a --filter "label=com.docker.compose.project=${project}" --format '{{.Names}}' 2>/dev/null | grep -v '^Warning'); do
+    log "health of ${c}: $("${CONTAINER_BIN}" inspect "${c}" 2>/dev/null | grep -v '^Warning' | tr -d ' \n' | grep -oE '"health[A-Za-z]*":\{[^}]*\}|"health[A-Za-z]*":"[^"]*"' | head -3 | tr '\n' ' ')"
+  done
+  for port in $(grep -oE '"?[0-9]{2,5}:[0-9]+' "${file}" | tr -d '"' | cut -d: -f1 | sort -u); do
+    log "host port ${port}: $(netstat -an -p tcp 2>/dev/null | grep -E "[.:]${port} .*LISTEN" | head -2 | tr '\n' ';')"
+  done
+  log "---- end diagnostics ----"
+}
+
+# The runner shares the host with whatever else is running, and a host port that is still held makes `up` fail
+# with "Address already in use". Wait for the fixture's host ports to be free, and say who holds them if not.
+wait_ports_free() {
+  local file="$1" port waited
+  for port in $(grep -oE '"?[0-9]{2,5}:[0-9]+' "${file}" | tr -d '"' | cut -d: -f1 | sort -u); do
+    waited=0
+    while netstat -an -p tcp 2>/dev/null | grep -qE "[.:]${port} .*LISTEN"; do
+      if ((waited >= 90)); then
+        log "host port ${port} is still held after ${waited}s: $(netstat -an -p tcp 2>/dev/null | grep -E "[.:]${port} .*LISTEN" | head -2 | tr '\n' ';')"
+        return 0
+      fi
+      sleep 5; waited=$((waited + 5))
+    done
+  done
 }
 
 is_production_fixture() {
@@ -193,11 +232,13 @@ run_fixture() {
   local up_ok=0
   local attempt
   for attempt in 1 2 3 4 5; do
+    wait_ports_free compose.yaml
     if compose -f compose.yaml -p "${project}" up; then
       up_ok=1
       break
     fi
     log "up attempt ${attempt} failed for ${name}; retrying after backoff"
+    [[ "${attempt}" == "1" || "${attempt}" == "5" ]] && diagnose compose.yaml "${project}"
     compose -f compose.yaml -p "${project}" down || true
     sleep $((attempt * 15))
   done
@@ -213,17 +254,17 @@ run_fixture() {
     case "${name}" in
       08-wordpress)
         wait_http "http://127.0.0.1:18080/" "302" 180 \
-          || { compose -f compose.yaml -p "${project}" logs || true; compose -f compose.yaml -p "${project}" down || true; fail "${name} HTTP probe"; }
+          || { diagnose compose.yaml "${project}"; compose -f compose.yaml -p "${project}" down || true; fail "${name} HTTP probe"; }
         ;;
       09-nextcloud)
         wait_http "http://127.0.0.1:18081/" "" 240 \
-          || { compose -f compose.yaml -p "${project}" logs || true; compose -f compose.yaml -p "${project}" down || true; fail "${name} HTTP probe"; }
+          || { diagnose compose.yaml "${project}"; compose -f compose.yaml -p "${project}" down || true; fail "${name} HTTP probe"; }
         ;;
       10-immich)
         # Immich Nest bootstrap + geodata import; require a real HTTP 200 (no ps fallback).
         # Fixture sets IMMICH_HOST=0.0.0.0 so the published port is reachable on 127.0.0.1.
         wait_http "http://127.0.0.1:2283/" "200" 360 \
-          || { compose -f compose.yaml -p "${project}" logs || true; compose -f compose.yaml -p "${project}" down || true; fail "${name} HTTP probe (want 200)"; }
+          || { diagnose compose.yaml "${project}"; compose -f compose.yaml -p "${project}" down || true; fail "${name} HTTP probe (want 200)"; }
         ;;
     esac
   else
@@ -242,6 +283,8 @@ main() {
   for d in "${CORPUS}"/[0-9]*; do
     [[ -d "${d}" ]] || continue
     [[ -f "${d}/compose.yaml" ]] || continue
+    # COMPOSE_ONLY="08-wordpress 10-immich" runs just those (a focused CI run costs minutes, not ~80).
+    if [[ -n "${COMPOSE_ONLY:-}" && " ${COMPOSE_ONLY} " != *" $(basename "${d}") "* ]]; then continue; fi
     # In a subshell: fail() exits, and a fixture that fails (say, 06-nfs) must not abort the fixtures after it.
     # Without this a failing early fixture hid whether 07-10 pass at all.
     if ! ( run_fixture "${d}" ); then
@@ -257,9 +300,9 @@ main() {
 
 # Soft timeout wrapper when available
 if command -v gtimeout >/dev/null 2>&1; then
-  gtimeout "${TIMEOUT_S}" bash -c "$(declare -f log fail compose project_for nfs_kernel_ready ensure_nfs_kernel is_production_fixture http_probe wait_http run_fixture main); export CONTAINER_BIN CONTAINER_CLI CORPUS ROOT SKIP_NFS SKIP_PRODUCTION COMPOSE_NFS_CZ_ROOT; main"
+  gtimeout "${TIMEOUT_S}" bash -c "$(declare -f log fail compose project_for nfs_kernel_ready ensure_nfs_kernel diagnose wait_ports_free is_production_fixture http_probe wait_http run_fixture main); export CONTAINER_BIN CONTAINER_CLI CORPUS ROOT SKIP_NFS SKIP_PRODUCTION COMPOSE_NFS_CZ_ROOT COMPOSE_ONLY; main"
 elif command -v timeout >/dev/null 2>&1; then
-  timeout "${TIMEOUT_S}" bash -c "$(declare -f log fail compose project_for nfs_kernel_ready ensure_nfs_kernel is_production_fixture http_probe wait_http run_fixture main); export CONTAINER_BIN CONTAINER_CLI CORPUS ROOT SKIP_NFS SKIP_PRODUCTION COMPOSE_NFS_CZ_ROOT; main"
+  timeout "${TIMEOUT_S}" bash -c "$(declare -f log fail compose project_for nfs_kernel_ready ensure_nfs_kernel diagnose wait_ports_free is_production_fixture http_probe wait_http run_fixture main); export CONTAINER_BIN CONTAINER_CLI CORPUS ROOT SKIP_NFS SKIP_PRODUCTION COMPOSE_NFS_CZ_ROOT COMPOSE_ONLY; main"
 else
   main
 fi

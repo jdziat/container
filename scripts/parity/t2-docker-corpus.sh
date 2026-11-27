@@ -493,6 +493,29 @@ out="$(gc q.yml "${GP}q" push 2>&1)"
 "${CONTAINER_BIN}" image delete "${PIMG}" >/dev/null 2>&1
 rm -rf "${GD}"
 
+# --- networking: the things every compose stack silently depends on ---------------------------------
+# Two containers on one user network reach each other by IP and by name, and a guest resolves and reaches the
+# outside world. The heavy T3 fixtures (Immich: EHOSTUNREACH to its own redis; the NFS kernel build: "Temporary
+# failure resolving") fail without these, and nothing else in this gate says why.
+NETN="corpusconn${SUFFIX}"; SRV="corpussrv${SUFFIX}"; CLI="corpuscli${SUFFIX}"
+"${CONTAINER_BIN}" network create "${NETN}" >/dev/null 2>&1
+"${CONTAINER_BIN}" run -d --name "${SRV}" --network "${NETN}" "${IMAGE}" sh -c 'while true; do echo reachable | nc -l -p 8080; done' >/dev/null 2>&1; sleep 3
+SRVIP="$("${CONTAINER_BIN}" list 2>/dev/null | awk -v n="${SRV}" '$1==n {sub(/\/.*/, "", $6); print $6}')"
+if [[ -z "${SRVIP}" ]]; then
+    fail "container networking: no address for ${SRV} (list: $("${CONTAINER_BIN}" list 2>&1 | grep "${SRV}" | cut -c1-120))"
+else
+    got="$("${CONTAINER_BIN}" run --rm --network "${NETN}" "${IMAGE}" sh -c "nc -w 4 ${SRVIP} 8080" 2>&1 | tr -d '\r')"
+    [[ "${got}" == *reachable* ]] && pass "containers on one network reach each other by IP" || fail "container -> container by IP (${SRVIP}): ${got:0:200}"
+fi
+got="$("${CONTAINER_BIN}" run --rm --name "${CLI}" --network "${NETN}" "${IMAGE}" sh -c "nc -w 4 ${SRV} 8080" 2>&1 | tr -d '\r')"
+[[ "${got}" == *reachable* ]] && pass "containers on one network reach each other by name" || fail "container -> container by name (${SRV}): ${got:0:200}"
+"${CONTAINER_BIN}" delete -f "${SRV}" >/dev/null 2>&1; "${CONTAINER_BIN}" network delete "${NETN}" >/dev/null 2>&1
+got="$("${CONTAINER_BIN}" run --rm "${IMAGE}" sh -c 'nslookup ports.ubuntu.com 2>&1 | tail -3' 2>&1 | tr -d '\r')"
+[[ "${got}" == *"Address"* && "${got}" != *"can't resolve"* && "${got}" != *"SERVFAIL"* ]] \
+    && pass "a container resolves an external name" || fail "guest DNS: ${got:0:200}"
+got="$("${CONTAINER_BIN}" run --rm "${IMAGE}" sh -c 'wget -q -T 10 --spider http://ports.ubuntu.com/ && echo OUTBOUND_OK' 2>&1 | tr -d '\r')"
+[[ "${got}" == *OUTBOUND_OK* ]] && pass "a container reaches the internet over HTTP" || fail "guest outbound HTTP: ${got:0:200}"
+
 # --- verbs with no equivalent must fail loudly with exit 2, naming an alternative ---------------
 for verb in "search x" "import -" "context ls" "buildx ls" "swarm init" "stack ls"; do
     # shellcheck disable=SC2086

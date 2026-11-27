@@ -185,6 +185,7 @@ jobs:
 
       # The heavy fixtures (08-10 production images, 06 NFS) are off unless these repository variables opt in:
       # COMPOSE_SKIP_PRODUCTION=0, COMPOSE_SKIP_NFS=0. COMPOSE_CORPUS_TIMEOUT (seconds) bounds the T3 corpus.
+      # For a focused run set COMPOSE_ONLY (fixture names) and/or PARITY_HARNESSES (e.g. t3-compose-corpus); unset = everything.
       - name: Docker parity (behavioral)
         # Runs even when the upstream test step above failed, so a failure there cannot hide whether
         # this gate passes. The job as a whole still fails if either step fails.
@@ -193,6 +194,8 @@ jobs:
           COMPOSE_SKIP_PRODUCTION: ${{ vars.COMPOSE_SKIP_PRODUCTION }}
           COMPOSE_SKIP_NFS: ${{ vars.COMPOSE_SKIP_NFS }}
           COMPOSE_CORPUS_TIMEOUT: ${{ vars.COMPOSE_CORPUS_TIMEOUT }}
+          COMPOSE_ONLY: ${{ vars.COMPOSE_ONLY }}
+          PARITY_HARNESSES: ${{ vars.PARITY_HARNESSES }}
         run: make APP_ROOT="${APP_ROOT}" LOG_ROOT="${LOG_ROOT}" parity-behavioral
 
       - name: Extract coverage percentages
