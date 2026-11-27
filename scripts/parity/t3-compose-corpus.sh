@@ -69,7 +69,9 @@ ensure_nfs_kernel() {
   [[ -n "${COMPOSE_NFS_CZ_ROOT:-}" && -d "${COMPOSE_NFS_CZ_ROOT}/kernel" ]] \
     || { log "guest kernel has no NFS and COMPOSE_NFS_CZ_ROOT is not an apple/containerization checkout"; return 1; }
   log "building and installing an NFS-capable kernel from ${COMPOSE_NFS_CZ_ROOT} (this takes a while)"
-  CONTAINERIZATION_ROOT="${COMPOSE_NFS_CZ_ROOT}" CONTAINER_BIN="${CONTAINER_BIN}" "${ROOT}/scripts/install-nfs-kernel.sh" \
+  # The kernel Makefile runs `container` by bare name, so the binary under test must be first on PATH.
+  PATH="$(dirname "${CONTAINER_BIN}"):${PATH}" CONTAINERIZATION_ROOT="${COMPOSE_NFS_CZ_ROOT}" CONTAINER_BIN="${CONTAINER_BIN}" \
+    "${ROOT}/scripts/install-nfs-kernel.sh" \
     || { log "kernel install failed"; return 1; }
   nfs_kernel_ready || { log "kernel installed but the guest still has no NFS"; return 1; }
 }
@@ -240,7 +242,10 @@ main() {
   for d in "${CORPUS}"/[0-9]*; do
     [[ -d "${d}" ]] || continue
     [[ -f "${d}/compose.yaml" ]] || continue
-    if ! run_fixture "${d}"; then
+    # In a subshell: fail() exits, and a fixture that fails (say, 06-nfs) must not abort the fixtures after it.
+    # Without this a failing early fixture hid whether 07-10 pass at all.
+    if ! ( run_fixture "${d}" ); then
+      log "FIXTURE FAILED: $(basename "${d}")"
       failed=1
     fi
   done

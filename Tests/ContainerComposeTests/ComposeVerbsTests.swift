@@ -143,30 +143,85 @@ struct ComposeVerbsTests {
         #expect(p.serviceReference("../web:/x") == nil)
     }
 
+    private func container(_ name: String, service: String, number: Int = 1, state: String = "running", oneOff: Bool = false) -> ComposePSRow {
+        ComposePSRow(name: name, id: name, service: service, image: "i", state: state, oneOff: oneOff, number: number)
+    }
+
     @Test func copyOutAndIn() throws {
         let p = try plan(yaml)
-        let out = try p.copyArguments(source: "web:/etc/hosts", destination: "./hosts", index: 1, owned: ["web"])
+        let rows = [container("web", service: "web")]
+        let out = try p.copyArguments(source: "web:/etc/hosts", destination: "./hosts", index: 1, rows: rows)
         #expect(out == ("web:/etc/hosts", "./hosts"))
-        let into = try p.copyArguments(source: "./a.txt", destination: "web:/tmp/a.txt", index: 1, owned: ["web"])
+        let into = try p.copyArguments(source: "./a.txt", destination: "web:/tmp/a.txt", index: 1, rows: rows)
         #expect(into == ("./a.txt", "web:/tmp/a.txt"))
     }
 
-    @Test func copyPicksTheReplicaByIndex() throws {
+    @Test func copyPicksTheReplicaByContainerNumber() throws {
         let p = try plan(yaml)
-        let second = try p.copyArguments(source: "worker:/x", destination: "./x", index: 2, owned: ["worker-1", "worker-2"])
-        #expect(second.0 == "worker-2:/x")
-        #expect(throws: ComposeError.self) { try p.copyArguments(source: "worker:/x", destination: "./x", index: 3, owned: ["worker-1", "worker-2"]) }
-        // Out of range even though the (foreign) container of that name exists: range is checked on its own.
-        #expect(throws: ComposeError.self) { try p.copyArguments(source: "worker:/x", destination: "./x", index: 3, owned: ["worker-1", "worker-2", "worker-3"]) }
-        #expect(throws: ComposeError.self) { try p.copyArguments(source: "worker:/x", destination: "./x", index: 0, owned: ["worker-1", "worker-2"]) }
+        let rows = [container("worker-1", service: "worker", number: 1), container("worker-2", service: "worker", number: 2)]
+        #expect(try p.copyArguments(source: "worker:/x", destination: "./x", index: 2, rows: rows).0 == "worker-2:/x")
+        #expect(throws: ComposeError.self) { try p.copyArguments(source: "worker:/x", destination: "./x", index: 3, rows: rows) }
+        #expect(throws: ComposeError.self) { try p.copyArguments(source: "worker:/x", destination: "./x", index: 0, rows: rows) }
     }
 
     @Test func copyRefusesBadShapes() throws {
         let p = try plan(yaml)
-        #expect(throws: ComposeError.self) { try p.copyArguments(source: "./a", destination: "./b", index: 1, owned: ["web"]) }
-        #expect(throws: ComposeError.self) { try p.copyArguments(source: "web:/a", destination: "app:/b", index: 1, owned: ["web", "app"]) }
-        // a service with no container of ours (not up, or someone else's same-named container)
-        #expect(throws: ComposeError.self) { try p.copyArguments(source: "web:/a", destination: "./b", index: 1, owned: []) }
+        let rows = [container("web", service: "web"), container("app", service: "app")]
+        #expect(throws: ComposeError.self) { try p.copyArguments(source: "./a", destination: "./b", index: 1, rows: rows) }
+        #expect(throws: ComposeError.self) { try p.copyArguments(source: "web:/a", destination: "app:/b", index: 1, rows: rows) }
+        // a service with no container of this project (not up; a foreign same-named container is never in rows)
+        #expect(throws: ComposeError.self) { try p.copyArguments(source: "web:/a", destination: "./b", index: 1, rows: []) }
+    }
+
+    // MARK: replicas come from the running containers, not the file
+
+    /// The live failure: `up --scale g=2` is not in the file (replicas 1 there), so planned names said `g`, but
+    /// the containers are `g-1` and `g-2`. exec/cp/logs/stop all looked for `g` and found nothing.
+    @Test func aScaledServiceIsFoundEvenThoughTheFileSaysOneReplica() throws {
+        let p = try plan("services:\n  g:\n    image: x\n")
+        #expect(p.services.first?.replicas == 1)
+        let rows = [container("g-1", service: "g", number: 1), container("g-2", service: "g", number: 2)]
+        #expect(try p.replicaName(service: "g", index: 1, rows: rows) == "g-1")
+        #expect(try p.replicaName(service: "g", index: 2, rows: rows) == "g-2")
+        #expect(try p.containers(of: ["g"], in: rows).map(\.name) == ["g-1", "g-2"])
+        #expect(try p.copyArguments(source: "g:/f", destination: "./f", index: 2, rows: rows).0 == "g-2:/f")
+    }
+
+    @Test func replicasAreOrderedByNumberNotByName() throws {
+        let p = try plan("services:\n  g:\n    image: x\n")
+        let rows = [container("zzz", service: "g", number: 2), container("aaa", service: "g", number: 1)]
+        #expect(try p.containers(of: [], in: rows).map(\.name) == ["aaa", "zzz"])
+        #expect(try p.replicaName(service: "g", index: 1, rows: rows) == "aaa")
+    }
+
+    @Test func containersFollowThePlansServiceOrderAndSkipOneOffsByDefault() throws {
+        let p = try plan(yaml)
+        let order = p.services.map(\.name)  // the planner's (dependency-sorted) order; the test must not assume file order
+        #expect(Set(order) == ["web", "app", "worker"])
+        // Containers supplied in the opposite order, plus a one-off of web.
+        let rows = order.reversed().map { container($0, service: $0) } + [container("web_run_abc", service: "web", oneOff: true)]
+        #expect(try p.containers(of: [], in: rows).map(\.name) == order)
+        let withOneOff = try p.containers(of: [], in: rows, includeOneOffs: true).map(\.name)
+        #expect(withOneOff == order.flatMap { $0 == "web" ? ["web", "web_run_abc"] : [$0] })
+        #expect(try p.containers(of: ["web"], in: rows).map(\.name) == ["web"])
+        #expect(try p.containers(of: ["web"], in: rows, includeOneOffs: true).map(\.name) == ["web", "web_run_abc"])
+        #expect(throws: ComposeError.self) { try p.containers(of: ["nope"], in: rows) }
+    }
+
+    @Test func aOneOffIsNeverPickedAsAReplica() throws {
+        let p = try plan(yaml)
+        #expect(throws: ComposeError.self) {
+            try p.replicaName(service: "web", index: 1, rows: [container("web_run_abc", service: "web", oneOff: true)])
+        }
+    }
+
+    @Test func psRowsCarryTheContainerNumber() throws {
+        let json =
+            "[{\"status\":\"running\",\"configuration\":{\"id\":\"a\",\"image\":{\"reference\":\"i\"},\"labels\":{\"com.docker.compose.project\":\"p\",\"com.docker.compose.service\":\"w\",\"com.docker.compose.container-number\":\"3\"}}}]"
+        #expect(try ComposePS.rows(listJSON: json, project: "p").first?.number == 3)
+        let none =
+            "[{\"status\":\"running\",\"configuration\":{\"id\":\"a\",\"image\":{\"reference\":\"i\"},\"labels\":{\"com.docker.compose.project\":\"p\",\"com.docker.compose.service\":\"w\"}}}]"
+        #expect(try ComposePS.rows(listJSON: none, project: "p").first?.number == 1)
     }
 
     @Test func rmiLocalIsOnlyWhatComposeBuilt() throws {
@@ -272,13 +327,13 @@ struct ComposeVerbsTests {
         #expect(ComposeLogs.prefix("x", name: "longname", width: 3, enabled: true) == "longname  | x")
     }
 
-    @Test func logTargetsAreOwnedContainersInServiceOrder() throws {
+    @Test func logTargetsAreTheProjectsRealContainersInServiceOrder() throws {
         let p = try plan(yaml)
-        let all = try ComposeLogs.targets(plan: p, services: [], owned: ["web", "worker-1", "worker-2"])
-        #expect(Set(all) == ["web", "worker-1", "worker-2"])
-        #expect(try ComposeLogs.targets(plan: p, services: ["worker"], owned: ["web", "worker-1", "worker-2"]) == ["worker-1", "worker-2"])
-        #expect(try ComposeLogs.targets(plan: p, services: ["web"], owned: []).isEmpty)
-        #expect(throws: ComposeError.self) { try ComposeLogs.targets(plan: p, services: ["nope"], owned: []) }
+        let rows = [container("worker-2", service: "worker", number: 2), container("web", service: "web"), container("worker-1", service: "worker", number: 1)]
+        #expect(try ComposeLogs.targets(plan: p, services: [], rows: rows) == ["web", "worker-1", "worker-2"])
+        #expect(try ComposeLogs.targets(plan: p, services: ["worker"], rows: rows) == ["worker-1", "worker-2"])
+        #expect(try ComposeLogs.targets(plan: p, services: ["web"], rows: []).isEmpty)
+        #expect(throws: ComposeError.self) { try ComposeLogs.targets(plan: p, services: ["nope"], rows: []) }
     }
 
     @Test func configJSONIsParseableAndComplete() throws {
@@ -510,5 +565,41 @@ struct ComposeVerbsTests {
     @Test func pushRejectsAnUnknownSchemeBeforeDoingAnything() {
         #expect(throws: ComposeError.self) { try ComposePush.arguments(image: "r/x:1", scheme: "ftp") }
         #expect(throws: ComposeError.self) { try ComposePush.arguments(image: "r/x:1", scheme: "") }
+    }
+
+    /// `--index` is the container NUMBER, not a position: after replica 2 is removed, 3 is still 3.
+    @Test func indexIsTheContainerNumberEvenWithAGap() throws {
+        let p = try plan("services:\n  g:\n    image: x\n")
+        let rows = [container("g-1", service: "g", number: 1), container("g-3", service: "g", number: 3)]
+        #expect(try p.replicaName(service: "g", index: 3, rows: rows) == "g-3")
+        #expect(throws: ComposeError.self) { try p.replicaName(service: "g", index: 2, rows: rows) }
+    }
+
+    @Test func aMissingIndexNamesTheNumbersThatExistInOrder() throws {
+        let p = try plan("services:\n  g:\n    image: x\n")
+        // Names sort a < c but numbers say c(1), a(3): sorting by name would print "3, 1".
+        let rows = [container("a", service: "g", number: 3), container("c", service: "g", number: 1)]
+        do {
+            _ = try p.replicaName(service: "g", index: 2, rows: rows)
+            Issue.record("expected an error")
+        } catch {
+            #expect("\(error)".contains("(1, 3)"), "got: \(error)")
+        }
+    }
+
+    @Test func replicasSortByNumberWhenNamesSortTheOtherWay() throws {
+        let p = try plan("services:\n  g:\n    image: x\n")
+        // Names sort b < c < d but the numbers say d(1), c(2), b(3).
+        let rows = [container("b", service: "g", number: 3), container("c", service: "g", number: 2), container("d", service: "g", number: 1)]
+        #expect(try p.containers(of: [], in: rows).map(\.name) == ["d", "c", "b"])
+    }
+
+    @Test func serviceOrderBeatsNameOrderAcrossServices() throws {
+        // `zeta` has no dependencies and `alpha` depends on it, so the plan orders zeta before alpha even though
+        // alphabetically alpha comes first.
+        let p = try plan("services:\n  alpha:\n    image: x\n    depends_on: [zeta]\n  zeta:\n    image: x\n")
+        #expect(p.services.map(\.name) == ["zeta", "alpha"])
+        let rows = [container("alpha", service: "alpha"), container("zeta", service: "zeta")]
+        #expect(try p.containers(of: [], in: rows).map(\.name) == ["zeta", "alpha"])
     }
 }

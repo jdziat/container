@@ -28,6 +28,8 @@ struct ComposePSRow: Codable, Equatable {
     var image: String
     var state: String
     var oneOff: Bool
+    /// `com.docker.compose.container-number` (1-based replica number); 1 when the label is absent.
+    var number: Int = 1
 
     enum CodingKeys: String, CodingKey {
         case name = "Name"
@@ -36,6 +38,7 @@ struct ComposePSRow: Codable, Equatable {
         case image = "Image"
         case state = "State"
         case oneOff = "OneOff"
+        case number = "Number"
     }
 }
 
@@ -60,7 +63,8 @@ enum ComposePS {
                     name: (config?["name"] as? String) ?? id, id: id,
                     service: labels[ComposeScope.serviceLabel] ?? "",
                     image: ((config?["image"] as? [String: Any])?["reference"] as? String) ?? "",
-                    state: normalizeState(status), oneOff: labels[oneOffLabel] == "True"))
+                    state: normalizeState(status), oneOff: labels[oneOffLabel] == "True",
+                    number: Int(labels["com.docker.compose.container-number"] ?? "") ?? 1))
         }
         return result.sorted { ($0.service, $0.name) < ($1.service, $1.name) }
     }
@@ -159,19 +163,34 @@ extension ComposePlanner.Plan {
         return (prefix, String(argument[argument.index(after: colon)...]))
     }
 
-    /// The container for replica `index` (1-based) of `service`, which must be one this project owns.
-    func replicaName(service: String, index: Int, owned: Set<String>) throws -> String {
-        guard let svc = services.first(where: { $0.name == service }) else {
+    /// This project's containers right now (label-scoped; running or not, one-offs included).
+    func projectRows() throws -> [ComposePSRow] {
+        try ComposePS.rows(listJSON: runContainer(["list", "-a", "--format", "json"]), project: project)
+    }
+
+    /// The container for replica `index` (1-based, the container-number label) of `service`, found from the
+    /// project's REAL containers, not the file: `up --scale web=3` is not recorded in the file, so planned
+    /// names would miss `web-2`. Only this project's containers are ever considered.
+    func replicaName(service: String, index: Int, rows: [ComposePSRow]) throws -> String {
+        guard services.contains(where: { $0.name == service }) else {
             throw ComposeError.invalid("no such service: \(service)")
         }
-        let names = Self.plannedContainerNames(svc)
-        guard index >= 1, index <= names.count else {
-            throw ComposeError.invalid("service \(service) has \(names.count) instance(s); --index \(index) is out of range")
+        let mine = rows.filter { $0.service == service && !$0.oneOff }.sorted { $0.number < $1.number }
+        guard !mine.isEmpty else { throw ComposeError.invalid("service \(service) has no container (is it up?)") }
+        guard let found = mine.first(where: { $0.number == index }) else {
+            throw ComposeError.invalid(
+                "service \(service) has \(mine.count) instance(s) (\(mine.map { String($0.number) }.joined(separator: ", "))); --index \(index) does not exist")
         }
-        guard owned.contains(names[index - 1]) else {
-            throw ComposeError.invalid("service \(service) has no container (is it up?)")
-        }
-        return names[index - 1]
+        return found.name
+    }
+
+    /// The project's real containers for `names` (all services when empty), in service-file order then replica
+    /// number. One-offs are left out unless `includeOneOffs`. Unknown service names are an error.
+    func containers(of names: [String], in rows: [ComposePSRow], includeOneOffs: Bool = false) throws -> [ComposePSRow] {
+        let wanted = Set(try selecting(names, withDependencies: false).services.map(\.name))
+        let order = Dictionary(uniqueKeysWithValues: services.enumerated().map { ($1.name, $0) })
+        return rows.filter { (includeOneOffs || !$0.oneOff) && (names.isEmpty || wanted.contains($0.service)) }
+            .sorted { (order[$0.service] ?? Int.max, $0.number, $0.name) < (order[$1.service] ?? Int.max, $1.number, $1.name) }
     }
 
     /// `config --format json`: the same facts as the text summary, machine-readable.
@@ -195,7 +214,7 @@ extension ComposePlanner.Plan {
 
     /// `compose cp SERVICE:SRC DEST` / `compose cp SRC SERVICE:DEST` as the `container copy` arguments.
     /// Exactly one side must be a service; `index` picks the replica (1-based).
-    func copyArguments(source: String, destination: String, index: Int, owned: Set<String>) throws -> (String, String) {
+    func copyArguments(source: String, destination: String, index: Int, rows: [ComposePSRow]) throws -> (String, String) {
         let from = serviceReference(source)
         let to = serviceReference(destination)
         switch (from, to) {
@@ -207,10 +226,10 @@ extension ComposePlanner.Plan {
             break
         }
         if let from {
-            return ("\(try replicaName(service: from.service, index: index, owned: owned)):\(from.path)", destination)
+            return ("\(try replicaName(service: from.service, index: index, rows: rows)):\(from.path)", destination)
         }
         let to2 = to!
-        return (source, "\(try replicaName(service: to2.service, index: index, owned: owned)):\(to2.path)")
+        return (source, "\(try replicaName(service: to2.service, index: index, rows: rows)):\(to2.path)")
     }
 
     /// Images `down --rmi` removes. `local` is only the images compose built itself (the auto-named
@@ -295,10 +314,10 @@ enum ComposeLogs {
         return name.padding(toLength: max(width, name.count), withPad: " ", startingAt: 0) + "  | " + line
     }
 
-    /// Containers to read, in service order then replica order, only those that exist.
-    static func targets(plan: ComposePlanner.Plan, services: [String], owned: Set<String>) throws -> [String] {
-        try plan.selecting(services, withDependencies: false).services
-            .flatMap { ComposePlanner.Plan.plannedContainerNames($0) }.filter { owned.contains($0) }
+    /// Containers to read: the project's real containers for `services` (all when empty), in service order
+    /// then replica number, never one-offs.
+    static func targets(plan: ComposePlanner.Plan, services: [String], rows: [ComposePSRow]) throws -> [String] {
+        try plan.containers(of: services, in: rows).map(\.name)
     }
 }
 

@@ -356,8 +356,8 @@ extension ContainerCompose {
 
         func run() async throws {
             let plan = try ContainerCompose.loadPlan(shared)
-            let owned = try plan.projectContainerNames()
-            let (from, to) = try plan.copyArguments(source: source, destination: destination, index: index, owned: owned)
+            let (from, to) = try plan.copyArguments(
+                source: source, destination: destination, index: index, rows: plan.projectRows())
             try runContainerStreaming(["copy", from, to])
         }
     }
@@ -387,9 +387,7 @@ extension ContainerCompose {
 
         func run() async throws {
             let plan = try ContainerCompose.loadPlan(shared)
-            let owned = try plan.projectContainerNames()
-            let names = try plan.selecting(services, withDependencies: false).services
-                .flatMap { ComposePlanner.Plan.plannedContainerNames($0) }.filter { owned.contains($0) }
+            let names = try plan.containers(of: services, in: plan.projectRows()).map(\.name)
             guard !names.isEmpty else { throw ComposeError.invalid("compose wait: no containers to wait for (is the project up?)") }
             try runContainerStreaming(["wait"] + names)
         }
@@ -437,7 +435,7 @@ extension ContainerCompose {
 
         func run() async throws {
             let plan = try ContainerCompose.loadPlan(shared)
-            let name = try plan.replicaName(service: service, index: index, owned: plan.projectContainerNames())
+            let name = try plan.replicaName(service: service, index: index, rows: plan.projectRows())
             var args = ["export"]
             if let output { args += ["--output", output] }
             try runContainerStreaming(args + [name])
@@ -463,8 +461,7 @@ extension ContainerCompose {
 
         func run() async throws {
             let plan = try ContainerCompose.loadPlan(shared)
-            let owned = try plan.projectContainerNames()
-            let names = try ComposeLogs.targets(plan: plan, services: services, owned: owned)
+            let names = try ComposeLogs.targets(plan: plan, services: services, rows: plan.projectRows())
             guard !names.isEmpty else { throw ComposeError.invalid("compose logs: no containers to read (is the project up?)") }
             func args(_ name: String) -> [String] {
                 var args = ["logs"]
@@ -525,7 +522,7 @@ extension ContainerCompose {
             guard !command.isEmpty else {
                 throw ComposeError.invalid("compose exec requires a command")
             }
-            let name = try plan.replicaName(service: service, index: index, owned: plan.projectContainerNames())
+            let name = try plan.replicaName(service: service, index: index, rows: plan.projectRows())
             try runContainerStreaming(
                 ComposeExec.arguments(
                     container: name, command: command, detach: detach, env: env, user: user, workdir: workdir,
@@ -657,16 +654,9 @@ extension ContainerCompose {
     /// verbs include `rm -f` and `kill`. Services with no container yet are skipped, as Docker
     /// does, rather than failing the whole command.
     static func targets(plan: ComposePlanner.Plan, services: [String]) throws -> [String] {
-        let owned = try plan.projectContainerNames()
-        if services.isEmpty {
-            return owned.sorted()
-        }
-        return try services.flatMap { name -> [String] in
-            guard let svc = plan.services.first(where: { $0.name == name }) else {
-                throw ComposeError.invalid("unknown service \(name)")
-            }
-            return ComposePlanner.Plan.plannedContainerNames(svc).filter { owned.contains($0) }
-        }
+        // From the project's real containers (by label), not planned names: `up --scale web=3` is not in the
+        // file, so planned names would miss web-2 and web-3. No services means every container, one-offs too.
+        try plan.containers(of: services, in: plan.projectRows(), includeOneOffs: services.isEmpty).map(\.name)
     }
 
     static func loadPlan(_ shared: SharedOptions) throws -> ComposePlanner.Plan {
