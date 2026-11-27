@@ -94,6 +94,13 @@ extension Application {
                 } catch {
                     log.warning("failed to wait for all containers", metadata: ["error": "\(error)"])
                 }
+            } else {
+                // An apiserver that does not answer is exactly the one that still needs removing: it is a launchd
+                // job, so it outlives whatever started it. The cleanup below skips this label on the assumption
+                // that the branch above handled it, so without this a wedged apiserver was the one service
+                // `system stop` never booted out, and it kept answering nothing for every command after.
+                log.info("stopping unresponsive service", metadata: ["label": "\(fullLabel)"])
+                try? ServiceManager.deregister(fullServiceLabel: fullLabel)
             }
 
             // Note: The assumption here is that we would have registered the launchd services

@@ -476,8 +476,8 @@ endef
 # SAFETY note (the lifecycle script only touches uniquely named resources and label-scoped prunes).
 .PHONY: parity-cli-surface
 parity-cli-surface:
-	@chmod +x scripts/parity/cli-surface.sh scripts/parity/compose-matrix-drift.sh
-	@BIN_DIR="$(BUILD_BIN_DIR)" bash scripts/parity/cli-surface.sh
+	@chmod +x scripts/parity/with-timeout.sh scripts/parity/cli-surface.sh scripts/parity/compose-matrix-drift.sh
+	@BIN_DIR="$(BUILD_BIN_DIR)" bash scripts/parity/with-timeout.sh "$${PARITY_SURFACE_TIMEOUT:-600}" bash scripts/parity/cli-surface.sh
 	@bash scripts/parity/compose-matrix-drift.sh
 
 # Self-contained and ISOLATED: like `make integration`, this stops any running system, starts a
@@ -487,8 +487,20 @@ parity-cli-surface:
 # developer's volumes.) It does not depend on `container`: it tests the installed bin/ (CI builds
 # it earlier in the same job; locally run `make container` first). Locally this leaves the
 # system stopped afterwards, exactly as `make integration` does.
+# Runs BEFORE anything else in parity-behavioral (prerequisites run left to right; do not use make -j here).
+# A container apiserver is a launchd job, so it outlives the process that started it. A job that was cancelled
+# while the apiserver was wedged left it behind, and then every later `container` command, including the
+# `--help` that parity-cli-surface runs, blocked on it, so `system stop` was never reached. This talks to
+# launchd directly, so it works whether or not the apiserver answers. It stops this user's container
+# services, which parity-behavioral does anyway, so it carries the same isolated-APP_ROOT guard.
+.PHONY: parity-clean-slate
+parity-clean-slate:
+	@test -n "$(strip $(APP_ROOT))" || { echo "parity-behavioral refuses to run against the default system: set APP_ROOT to an isolated directory" >&2; exit 2; }
+	@echo "Removing container services left by an earlier run (a wedged apiserver survives a cancelled job)"
+	@scripts/ensure-container-stopped.sh
+
 .PHONY: parity-behavioral
-parity-behavioral: parity-cli-surface
+parity-behavioral: parity-clean-slate parity-cli-surface
 	@test -x "$(ROOT_DIR)/bin/container" || { echo "bin/container not installed: run 'make container' first" >&2; exit 2; }
 	@test -x "$(ROOT_DIR)/bin/docker" || { echo "bin/docker not installed: run 'make container' first" >&2; exit 2; }
 	@test -n "$(strip $(APP_ROOT))" || { echo "parity-behavioral refuses to run against the default system: set APP_ROOT to an isolated directory" >&2; exit 2; }
