@@ -497,7 +497,12 @@ parity-behavioral: parity-cli-surface
 	@bin/container system stop || true
 	@sleep 3 && scripts/ensure-container-stopped.sh
 	@mkdir -p "$(APP_ROOT)"
-	@bin/container --debug system start --timeout 60 --enable-kernel-install $(SYSTEM_START_OPTS) && \
+	@bash scripts/parity/with-timeout.sh "$${PARITY_START_TIMEOUT:-300}" bin/container --debug system start --timeout 60 --enable-kernel-install $(SYSTEM_START_OPTS) || { \
+		echo "container system start failed or timed out; the helpers' own logs follow" >&2 ; \
+		if [ -n "$(LOG_ROOT)" ] ; then for f in "$(LOG_ROOT)"/*.log ; do [ -f "$$f" ] && { echo "== $$f (last 25 lines of $$(wc -l < "$$f"))" ; tail -n 25 "$$f" ; } ; done ; fi ; \
+		scripts/ensure-container-stopped.sh ; \
+		exit 1 ; \
+	} && \
 	{ \
 		export CONTAINER_APP_ROOT="$(APP_ROOT)" CONTAINER_BIN="$(ROOT_DIR)/bin/container" DOCKER_BIN="$(ROOT_DIR)/bin/docker" BRIDGE_BIN="$(BUILD_BIN_DIR)/container-docker-api-bridge" ; \
 		export COMPOSE_SKIP_PRODUCTION="$${COMPOSE_SKIP_PRODUCTION:-1}" COMPOSE_SKIP_NFS="$${COMPOSE_SKIP_NFS:-1}" ; \

@@ -166,8 +166,28 @@ public actor NetworksService {
             try await self.registerService(configuration: configuration)
             let client = try Self.getClient(configuration: configuration)
 
-            // Ensure the network is running
-            let networkStatus = try await client.status()
+            // Ensure the network is running. If the helper never answers it is still registered with launchd,
+            // which keeps restarting it, so take it back out before reporting the failure.
+            let networkStatus: NetworkStatus
+            do {
+                networkStatus = try await client.status()
+            } catch {
+                do {
+                    try await self.deregisterService(configuration: configuration)
+                } catch {
+                    self.log.error(
+                        "failed to deregister network service after it did not start",
+                        metadata: [
+                            "id": "\(configuration.id)",
+                            "error": "\(error.localizedDescription)",
+                        ])
+                }
+                throw ContainerizationError(
+                    .internalError,
+                    message:
+                        "network \(configuration.id) did not start: \(error). The helper's own log (container system logs) says why; a vmnet failure is reported there."
+                )
+            }
 
             let finalConfiguration = try NetworkConfiguration(
                 name: configuration.name,
