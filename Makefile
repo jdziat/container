@@ -510,7 +510,12 @@ parity-behavioral: parity-clean-slate parity-cli-surface
 	@sleep 3 && scripts/ensure-container-stopped.sh
 	@mkdir -p "$(APP_ROOT)"
 	@bash scripts/parity/with-timeout.sh "$${PARITY_START_TIMEOUT:-300}" bin/container --debug system start --timeout 60 --enable-kernel-install $(SYSTEM_START_OPTS) || { \
-		echo "container system start failed or timed out; the helpers' own logs follow" >&2 ; \
+		echo "container system start failed or timed out; host vmnet state, then the helpers' own logs, follow" >&2 ; \
+		echo "== host vmnet interfaces: $$(ifconfig -l | tr ' ' '\n' | grep -cE '^(bridge|vmenet|vmnet)') ($$(ifconfig -l | tr ' ' '\n' | grep -E '^(bridge|vmenet|vmnet)' | tr '\n' ' '))" >&2 ; \
+		echo "== container-network-vmnet helpers by user (a second user's networks share the host's vmnet):" >&2 ; \
+		ps -eo user,command | grep '[c]ontainer-network-vmnet start' | awk '{print $$1}' | sort | uniq -c >&2 ; \
+		echo "== this user's launchd view of the vmnet helpers:" >&2 ; \
+		launchctl list 2>/dev/null | grep -E 'container-network-vmnet' >&2 || true ; \
 		if [ -n "$(LOG_ROOT)" ] ; then for f in "$(LOG_ROOT)"/*.log ; do [ -f "$$f" ] && { echo "== $$f (last 25 lines of $$(wc -l < "$$f"))" ; tail -n 25 "$$f" ; } ; done ; fi ; \
 		scripts/ensure-container-stopped.sh ; \
 		exit 1 ; \
