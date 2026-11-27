@@ -39,7 +39,13 @@ parent=$$
 "$@" &
 child=$!
 (
-  sleep "${limit}"
+  # The sleep must NOT inherit our stdout/stderr. If it did, then when the command finishes first and the
+  # watchdog is killed, the orphaned sleep would keep the caller's pipe open for the whole limit, and a
+  # `with-timeout.sh ... | grep` would not see end-of-file until it expired.
+  sleep "${limit}" >/dev/null 2>&1 </dev/null &
+  sleeper=$!
+  trap 'kill "${sleeper}" 2>/dev/null; exit 0' TERM
+  wait "${sleeper}"
   if kill -0 "${child}" 2>/dev/null; then
     kill -USR1 "${parent}" 2>/dev/null
     echo "with-timeout: '$*' exceeded ${limit}s; killing it and its children" >&2
@@ -62,7 +68,7 @@ while [[ "${status}" -ge 128 ]] && kill -0 "${child}" 2>/dev/null; do
   wait "${child}"
   status=$?
 done
-kill "${watchdog}" 2>/dev/null
+kill -TERM "${watchdog}" 2>/dev/null
 wait "${watchdog}" 2>/dev/null
 [[ "${timed_out}" == 1 ]] && exit 124
 exit "${status}"
