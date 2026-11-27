@@ -502,7 +502,7 @@ parity-behavioral: parity-cli-surface
 		export CONTAINER_APP_ROOT="$(APP_ROOT)" CONTAINER_BIN="$(ROOT_DIR)/bin/container" DOCKER_BIN="$(ROOT_DIR)/bin/docker" BRIDGE_BIN="$(BUILD_BIN_DIR)/container-docker-api-bridge" ; \
 		export COMPOSE_SKIP_PRODUCTION="$${COMPOSE_SKIP_PRODUCTION:-1}" COMPOSE_SKIP_NFS="$${COMPOSE_SKIP_NFS:-1}" ; \
 		rc=0 ; \
-		for h in $(if $(strip $(PARITY_HARNESSES)),$(PARITY_HARNESSES),t2-docker-corpus t3-compose-corpus t2-bridge-streams t2-bridge-hostconfig t2-bridge-lifecycle) ; do \
+		for h in $(if $(strip $(PARITY_HARNESSES)),$(PARITY_HARNESSES),net-churn t2-docker-corpus t3-compose-corpus t2-bridge-streams t2-bridge-hostconfig t2-bridge-lifecycle) ; do \
 			echo "==> $$h" ; \
 			lim="$${PARITY_HARNESS_TIMEOUT:-3600}" ; \
 			if [ "$$h" = t3-compose-corpus ] ; then lim="$${PARITY_T3_TIMEOUT:-14400}" ; fi ; \
