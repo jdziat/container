@@ -65,7 +65,8 @@ extension Application {
         public func run() async throws {
             let containerSystemConfig: ContainerSystemConfig = try await ClientHealthCheck.loadContainerSystemConfig()
             var exitCode: Int32 = 127
-            let id = Utility.createContainerID(name: self.managementFlags.name)
+            let identity = Utility.createContainerIdentity(name: self.managementFlags.name)
+            let id = identity.id
 
             let progressConfig = try self.progressFlags.makeConfig(
                 showTasks: true,
@@ -80,17 +81,36 @@ extension Application {
             }
             progress.start()
 
-            guard ManagedContainer.nameValid(id) else {
-                throw ContainerizationError(.invalidArgument, message: "container ID \(id) is not a valid container ID")
+            // Validate only user-supplied --name. Generated UUID ids always pass nameValid.
+            if self.managementFlags.name != nil {
+                guard ManagedContainer.nameValid(identity.name) else {
+                    throw ContainerizationError(
+                        .invalidArgument,
+                        message: "container name \(identity.name) is not a valid container name")
+                }
             }
 
-            // Check if container with id already exists.
+            // Check if container with this Id or Name already exists.
             let client = ContainerClient()
-            let existing = try? await client.get(id: id)
-            guard existing == nil else {
+            let existing = try await client.list(filters: ContainerListFilters())
+            if let conflict = existing.first(where: {
+                $0.configuration.id == id
+                    || $0.configuration.name == id
+                    || $0.configuration.name == identity.name
+                    || $0.configuration.id == identity.name
+            }) {
+                if conflict.configuration.id == id {
+                    throw ContainerizationError(
+                        .exists,
+                        message: "container with id \(conflict.configuration.id) already exists"
+                    )
+                }
+                let claimed =
+                    conflict.configuration.name == id || conflict.configuration.id == id
+                    ? id : identity.name
                 throw ContainerizationError(
                     .exists,
-                    message: "container with id \(id) already exists"
+                    message: "container name \(claimed) already in use by \(conflict.configuration.id)"
                 )
             }
 

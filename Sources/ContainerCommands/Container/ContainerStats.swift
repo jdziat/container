@@ -31,8 +31,8 @@ extension Application {
         @Argument(help: "Container ID or name (optional, shows all running containers if not specified)")
         var containers: [String] = []
 
-        @Option(name: .long, help: "Format of the output")
-        var format: ListFormat = .table
+        @Option(name: .long, help: "Format of the output: json, table, yaml, toml, or a Go template such as '{{.Name}} {{.CPUPerc}}'")
+        var format: FormatArgument = .table
 
         @Flag(name: .long, help: "Disable streaming stats and only pull the first result")
         var noStream = false
@@ -43,7 +43,7 @@ extension Application {
         public init() {}
 
         public func run() async throws {
-            if format != .table || noStream {
+            if format.template != nil || format.listFormat != .table || noStream {
                 // Static mode - get stats once and exit
                 try await runStatic()
             } else {
@@ -87,22 +87,20 @@ extension Application {
                 // No containers specified - show all running containers
                 containersToShow = try await client.list(filters: ContainerListFilters(status: .running))
             } else {
-                // Fetch specified containers by ID
-                containersToShow = try await client.list(filters: ContainerListFilters(ids: containers))
-                // Validate all specified containers were found
-                for containerId in containers {
-                    guard containersToShow.contains(where: { $0.id == containerId }) else {
-                        throw ContainerizationError(
-                            .notFound,
-                            message: "no such container: \(containerId)"
-                        )
-                    }
-                }
+                // Resolve Id or Name client-side (server ids filter is Id-only).
+                let (found, notFound) = try await client.findContainers(
+                    named: containers, filters: ContainerListFilters())
+                if let first = notFound.first { throw first }
+                containersToShow = found
             }
 
             let statsData = try await Self.collectStats(client: client, for: containersToShow)
 
-            try Output.render(payload: statsData.map { StatsReport(snapshot: $0) }, format: format) {
+            if let template = format.template {
+                Output.emit(try GoTemplate.render(template, rows: Self.dockerRows(statsData)))
+                return
+            }
+            try Output.render(payload: statsData.map { StatsReport(snapshot: $0) }, format: format.listFormat) {
                 Self.statsTable(statsData)
             }
         }
@@ -110,17 +108,13 @@ extension Application {
         private static func runStreaming(containerIds: [String]) async throws {
             let client = ContainerClient()
 
-            // If containers were specified, validate they all exist upfront
+            // If containers were specified, validate they all exist upfront (Id or Name).
+            var resolvedIds = containerIds
             if !containerIds.isEmpty {
-                let specifiedContainers = try await client.list(filters: ContainerListFilters(ids: containerIds))
-                for containerId in containerIds {
-                    guard specifiedContainers.contains(where: { $0.id == containerId }) else {
-                        throw ContainerizationError(
-                            .notFound,
-                            message: "no such container: \(containerId)"
-                        )
-                    }
-                }
+                let (found, notFound) = try await client.findContainers(
+                    named: containerIds, filters: ContainerListFilters())
+                if let first = notFound.first { throw first }
+                resolvedIds = found.map { $0.id }
             }
 
             clearScreen()
@@ -130,10 +124,10 @@ extension Application {
             while true {
                 do {
                     let containersToShow: [ContainerSnapshot]
-                    if containerIds.isEmpty {
+                    if resolvedIds.isEmpty {
                         containersToShow = try await client.list(filters: ContainerListFilters(status: .running))
                     } else {
-                        containersToShow = try await client.list(filters: ContainerListFilters(ids: containerIds))
+                        containersToShow = try await client.list(filters: ContainerListFilters(ids: resolvedIds))
                     }
 
                     let statsData = try await collectStats(client: client, for: containersToShow)
@@ -317,6 +311,33 @@ extension Application {
                 return String(format: "%.2f MiB", value / mib)
             } else {
                 return String(format: "%.2f KiB", value / kib)
+            }
+        }
+
+        /// Rows shaped like `docker stats --format`: `.Name`, `.ID`, `.CPUPerc`, `.MemUsage`, `.MemPerc`,
+        /// `.NetIO`, `.BlockIO`, `.PIDs`. Values are formatted exactly as the table prints them.
+        static func dockerRows(_ statsData: [StatsSnapshot]) -> [Any] {
+            let na = "--"
+            return statsData.map { snapshot -> Any in
+                let s = snapshot.stats2
+                func pair(_ a: UInt64?, _ b: UInt64?) -> String {
+                    "\(a.map { formatBytes($0) } ?? na) / \(b.map { formatBytes($0) } ?? na)"
+                }
+                var memPerc = na
+                if let used = s.memoryUsageBytes, let limit = s.memoryLimitBytes, limit > 0 {
+                    memPerc = String(format: "%.2f%%", Double(used) / Double(limit) * 100.0)
+                }
+                return [
+                    "Name": snapshot.container.configuration.name,
+                    "Container": snapshot.container.id,
+                    "ID": snapshot.container.id,
+                    "CPUPerc": snapshot.cpuUtilization.map { String(format: "%.2f%%", $0 * 100.0) } ?? na,
+                    "MemUsage": pair(s.memoryUsageBytes, s.memoryLimitBytes),
+                    "MemPerc": memPerc,
+                    "NetIO": pair(s.networkRxBytes, s.networkTxBytes),
+                    "BlockIO": pair(s.blockReadBytes, s.blockWriteBytes),
+                    "PIDs": s.numProcesses.map { "\($0)" } ?? na,
+                ] as [String: Any]
             }
         }
 

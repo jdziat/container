@@ -1,0 +1,15 @@
+name: corpus-bind
+services:
+  app:
+    image: docker.io/library/alpine:3.20
+    working_dir: /app
+    command: ["sh", "-c", "ls -la /app /data && sleep 20"]
+    volumes:
+      - type: bind
+        source: ./data
+        target: /app
+      - type: volume
+        source: named
+        target: /data
+volumes:
+  named:

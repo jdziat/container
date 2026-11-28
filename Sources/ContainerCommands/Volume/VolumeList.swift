@@ -29,7 +29,7 @@ extension Application.VolumeCommand {
         )
 
         @Option(name: .long, help: "Format of the output")
-        var format: ListFormat = .table
+        var format: FormatArgument = .table
 
         @Flag(name: .shortAndLong, help: "Only output the volume name")
         var quiet: Bool = false
@@ -42,7 +42,7 @@ extension Application.VolumeCommand {
         public func run() async throws {
             let volumes = try await ClientVolume.list()
             let volumeResources = volumes.map { VolumeResource(configuration: $0) }
-            try Output.render(payload: volumeResources, display: volumeResources, format: format, quiet: quiet)
+            try format.render(payload: volumeResources, display: volumeResources, quiet: quiet)
         }
     }
 }

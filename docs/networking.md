@@ -93,12 +93,12 @@ container stop http-server
 > [!NOTE]
 > On the `default` network, prefer a domain-qualified name (`http-server.test` above)
 > after `container system dns create`. On a **custom** network (`container network create`),
-> Compose-style **bare** names are injected into each guest's `/etc/hosts` for peers that
-> share a custom network (hostname plus `--network ...,alias=` names). Entries are written
-> at bootstrap and refreshed in already-running guests when containers join or leave the
-> network. Full network-scoped DNS remains tracked as
-> [apple/container#1809](https://github.com/apple/container/issues/1809). See also
-> [apple/container#856](https://github.com/apple/container/issues/856).
+> Compose-style **bare** names (hostname plus `--network ...,alias=` names, including
+> single-label aliases) are injected into each guest's `/etc/hosts` and served by an
+> in-guest `hosts-dns` helper on `127.0.0.1:53` so `nslookup` and getaddrinfo both work.
+> Entries are written at bootstrap and refreshed in already-running guests when containers
+> join or leave the network ([apple/container#1809](https://github.com/apple/container/issues/1809)).
+> See also [apple/container#856](https://github.com/apple/container/issues/856).
 
 ## Forward traffic from `localhost` to your container
 
@@ -196,7 +196,7 @@ An alias that contains `*` is rejected. Use the leading-dot form instead, which 
 ### Rules for aliases
 
 * A name with a leading dot must be below a name that the same network attachment owns, which is its own hostname or one of its exact aliases. `gateway.test` with `.gateway.test` is allowed. `.apps.test` on a container that has no `apps.test` name is not.
-* An exact alias needs at least two labels, such as `api.test`, and the part after the leading dot of a subtree alias needs at least two labels too. A name with a single label is not under any domain, so macOS would never send queries for it to the container DNS service. When a default DNS domain is configured, a name without a dot gets the domain, as described above. When none is configured, `api` and `.test` are rejected.
+* An exact alias may be a single label (`api`) so Compose-style network aliases resolve between guests via `/etc/hosts` and hosts-dns without a default domain. The part after the leading dot of a subtree alias still needs at least two labels. When a default DNS domain is configured, a name without a dot gets the domain, as described above. Single-label aliases are not reachable from macOS unless you register a covering domain.
 * Every exact name is unique across all containers, whether they are running or stopped. A new container cannot use an alias or a hostname that another container already has, and an alias cannot match another container's name.
 * A container can have at most 32 aliases for each network.
 * Aliases are fixed when the container is created.

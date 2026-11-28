@@ -418,4 +418,114 @@ public struct ContainersHarness: Sendable {
         try await service.clean(id: id)
         return message.reply()
     }
+
+    @Sendable
+    public func events(_ message: XPCMessage) async throws -> XPCMessage {
+        let since = message.uint64(key: .eventSince)
+        let events = await service.events(since: since)
+        let data = try JSONEncoder().encode(events)
+        let reply = message.reply()
+        reply.set(key: .containerEvents, value: data)
+        return reply
+    }
+
+    @Sendable
+    public func rename(_ message: XPCMessage) async throws -> XPCMessage {
+        let id = message.string(key: .id)
+        guard let id else {
+            throw ContainerizationError(.invalidArgument, message: "id cannot be empty")
+        }
+        let newName = message.string(key: .newName)
+        guard let newName else {
+            throw ContainerizationError(.invalidArgument, message: "new name cannot be empty")
+        }
+        try await service.rename(idOrName: id, newName: newName)
+        return message.reply()
+    }
+
+    @Sendable
+    public func update(_ message: XPCMessage) async throws -> XPCMessage {
+        let id = message.string(key: .id)
+        guard let id else {
+            throw ContainerizationError(.invalidArgument, message: "id cannot be empty")
+        }
+        guard let data = message.dataNoCopy(key: .updateConfig) else {
+            throw ContainerizationError(.invalidArgument, message: "update config cannot be empty")
+        }
+        let request = try JSONDecoder().decode(ContainerUpdateRequest.self, from: data)
+        try await service.update(idOrName: id, request: request)
+        return message.reply()
+    }
+
+    @Sendable
+    public func pause(_ message: XPCMessage) async throws -> XPCMessage {
+        let id = message.string(key: .id)
+        guard let id else {
+            throw ContainerizationError(.invalidArgument, message: "id cannot be empty")
+        }
+        try await service.pause(idOrName: id)
+        return message.reply()
+    }
+
+    @Sendable
+    public func unpause(_ message: XPCMessage) async throws -> XPCMessage {
+        let id = message.string(key: .id)
+        guard let id else {
+            throw ContainerizationError(.invalidArgument, message: "id cannot be empty")
+        }
+        try await service.unpause(idOrName: id)
+        return message.reply()
+    }
+
+    @Sendable
+    public func diff(_ message: XPCMessage) async throws -> XPCMessage {
+        let id = message.string(key: .id)
+        guard let id else {
+            throw ContainerizationError(.invalidArgument, message: "id cannot be empty")
+        }
+        let changes = try await service.diff(idOrName: id)
+        let data = try JSONEncoder().encode(changes)
+        let reply = message.reply()
+        reply.set(key: .containerDiff, value: data)
+        return reply
+    }
+
+    @Sendable
+    public func networkConnect(_ message: XPCMessage) async throws -> XPCMessage {
+        let id = message.string(key: .id)
+        guard let id else {
+            throw ContainerizationError(.invalidArgument, message: "id cannot be empty")
+        }
+        let network = message.string(key: .networkId)
+        guard let network else {
+            throw ContainerizationError(.invalidArgument, message: "network cannot be empty")
+        }
+        let aliases: [String]
+        if let data = message.dataNoCopy(key: .networkAliases) {
+            aliases = try JSONDecoder().decode([String].self, from: data)
+        } else {
+            aliases = []
+        }
+        let restart = message.bool(key: .restartIfRunning)
+        try await service.networkConnect(
+            idOrName: id, network: network, aliases: aliases, restartIfRunning: restart)
+        return message.reply()
+    }
+
+    @Sendable
+    public func networkDisconnect(_ message: XPCMessage) async throws -> XPCMessage {
+        let id = message.string(key: .id)
+        guard let id else {
+            throw ContainerizationError(.invalidArgument, message: "id cannot be empty")
+        }
+        let network = message.string(key: .networkId)
+        guard let network else {
+            throw ContainerizationError(.invalidArgument, message: "network cannot be empty")
+        }
+        let restart = message.bool(key: .restartIfRunning)
+        let force = message.bool(key: .forceDelete)
+        try await service.networkDisconnect(
+            idOrName: id, network: network, restartIfRunning: restart, force: force)
+        return message.reply()
+    }
 }

@@ -34,8 +34,7 @@ total 4
 ## Named volumes
 
 Named volumes offer complementary features to bind mounts. Use a named volume when you
-don't need to share data with the host filesystem, and you want better I/O performance
-than a bind mount provides.
+want Compose-/Docker-shaped named storage with a managed host path and lifecycle.
 
 Create a named volume with `container volume create`:
 
@@ -43,11 +42,19 @@ Create a named volume with `container volume create`:
 container volume create foo
 ```
 
-By default, a volume uses a journaled `ext4` filesystem. Configure the journal mode and
-size at creation time with `--opt`:
+**Default (shared virtiofs):** local named volumes are a host directory under the volume
+store (`…/volumes/<name>/_data`) mounted into each guest via virtiofs. Multiple containers
+can mount the same volume read-write (e.g. Nextcloud app + cron). See
+[L2 strategy lock](plans/2026-11-21-l2-strategy-lock.md).
+
+**Optional exclusive block plane:** for a journaled `ext4` disk image (single-writer
+virtio-blk), pass `--opt backend=block` and optional size/journal opts:
 
 ```bash
-# ordered journaling (default)
+# exclusive virtio-blk (single-writer)
+container volume create --opt backend=block myvolume
+
+# ordered journaling (implies block)
 container volume create --opt journal=ordered myvolume
 
 # writeback journaling with a 64 MiB journal
@@ -64,7 +71,7 @@ container volume list
 container volume delete foo
 ```
 
-Show a volume's configuration, including its size and the path to its backing image:
+Show a volume's configuration, including its host path:
 
 ```bash
 container volume inspect foo
@@ -76,7 +83,7 @@ container volume inspect foo
     "configuration" : {
       "creationDate" : "2026-08-10T21:39:10Z",
       "driver" : "local",
-      "format" : "ext4",
+      "format" : "directory",
       "labels" : {
 
       },
@@ -84,16 +91,15 @@ container volume inspect foo
       "options" : {
 
       },
-      "sizeInBytes" : 549755813888,
-      "source" : "\/Users\/fido\/Library\/Application Support\/com.apple.container\/volumes\/foo\/volume.img"
+      "source" : "\/Users\/fido\/Library\/Application Support\/com.apple.container\/volumes\/foo\/_data"
     },
     "id" : "foo"
   }
 ]
 ```
 
-A volume's image is sparse, so `sizeInBytes` reports the size the volume can grow to —
-512 GiB by default — rather than the space it currently occupies on disk.
+A block-backed volume's image is sparse, so `sizeInBytes` reports the size the volume can
+grow to — 512 GiB by default — rather than the space it currently occupies on disk.
 
 Remove every volume that has no container referencing it:
 
@@ -211,12 +217,13 @@ Mount-time options go on `container run` or `container create`, using `--mount`,
 
 | Key | Values | Applies to | Description |
 |---|---|---|---|
-| `type` | `bind` (alias `virtiofs`), `volume`, `tmpfs` | — | The kind of mount to create. Defaults to a bind mount. |
-| `source`, `src` | host path, or volume name | bind mounts, named volumes | The host directory to share, or the name of the volume to mount. Omit it for a tmpfs mount, or to get an [anonymous volume](#anonymous-volumes). |
+| `type` | `bind` (alias `virtiofs`), `volume`, `tmpfs`, `nfs` | — | The kind of mount to create. Defaults to a bind mount. |
+| `source`, `src` | host path, volume name, or NFS export | bind, volume, nfs | Host path (file or directory), volume name, or NFS export path. Omit for tmpfs or anonymous volumes. |
 | `destination`, `dst`, `target` | absolute container path | all | Where the mount appears inside the container. |
 | `readonly`, `ro` | key only, no value | all | Mount read-only. |
 | `size` | for example `512M`, `1G` | tmpfs only | Upper bound on the guest memory the mount can consume. |
 | `mode` | octal, for example `1777` | tmpfs only | Permission bits for the mount point, the same as `chmod`. |
+| `addr`, `nfsvers`, `vers`, `proto`, `soft`, `hard`, … | Docker NFS option shape | nfs only | Passed through to the guest `mount -t nfs` call. |
 
 ### Options for `--volume`
 
@@ -251,4 +258,76 @@ container run --rm --tmpfs /tmpfsmount1:size=64M,mode=1777 alpine sh
 |---|---|---|
 | `size` | for example `10g` | Size of the volume's filesystem image, fixed at creation time. |
 | `journal` | `ordered` (default), `writeback`, `journal`, each optionally as `<mode>:<size>` | The `ext4` journal mode, and optionally the journal size — for example `writeback:64m`. |
+
+## NFS mounts
+
+NFS uses a **guest NFS client** inside each per-container VM (same user-facing contract as
+Docker `--mount type=nfs,...`). The host does not mount NFS on behalf of the container.
+
+```bash
+container run --rm \
+  --mount type=nfs,source=/export,destination=/data,addr=192.0.2.10,nfsvers=4 \
+  alpine ls /data
+```
+
+Compose can declare `type: nfs` or a named volume with `driver: nfs` and `driver_opts`
+(`device`, `o=addr=...`). The Linux guest image must include NFS client support
+(`nfs-utils` / kernel NFS client); otherwise the mount fails closed with an install
+hint for an NFS-enabled kernel (`container system kernel set`).
+
+**Kernel (L1 — preferred NFS-capable install):** Guest NFS needs `nfs` in
+`/proc/filesystems`. The **stock preferred** install path is the Containerization
+NFS-capable kernel (`CONFIG_NFS_FS` / `CONFIG_NFSD`). `CONTAINER_PREFERRED_KERNEL`
+defaults to `nfs`; `container system kernel set --recommended` and
+`system start` missing-kernel install follow that preference. Set
+`CONTAINER_PREFERRED_KERNEL=kata` for the historic Kata debug tarball (often
+omits `nfs`).
+
+```bash
+# preferred (NFS-capable; default)
+make install-recommended-kernel
+# or:
+container system kernel set --recommended
+make install-nfs-kernel
+
+# packaged helpers
+install-container-recommended-kernel
+install-container-nfs-kernel
+
+# equivalent scripts — clone apple/containerization next to this repo, or set CONTAINERIZATION_ROOT
+./scripts/install-recommended-kernel.sh
+./scripts/install-nfs-kernel.sh
+
+# historic Kata tarball only:
+CONTAINER_PREFERRED_KERNEL=kata container system kernel set --recommended
+
+# or manually:
+make -C /path/to/containerization/kernel
+container system kernel set --arch arm64 --binary /path/to/vmlinux-arm64 --force
+```
+
+Missing NFS in the guest fails closed with an actionable message pointing at the
+preferred install and this section. Preflight: `container compose doctor` warns
+when the Compose file uses NFS mounts and the guest may lack NFS.
+
+**Named volume sharing:** default local volumes use the shared virtiofs directory plane;
+multiple containers may mount the same volume RW. Block-image volumes
+(`--opt backend=block`, or size/journal opts) remain exclusive virtio-blk; create/bootstrap
+refuses a second RW attach. `compose doctor` reports multi-writer mounts as INFO for the
+shared plane. Guest `chown` on virtiofs roots can still fail for some images — prefer a
+data subdirectory (e.g. Postgres `PGDATA`) or pin that volume with `backend: block`.
+Blk hotplug stays fail-closed; virtiofs multi-mount is create-time only. On the CR
+backend, host-directory shares are wired at create time; the directory plane supports
+basic POSIX write/create (`CREATE`/`MKDIR`/`WRITE`/`SETATTR` size·mode·mtime /
+`UNLINK`/`RMDIR`/`RENAME`) against allowlisted host paths.
+
+**Local e2e without host `nfsd`:** start an in-guest server, then run the corpus:
+
+```bash
+eval "$(scripts/parity/nfs-guest-server.sh)"   # sets COMPOSE_NFS_SERVER / COMPOSE_NFS_EXPORT
+make compose-parity                            # fixture 06-nfs uses network nfsnet
+```
+
+Mounts use Docker shape (`addr=`, `nfsvers=`/`vers=`); the runtime rewrites to
+`server:/export` and adds `nolock` when locking helpers are absent.
 

@@ -9,14 +9,14 @@ Decision summary: [cto-parity-decision-2026-11-15.md](cto-parity-decision-2026-1
 | Field | Value |
 |-------|-------|
 | Review date | 2026-11-15 |
-| Tier under review | Scoped packets P0–P7 (not full T1/T2 promotion) |
-| Commit SHA reviewed | `16e8d488ee1d9ede35ab9cf21b9973ffdc9361b3` + working-tree parity implementation |
+| Tier under review | Complete scoped P0–P7 workflow parity (matrix `done` / `done (interim)` / `alias` / `plugin` / `wontfix`) |
+| Artifact reviewed | Uncommitted working tree on base `f16a6867a05610e3754459d6e377df0a5783b92b` (attach, hosts merge, cleanup hook, matrix/docs). |
 | macOS version and hardware | macOS 26.5.1 (25F80), arm64 |
-| `container --version` | `container CLI version 0.0.0 (build: debug, commit: unspeci)` |
+| `container --version` | `container CLI version f16a686 (build: debug)` |
 | Reviewer | CTO persona (org gate style) |
-| Decision | **GO (scoped)** |
+| Decision | **Working-tree CTO GO** for scoped P0–P7 + 2026-11-17 full parity expansion (includes intentional `done (interim)` rows). Nitpick `-fail-on warning`: no findings. Not a release-train SHA GO — commit the harden first. |
 | Failing criteria (if NO-GO) | n/a |
-| Follow-ups and owners | Closed residuals (probe/`service_healthy`, backoff/`on-failure:N`, late-join hosts, attach, bridge subset). Remaining: full #1809 DNS listener; Engine create/build/exec; compose `build:` |
+| Follow-ups and owners | Closed: probe/`service_healthy`, backoff/`on-failure:N`, late-join hosts, attach, bridge interim create/exec/pause/diff, hosts self-identity, cleanup-hook kill, `rename`→Name≠Id `done`. Remaining out of scope: full #1809 DNS; full Engine shapes; compose `build:` |
 
 ## Packets and evidence
 
@@ -26,7 +26,7 @@ Decision summary: [cto-parity-decision-2026-11-15.md](cto-parity-decision-2026-1
 |----------|------------------|--------|----------------|
 | Matrix covers every Docker and Podman command in scope | `docs/parity-matrix.md` | pass | Status legend + lifecycle/images/network/compose/podman tables |
 | Every `done` row corresponds to a command in command reference | `docs/command-reference.md` | pass | Includes `restart`/`wait`/`port`, `--restart`, `--health-cmd*` |
-| No row is `in-progress` or `planned` for the claimed scope | `docs/parity-matrix.md` | pass | `attach` is `done`; `rename` stays `planned` and is not claimed GO |
+| No row is `in-progress` or `planned` for the claimed scope | `docs/parity-matrix.md` | pass | Expansion-track rows are `done` / `done (interim)`; `rename` is `done` (Name≠Id) |
 | T0 harness present | `scripts/parity/t0-core-loop.sh` | pass | Script available; runtime green requires live services |
 | T1 harness present | `scripts/parity/t1-stack-smoke.sh` | pass (interim) | Hosts injection; `PARITY_STRICT_DNS=1` for hard DNS fail |
 | Migration skill and `SKILL.md` match the matrix | `skills/container/` | pass | `commit`, restart/wait/port, custom-network hosts notes |
@@ -82,8 +82,8 @@ Decision summary: [cto-parity-decision-2026-11-15.md](cto-parity-decision-2026-1
 
 | Evidence | Where to find it | Result | Link or output |
 |----------|------------------|--------|----------------|
-| Curated subset + refuse unsupported | `Sources/Plugins/DockerAPIBridge` | pass | Unix socket; create/build/exec still 501 |
-| No core `/var/run/docker.sock` | Diff + matrix `wontfix` | pass | |
+| Curated subset + refuse unsupported | `Sources/Plugins/DockerAPIBridge` | pass (interim) | Unix socket; create/exec/pause/unpause/changes interim; build/networks/volumes still 501 |
+| Optional plugin sock path | `serve --socket` | pass (interim) | May bind `/var/run/docker.sock` when privileged; not in-core apiserver |
 | Dev Containers / Testcontainers smoke | — | optional | Bridge subset landed; full smoke still optional |
 
 ### Packet 7: Podman adjacency
@@ -102,7 +102,7 @@ Decision summary: [cto-parity-decision-2026-11-15.md](cto-parity-decision-2026-1
 | 4 | No drop-in Docker language for `wontfix` | pass | Decision + matrix |
 | 5 | Contracts additive / backward compatible | pass | Optional create-time fields |
 | 6 | Packets in scoped GO are pass | pass | This dossier |
-| 7 | No claimed-tier row is `planned`/`blocked` | pass | Attach is `done` in claimed scope |
+| 7 | No claimed-tier row is `planned`/`blocked` | pass | `docs/parity-matrix.md` — expansion-track rows `done` / `done (interim)`; T2 harness `done (interim)` |
 | 8 | New code has tests; filtered suite green | pass | Restart/Healthcheck/PeerHost tests; `swift build` |
 | 9 | License headers on new sources | pass | Apache headers present |
 
@@ -120,3 +120,4 @@ Decision summary: [cto-parity-decision-2026-11-15.md](cto-parity-decision-2026-1
 |------|------|----------|------|
 | Reviewer | CTO persona | GO (scoped) | 2026-11-15 |
 | CTO | CTO persona | GO (scoped) + residual close-out | 2026-11-16 |
+| CTO | CTO persona | Working-tree validation PASS — plain nitpick EXIT 0 + CTO adversarial EXIT 0; SHA GO deferred until commit | 2026-11-17 |

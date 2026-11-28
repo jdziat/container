@@ -44,6 +44,12 @@ public actor SnapshotStore {
             let capacityInBytes: UInt64
             if image.reference == initImage {
                 capacityInBytes = 512.mib()
+            } else if let raw = ProcessInfo.processInfo.environment["CONTAINER_ROOTFS_CAPACITY_GIB"],
+                let gib = UInt64(raw), gib > 0
+            {
+                // Smaller sparse images keep CR virtio-blk usable; 512 GiB
+                // metadata layouts stall createProcess before stdio dial-back.
+                capacityInBytes = gib.gib()
             } else {
                 capacityInBytes = 512.gib()
             }

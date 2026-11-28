@@ -333,6 +333,8 @@ extension BuildOptions {
                             guard let dest = exp.destination else {
                                 throw ContainerizationError(.invalidArgument, message: "dest is required \(exp.rawValue)")
                             }
+                            // CR virtiofs: build RPC can finish before out.tar is visible/stable.
+                            try await Builder.BuildExport.waitForExportFile(at: dest)
                             let result = try await ClientImage.load(from: dest.absolutePath(), force: false)
                             guard result.rejectedMembers.isEmpty else {
                                 log.error("archive contains invalid members", metadata: ["paths": "\(result.rejectedMembers)"])
@@ -353,6 +355,7 @@ extension BuildOptions {
                                 throw ContainerizationError(.invalidArgument, message: "dest is required \(exp.rawValue)")
                             }
                             let tarURL = tempURL.appendingPathComponent("out.tar")
+                            try await Builder.BuildExport.waitForExportFile(at: tarURL)
                             try FileManager.default.moveItem(at: tarURL, to: dest)
                             finalMessage = dest.absolutePath()
                         case "local":
@@ -360,6 +363,7 @@ extension BuildOptions {
                                 throw ContainerizationError(.invalidArgument, message: "dest is required \(exp.rawValue)")
                             }
                             let localDir = tempURL.appendingPathComponent("local")
+                            try await Builder.BuildExport.waitForExportFile(at: localDir)
 
                             guard FileManager.default.fileExists(atPath: localDir.path) else {
                                 throw ContainerizationError(.invalidArgument, message: "expected local output not found")

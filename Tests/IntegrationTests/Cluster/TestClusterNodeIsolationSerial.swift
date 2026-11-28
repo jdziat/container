@@ -46,7 +46,10 @@ struct TestClusterNodeIsolationSerial {
     private func expectNotFound(_ f: ContainerFixture, _ command: [String], node name: String, state: String) throws {
         let result = try f.run(command + [name])
         #expect(result.status != 0)
-        #expect(result.error.contains("container with ID \(name) not found"))
+        #expect(
+            result.error.contains("container with ID or name \(name) not found")
+                || result.error.contains("container with ID \(name) not found")
+        )
         try requireNode(f, name, state, after: command + [name])
     }
 

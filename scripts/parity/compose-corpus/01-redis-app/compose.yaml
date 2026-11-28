@@ -1,0 +1,15 @@
+name: corpus-redis-app
+services:
+  redis:
+    image: docker.io/library/alpine:3.20
+    restart: unless-stopped
+    command: ["sh", "-c", "echo redis-ready && sleep 60"]
+  app:
+    image: docker.io/library/alpine:3.20
+    depends_on:
+      - redis
+    command: ["sh", "-c", "echo redis-ok && sleep 30"]
+    volumes:
+      - appdata:/data
+volumes:
+  appdata:

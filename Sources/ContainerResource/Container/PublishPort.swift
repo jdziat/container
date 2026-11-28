@@ -96,8 +96,12 @@ extension [PublishPort] {
     public func hasOverlaps() -> Bool {
         var hostPorts = Set<String>()
         for publishPort in self {
+            // hostPort 0 means "ephemeral at bind time" for the whole range; skip so
+            // count>1 does not look like ports 1..(count-1) colliding with explicit maps.
+            if publishPort.hostPort == 0 { continue }
             for offset in 0..<publishPort.count {
-                let hostPortKey = "\(publishPort.hostPort + offset)/\(publishPort.proto.rawValue)"
+                let port = publishPort.hostPort &+ offset
+                let hostPortKey = "\(port)/\(publishPort.proto.rawValue)"
                 guard !hostPorts.contains(hostPortKey) else {
                     return true
                 }

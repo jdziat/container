@@ -38,7 +38,7 @@ An attachment can also declare aliases, which are additional names that resolve 
 * An **exact alias** is a name, such as `api.example.test`.
 * A **subtree alias** is a name with a leading dot, such as `.example.test`. It matches every name below its base, at one or more labels, and does not match the base itself. The wildcard semantics follow RFC 4592.
 
-An alias that has no dot is qualified with the default DNS domain when the container is created, the same way a container ID without a dot becomes a hostname. `alias=api` with the domain `test` is stored as `api.test`, and `alias=.gateway` is stored as `.gateway.test`. A name with a dot is stored as it is. The qualification happens in the CLI, so the stored configuration, the API server and the helpers only ever see the qualified names, and a later change to the default domain does not alter them. Without a default domain, the name stays as it is and fails the check for a fully qualified name.
+An alias that has no dot is qualified with the default DNS domain when the container is created, the same way a container ID without a dot becomes a hostname. `alias=api` with the domain `test` is stored as `api.test`, and `alias=.gateway` is stored as `.gateway.test`. A name with a dot is stored as it is. The qualification happens in the CLI, so the stored configuration, the API server and the helpers only ever see the (possibly qualified) names, and a later change to the default domain does not alter them. Without a default domain, a single-label exact alias such as `api` is stored as-is and is valid: guest peers resolve it through `/etc/hosts` and the in-guest `hosts-dns` helper. Subtree aliases still need at least two labels in the base.
 
 Aliases are part of the attachment configuration (`AttachmentOptions.aliases`), are stored in their normalized string form, and cannot be changed after the container is created. `DNSMatchRule` in the `DNSServer` module parses and matches them. Names are compared by label, are not case sensitive, and are compared without a trailing dot.
 
@@ -61,7 +61,7 @@ When a container starts, the API server validates its stored names again with th
 ## Invariants
 
 * **Exact names are unique.** A hostname or an exact alias is claimed by at most one attachment across all networks, whether its container is running or stopped. Creation fails if a new hostname or alias matches an existing hostname or alias, in either direction. The lookup relies on this to stop at the first hostname or exact alias match.
-* **Aliases are qualified.** Every exact alias is a fully qualified name with at least two labels once the default domain has been added, because a name with a single label is never under a registered domain and could not be resolved from macOS. The API server enforces this for every client, whether or not the CLI qualified the name.
+* **Exact aliases may be single-label.** Compose-style bare aliases are allowed so guests can resolve them via hosts injection and hosts-dns without a default domain. Resolving those bare names from macOS still requires a registered domain (or querying `127.0.0.1:2053` directly).
 * **A subtree is owned.** The base of a subtree alias is the hostname or an exact alias of the same attachment, and has at least two labels. A container can therefore not claim the names below another container's name, and two containers cannot declare the same subtree. A subtree and its base always resolve to the same attachment.
 * **Precedence is total.** An exact name beats a subtree, and a longer subtree base beats a shorter one. Two different subtrees that match a name and have the same number of base labels would have the same base, which one container owns, so there is no tie.
 * **Names are canonical.** Hostnames and aliases are compared lowercase and without a trailing dot, and the helper stores them that way. A container named `Foo` is therefore found by a query for `foo`.
@@ -79,6 +79,17 @@ When a container starts, the API server validates its stored names again with th
 * A subtree makes every name below its base resolve to the container. A proxy behind such a name receives the requested name in the `Host` header and must treat it as untrusted input.
 * Answers are a single record from an in-memory table, with no recursion, so aliases add no amplification.
 * The checks do not look at the resolver files. They are host state that can change at any time, and they do not limit what the server answers, because a client can query port 2053 directly.
+
+## Guest bare-name path (custom networks)
+
+In addition to the host loopback DNS servers above, each Linux guest whose DNS
+configuration is enabled mounts `libexec/container/helpers/hosts-dns` and wraps
+the init process with that helper. The helper binds `127.0.0.1:53`, answers A
+queries from `/etc/hosts` (including late-join peer refreshes), returns NODATA
+for AAAA when an A record exists (musl), and forwards everything else to the
+network gateway. `resolv.conf` lists `nameserver 127.0.0.1`. This is the
+network-scoped discovery path for [#1809](https://github.com/apple/container/issues/1809)
+when a privileged host bind on the vmnet gateway is unavailable.
 
 ## Known limitations
 

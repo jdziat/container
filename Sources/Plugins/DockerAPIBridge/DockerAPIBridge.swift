@@ -18,6 +18,7 @@ import ArgumentParser
 import Foundation
 import Logging
 
+@main
 struct DockerAPIBridge: AsyncParsableCommand {
     static let configuration = CommandConfiguration(
         commandName: "docker-api-bridge",
@@ -35,17 +36,40 @@ extension DockerAPIBridge {
 
         @Option(
             name: .customLong("socket"),
-            help: "Unix socket path (DOCKER_HOST=unix://<path>)"
+            help:
+                "Unix socket path (DOCKER_HOST=unix://<path>). May be /var/run/docker.sock if you can bind it (typically root); the bridge chmods the socket to 0600. Overridden by CONTAINER_ENGINE_SOCK when set."
         )
         var socket: String = DockerAPIBridgeServer.defaultSocketPath
+
+        @Flag(
+            name: .customLong("privileged-sock"),
+            help: "Bind /var/run/docker.sock (Recipe B; same as CONTAINER_ENGINE_SOCK=/var/run/docker.sock)"
+        )
+        var privilegedSock = false
 
         func run() async throws {
             var logger = Logger(label: "com.apple.container.docker-api-bridge")
             logger.logLevel = .info
-            let server = DockerAPIBridgeServer(socketPath: socket, log: logger)
+            var path = socket
+            if let env = ProcessInfo.processInfo.environment["CONTAINER_ENGINE_SOCK"],
+                !env.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            {
+                path = env.trimmingCharacters(in: .whitespacesAndNewlines)
+            } else if privilegedSock {
+                path = "/var/run/docker.sock"
+            }
+            if path == "/var/run/docker.sock" {
+                FileHandle.standardError.write(
+                    Data(
+                        "warning: binding /var/run/docker.sock requires privilege to create that path; socket mode will be 0600 (Recipe B: scripts/install-engine-sock.sh)\n"
+                            .utf8
+                    )
+                )
+            }
+            let server = DockerAPIBridgeServer(socketPath: path, log: logger)
             FileHandle.standardError.write(
                 Data(
-                    "docker-api-bridge listening on unix://\(socket)\nSet DOCKER_HOST=unix://\(socket)\n"
+                    "docker-api-bridge listening on unix://\(path)\nSet DOCKER_HOST=unix://\(path)\n"
                         .utf8
                 )
             )
@@ -63,5 +87,3 @@ extension DockerAPIBridge {
         }
     }
 }
-
-DockerAPIBridge.main()

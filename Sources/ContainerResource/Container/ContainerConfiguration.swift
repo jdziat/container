@@ -18,8 +18,10 @@ import ContainerizationOCI
 import Foundation
 
 public struct ContainerConfiguration: Sendable, Codable {
-    /// Identifier for the container.
+    /// Identifier for the container (immutable bundle key / Docker Id).
     public var id: String
+    /// User-facing name (Docker Name). Defaults to `id` for legacy configs.
+    public var name: String
     /// Image used to create the container.
     public var image: ImageDescription
     /// External mounts to add to the container.
@@ -58,9 +60,22 @@ public struct ContainerConfiguration: Sendable, Codable {
     public var capAdd: [String] = []
     /// Linux capabilities to drop (normalized CAP_* strings, or "ALL").
     public var capDrop: [String] = []
+    /// Host devices (`--device` / Compose `devices:`). R2 unrestricted by default.
+    public var devices: [ContainerDevice] = []
+    /// Guest UTS hostname (`uname -n` / `/etc/hostname`). When nil, derived from
+    /// the primary network attachment hostname (usually the container Name).
+    public var hostname: String?
+    /// Guest domain name (Docker `--domainname` / Compose `domainname:`).
+    /// Applied as resolv.conf `domain` / search and as an FQDN hosts alias.
+    public var domainname: String?
+    /// Default stop timeout in seconds (`stop_grace_period` / Docker StopTimeout).
+    /// When nil, stop uses the CLI/API caller default.
+    public var stopTimeoutSeconds: Int32?
     /// Size of /dev/shm in bytes. When nil, the default size is used.
     public var shmSize: UInt64?
-    /// Signal to send to the container process on stop (from image config).
+    /// Extra `/etc/hosts` entries (Docker `--add-host name:ip`), as `name:ip` strings.
+    public var extraHosts: [String] = []
+    /// Signal to send to the container process on stop (from image config, or `--stop-signal`).
     public var stopSignal: String?
     /// Paths inside the container to hide from the workload. When nil, the
     /// runtime's default set is used. Set to `[]` to opt out, or provide a
@@ -84,6 +99,7 @@ public struct ContainerConfiguration: Sendable, Codable {
 
     enum CodingKeys: String, CodingKey {
         case id
+        case name
         case image
         case mounts
         case publishedPorts
@@ -103,18 +119,26 @@ public struct ContainerConfiguration: Sendable, Codable {
         case useInit
         case capAdd
         case capDrop
+        case devices
+        case hostname
+        case domainname
+        case stopTimeoutSeconds
         case shmSize
         case stopSignal
+        case extraHosts
         case maskedPaths
         case readonlyPaths
         case creationDate
         case restartPolicy
         case restartMaxRetries
         case healthcheck
-        // healthStatus is intentionally omitted from durable encode/decode.
+        /// Encoded for live `inspect` / Compose `service_healthy` waits. Writers to
+        /// durable storage must strip it (see `Bundle.set`) so a snapshot never restores
+        /// a stale probe result.
+        case healthStatus
     }
 
-    // Encoded via synthesized `encode(to:)` over CodingKeys (healthStatus omitted).
+    // Encoded via synthesized `encode(to:)` over CodingKeys (includes healthStatus for inspect).
 
     /// Create a configuration from the supplied Decoder, initializing missing
     /// values where possible to reasonable defaults.
@@ -122,6 +146,7 @@ public struct ContainerConfiguration: Sendable, Codable {
         let container = try decoder.container(keyedBy: CodingKeys.self)
 
         id = try container.decode(String.self, forKey: .id)
+        name = try container.decodeIfPresent(String.self, forKey: .name) ?? id
         image = try container.decode(ImageDescription.self, forKey: .image)
         mounts = try container.decodeIfPresent([Filesystem].self, forKey: .mounts) ?? []
         publishedPorts = try container.decodeIfPresent([PublishPort].self, forKey: .publishedPorts) ?? []
@@ -147,16 +172,23 @@ public struct ContainerConfiguration: Sendable, Codable {
         useInit = try container.decodeIfPresent(Bool.self, forKey: .useInit) ?? false
         capAdd = try container.decodeIfPresent([String].self, forKey: .capAdd) ?? []
         capDrop = try container.decodeIfPresent([String].self, forKey: .capDrop) ?? []
+        devices = try container.decodeIfPresent([ContainerDevice].self, forKey: .devices) ?? []
+        hostname = try container.decodeIfPresent(String.self, forKey: .hostname)
+        domainname = try container.decodeIfPresent(String.self, forKey: .domainname)
+        stopTimeoutSeconds = try container.decodeIfPresent(Int32.self, forKey: .stopTimeoutSeconds)
         shmSize = try container.decodeIfPresent(UInt64.self, forKey: .shmSize)
         stopSignal = try container.decodeIfPresent(String.self, forKey: .stopSignal)
+        extraHosts = try container.decodeIfPresent([String].self, forKey: .extraHosts) ?? []
         maskedPaths = try container.decodeIfPresent([String].self, forKey: .maskedPaths)
         readonlyPaths = try container.decodeIfPresent([String].self, forKey: .readonlyPaths)
         creationDate = try container.decodeIfPresent(Date.self, forKey: .creationDate) ?? Date(timeIntervalSince1970: 0)
         restartPolicy = try container.decodeIfPresent(RestartPolicy.self, forKey: .restartPolicy) ?? .no
         restartMaxRetries = try container.decodeIfPresent(UInt64.self, forKey: .restartMaxRetries)
         healthcheck = try container.decodeIfPresent(ContainerHealthcheck.self, forKey: .healthcheck)
-        // Runtime-only; never restore a stale probe result from durable config.
-        healthStatus = .none
+        // Live inspect / XPC round-trips include probe results. Durable on-disk config
+        // should strip status before write (see Bundle persistence call sites); a missing
+        // key still means `.none` after API restart.
+        healthStatus = try container.decodeIfPresent(ContainerHealthStatus.self, forKey: .healthStatus) ?? .none
     }
 
     public struct DNSConfiguration: Sendable, Codable {
@@ -205,9 +237,11 @@ public struct ContainerConfiguration: Sendable, Codable {
     public init(
         id: String,
         image: ImageDescription,
-        process: ProcessConfiguration
+        process: ProcessConfiguration,
+        name: String? = nil
     ) {
         self.id = id
+        self.name = name ?? id
         self.image = image
         self.initProcess = process
     }

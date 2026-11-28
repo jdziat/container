@@ -20,7 +20,7 @@ spelling.
 | `docker export` | `container export` | |
 | `docker inspect` | `container inspect` | also the way to find a container's IP |
 | `docker stats` | `container stats` | |
-| `docker ps` | `container list` / `ls` | add `-a` for stopped containers |
+| `docker ps` | `container list` / `ls` / `ps` | add `-a` for stopped containers |
 | `docker container prune` | `container prune` | |
 | `docker commit` | `container commit <id> <image>` | creates an image from the container's filesystem; a running container is snapshotted first |
 | `docker restart` | `container restart` | |
@@ -28,7 +28,10 @@ spelling.
 | `docker port` | `container port` | prints `<host address>:<host port>:<container port>/<proto>` |
 | `docker attach` | `container attach` | streams logs from the current end and waits for exit; stdin to already-running init is not rebindable — use `exec -it` |
 | `docker top` | — | `container exec <id> ps aux` |
-| `docker rename`, `pause`, `unpause`, `diff`, `update` | — | no equivalent |
+| `docker rename` | `container rename` | Name≠Id: Id is UUID; `--name` / `rename` set Name |
+| `docker pause`, `unpause` | `container pause` / `unpause` | per-container VM suspend/resume |
+| `docker diff` | `container diff` | A/C/D vs image snapshot |
+| `docker update` | `container update` | `--cpus`, `--memory`, `--restart` |
 
 `--restart` on `run`/`create` accepts `no|on-failure[:max]|always|unless-stopped` (crash restart uses exponential backoff).
 `--health-cmd` (plus `--health-interval`/`--health-timeout`/`--health-start-period`/`--health-retries`)
@@ -40,7 +43,7 @@ Full status: `docs/parity-matrix.md`.
 | Docker | container |
 |---|---|
 | `docker build` | `container build` |
-| `docker images` | `container image list` / `ls` |
+| `docker images` | `container images` / `container image list` / `ls` |
 | `docker pull` | `container image pull` |
 | `docker push` | `container image push` |
 | `docker rmi` | `container image delete` / `rm` |
@@ -49,9 +52,12 @@ Full status: `docs/parity-matrix.md`.
 | `docker load` | `container image load` |
 | `docker image inspect` | `container image inspect` |
 | `docker image prune` | `container image prune` |
-| `docker history` | — no equivalent |
+| `docker history` | `container image history` | |
 
-`container image` has the alias `i`.
+`container image` has the alias `i`. Top-level `container images` lists images (same as
+`image list`); it is not a plural parent that requires `images ls`.
+
+`--net` is accepted as an alias for `--network` on `run` / `create`.
 
 ### Build notes
 
@@ -75,7 +81,7 @@ Two differences worth knowing:
 | — | `container registry list` — shows current logins |
 | `docker volume create` / `ls` / `rm` / `inspect` / `prune` | `container volume create` / `list` / `delete` / `inspect` / `prune` |
 | `docker network create` / `ls` / `rm` / `inspect` / `prune` | `container network create` / `list` / `delete` / `inspect` / `prune` |
-| `docker network connect` / `disconnect` | — set `--network` when you run the container |
+| `docker network connect` / `disconnect` | `container network connect` / `disconnect` | Running containers auto-restart on a stock build; live NIC hotplug exists only in `CONTAINER_VMM_CR=1` builds; `--restart` still accepted for compatibility |
 
 ## System
 
@@ -85,32 +91,77 @@ Two differences worth knowing:
 | `docker version` | `container system version` |
 | `docker system df` | `container system df` |
 | daemon logs | `container system logs` |
-| `docker events` | — no equivalent |
+| `docker events` | `container events` | JSON lines for create/start/die/destroy |
+| `docker system prune` | `container system prune` | `--all`, `--volumes`; individual prunes still exist |
 
-`docker system prune` has no single equivalent. Run the four prunes:
+Engine API bridge is **`done`** (curated support matrix including networks/volumes/`POST /build`).
+Recipe B (`--socket /var/run/docker.sock` or `scripts/install-engine-sock.sh`) is the
+**first-class** path for sock consumers; Recipe A (Application Support sock) remains the
+default coexistence path. Docker CLI compatibility for the documented subset is **`done`** via `bin/docker` (unsupported verbs exit 2 with an alternative)
+(shim from `scripts/docker`) plus top-level aliases (`images`, `pull`, `push`, `rmi`,
+`login`, `logout`, `info`, `ps`, `--net`, `--hostname`). Routes outside
+`docker-api-bridge support` return HTTP 501 by design. See `docs/parity-matrix.md` and
+`docs/docker-job-catalog.md` (job freeze + socket recipes).
+
+True residuals (not unfinished bridge work): `network connect` on a running container needs
+connect/disconnect auto-restart (F4 interim); Compose `devices` is unrestricted by default (`CONTAINER_DEVICE_ALLOWLIST_ONLY=1` restores the allowlist); Swarm `wontfix`; `extends` and preferred NFS kernel are beyond-terminus Done;
+preflight with `container compose doctor` before `up` on Desktop migrants; Compose
+`domainname` is `done (interim)` (label only).
+
+## Socket recipes (Engine clients)
+
+Prefer coexistence: default Application Support sock + `DOCKER_HOST` or a Docker context.
+Do not treat auto-symlink of `/var/run/docker.sock` as required for parity.
+
+**Recipe A — Application Support:**
 
 ```bash
-container prune                 # stopped containers
-container image prune
-container volume prune
-container network prune
+container-docker-api-bridge serve --socket ~/Library/Application\ Support/com.apple.container/docker-api-bridge.sock
+export DOCKER_HOST=unix://$HOME/Library/Application\ Support/com.apple.container/docker-api-bridge.sock
 ```
+
+**Recipe B — privileged `/var/run/docker.sock`:**
+
+```bash
+sudo ./scripts/install-engine-sock.sh
+# or: sudo container-docker-api-bridge serve --socket /var/run/docker.sock
+export DOCKER_HOST=unix:///var/run/docker.sock
+```
+
+**Recipe C — Docker context** (absolute `unix://` host; IDE runners need the same env/context):
+
+```bash
+SOCK="$HOME/Library/Application Support/com.apple.container/docker-api-bridge.sock"
+docker context create container-bridge --docker "host=unix://${SOCK}"
+docker context use container-bridge
+```
+
+**Testcontainers extras (document-only):** set `TESTCONTAINERS_DOCKER_SOCKET_OVERRIDE` when
+Ryuk must see a guest-visible sock path; optional `TESTCONTAINERS_HOST_OVERRIDE` for published
+ports; `TESTCONTAINERS_RYUK_DISABLED=true` if privileged Ryuk is out of scope.
+
+**Dev Containers extras (document-only):** set `DOCKER_HOST` / Docker context in
+`containers.environment` (or the shell that launches the CLI). docker-outside-of-docker
+defaults to host `/var/run/docker.sock` — use Recipe B or custom mounts to the Application
+Support sock. This is not a zero-config Desktop claim.
+
+Full write-up: `docs/docker-job-catalog.md#socket-recipes`.
 
 ## Replacing a compose file
 
 Two paths:
 
 1. **Plugin (preferred when installed):** `Sources/Plugins/ContainerCompose` installs as the
-   `compose` plugin (`container compose up|down|config`). It creates a project network, starts
-   services in dependency order, forwards `restart:` and `healthcheck:`, waits on
-   `depends_on: condition: service_healthy`, and fail-closes on unsupported keys.
-   Bare service names work via guest `/etc/hosts` injection (see `docs/parity-matrix.md`).
-   YAML `build:` is not executed yet.
+   `compose` plugin (`container compose up|down|ps|logs|exec|run|build|config`). It follows
+   Docker Compose v2 single-engine shapes: project network + declared networks/volumes,
+   long-form ports/volumes, `build:`, `env_file`, labels, file-based configs/secrets, and
+   guest NFS (`type: nfs` / `driver: nfs`). Fail-closes on unknown keys. See
+   `docs/compose-support-matrix.md` and `make compose-parity`.
 2. **Shell script:** translate the file by hand with `container run` as below.
 
 On the `default` network, use domain-qualified names after DNS setup. On a **custom**
-network, bare names land in `/etc/hosts` and refresh on join/leave
-([apple/container#1809](https://github.com/apple/container/issues/1809) interim).
+network, bare names land in `/etc/hosts` (+ hosts-dns) and refresh on join/leave
+([apple/container#1809](https://github.com/apple/container/issues/1809); matrix `done`).
 
 Set up name resolution once when staying on `default` (all three steps — see SKILL.md):
 
@@ -204,11 +255,14 @@ Mapping notes:
 - `ports:` → `-p`. Often unnecessary between containers, since each container has its own IP
   and is reachable without publishing. You need `-p` to reach a service from a host browser or
   a macOS-native tool.
-- `volumes:` → `-v` for bind mounts, or `container volume create` plus `-v <name>:<path>`.
-- `build:` → a `container build -t <name> .` line before the `run`.
+- `volumes:` → `-v` / `--mount` for bind, named volume, tmpfs, or NFS. Named project volumes
+  are created on `compose up`; NFS volumes become `--mount type=nfs,...` (guest client).
+- `build:` → `container build` (also `compose build` / automatic on `compose up`).
 - `restart:` → pass `--restart <policy>` on each `container run` (the compose plugin forwards
   `restart:` the same way). Policies: `no`, `on-failure[:max]`, `always`, `unless-stopped`.
 - `healthcheck:` → translated to `--health-cmd*` by the compose plugin.
+- NFS: `--mount type=nfs,source=<export>,destination=<path>,addr=<server>[,nfsvers=…]`
+  matches Docker; see `docs/volumes.md#nfs-mounts`.
 
 ## Features with no Docker counterpart
 

@@ -107,7 +107,8 @@ extension Bundle {
         }
         let bundle = Bundle(path: path)
         if let containerConfiguration {
-            try bundle.write(filename: Self.containerConfigFilename, value: containerConfiguration)
+            // Strip live probe results the same way `set(configuration:)` does.
+            try bundle.set(configuration: containerConfiguration)
         }
 
         if let rootFsOverride = options?.rootFsOverride {
@@ -127,7 +128,10 @@ extension Bundle {
 extension Bundle {
     /// Set the value of the configuration for the Bundle.
     public func set(configuration: ContainerConfiguration) throws {
-        try write(filename: Self.containerConfigFilename, value: configuration)
+        // Probe results are live-only; never persist a stale healthy/unhealthy onto disk.
+        var durable = configuration
+        durable.healthStatus = .none
+        try write(filename: Self.containerConfigFilename, value: durable)
     }
 
     /// Return the full filepath for a named resource in the Bundle.

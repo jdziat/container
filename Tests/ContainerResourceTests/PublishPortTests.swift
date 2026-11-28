@@ -106,4 +106,13 @@ struct PublishPortTests {
         ]
         #expect(ports.hasOverlaps())
     }
+
+    @Test
+    func testEphemeralHostPortsDoNotOverlap() throws {
+        let ports = [
+            try PublishPort(hostAddress: try IPAddress("0.0.0.0"), hostPort: 0, containerPort: 8080, proto: .tcp, count: 1),
+            try PublishPort(hostAddress: try IPAddress("0.0.0.0"), hostPort: 0, containerPort: 9090, proto: .tcp, count: 1),
+        ]
+        #expect(!ports.hasOverlaps())
+    }
 }

@@ -112,6 +112,13 @@ extension Application {
             if let logRoot {
                 env[LogRoot.environmentName] = logRoot.string
             }
+            // Pass through / materialize in-core docker.sock opt-in for apiserver (E3 interim).
+            let wantsInCoreSock = ContainerSystemConfig.wantsInCoreDockerSock(config: containerSystemConfig)
+            if wantsInCoreSock {
+                env["CONTAINER_INCORE_DOCKER_SOCK"] = "1"
+            } else {
+                env.removeValue(forKey: "CONTAINER_INCORE_DOCKER_SOCK")
+            }
             let plist = LaunchPlist(
                 label: "com.apple.container.apiserver",
                 arguments: args,
@@ -175,15 +182,31 @@ extension Application {
         }
 
         private func installDefaultKernel(kernelURL: URL, kernelBinaryPath: String, kernelDigest: String) async throws {
+            let preference = KernelSet.preferredKernelPreference()
+            let prefersNFS = KernelSet.prefersNFSCapableKernel(preference)
             var shouldInstallKernel = false
             if kernelInstall == nil {
                 log.warning("No default kernel configured.")
-                print("Install the recommended default kernel from [\(kernelURL)]? [Y/n]: ", terminator: "")
+                if prefersNFS {
+                    print(
+                        "Install the preferred NFS-capable default kernel "
+                            + "(make install-recommended-kernel / install-nfs-kernel)? [Y/n]: ",
+                        terminator: ""
+                    )
+                } else {
+                    print("Install the recommended default kernel from [\(kernelURL)]? [Y/n]: ", terminator: "")
+                }
                 guard let read = readLine(strippingNewline: true) else {
                     throw ContainerizationError(.internalError, message: "failed to read user input")
                 }
                 guard read.lowercased() == "y" || read.count == 0 else {
-                    log.info("Please use the `container system kernel set --recommended` command to configure the default kernel")
+                    if prefersNFS {
+                        log.info(
+                            "Please run `make install-recommended-kernel` or `container system kernel set --recommended` (CONTAINER_PREFERRED_KERNEL=nfs by default). See docs/volumes.md#nfs-mounts."
+                        )
+                    } else {
+                        log.info("Please use the `container system kernel set --recommended` command to configure the default kernel")
+                    }
                     return
                 }
                 shouldInstallKernel = true
@@ -193,7 +216,18 @@ extension Application {
             guard shouldInstallKernel else {
                 return
             }
-            log.info("Installing kernel...")
+            if prefersNFS {
+                log.info("Installing preferred NFS-capable kernel (CONTAINER_PREFERRED_KERNEL=\(preference))...")
+                do {
+                    try await KernelSet.installPreferredNFSKernel(force: true, log: log)
+                    return
+                } catch {
+                    log.warning(
+                        "NFS-capable kernel install failed (\(error)); falling back to Kata recommended tarball. For NFS mounts, fix CONTAINERIZATION_ROOT and re-run `make install-nfs-kernel`. See docs/volumes.md#nfs-mounts."
+                    )
+                }
+            }
+            log.info("Installing Kata recommended kernel from \(kernelURL)...")
             try await KernelSet.downloadAndInstallWithProgressBar(
                 tarRemoteURL: kernelURL,
                 kernelFilePath: kernelBinaryPath,

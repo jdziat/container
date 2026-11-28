@@ -164,6 +164,35 @@ struct ContainersServiceCleanupTests {
             #expect(Self.cleanupArgs(appRoot: appRoot) == nil)
             #expect(!FileManager.default.fileExists(atPath: bundle.path))
             #expect(try await service.list().isEmpty)
+
+            // "Runtime plugin not found" is an inference (a half-finished upgrade looks the same),
+            // so the bundle must be moved aside, never destroyed.
+            let orphaned = appRoot.appendingPathComponent("orphaned-containers")
+            let kept = (try? FileManager.default.contentsOfDirectory(atPath: orphaned.path)) ?? []
+            #expect(kept.count == 1, "the bundle must be quarantined, not deleted")
+            if let name = kept.first {
+                #expect(FileManager.default.fileExists(atPath: orphaned.appendingPathComponent(name).appendingPathComponent("config.json").path))
+            }
+        }
+    }
+
+    /// The counterpart of `bootDropsContainerWithMissingRuntime`. A missing runtime is
+    /// permanent, so that bundle is dropped. But a bundle whose config merely fails to
+    /// *load* (a torn write, a transient I/O error) must be left on disk for a later boot to
+    /// retry, never wiped. Deleting durable container state because of a read error is the
+    /// data-loss case this distinction exists to prevent.
+    @Test
+    func bootKeepsBundleWithUnreadableConfig() async throws {
+        try await TemporaryStorage.withTempDir { root in
+            let appRoot = URL(fileURLWithPath: root.string)
+            let bundle = try Self.createBundle(appRoot: appRoot, id: "torn-\(UUID())", removal: .manual)
+            try Data("{ not json".utf8).write(to: bundle.appendingPathComponent("config.json"))
+
+            // Runtime is installed, so the only failure is the unreadable config.
+            let service = try await makeService(appRoot: appRoot, runtime: .installed)
+
+            #expect(FileManager.default.fileExists(atPath: bundle.path), "unreadable config must not delete the bundle")
+            #expect(try await service.list().isEmpty, "an unloadable container is not listed")
         }
     }
 }

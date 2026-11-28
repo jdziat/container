@@ -373,7 +373,10 @@ struct TestCLIRunCommand {
             }
 
             let actualID = try String(contentsOfFile: cidfile.string, encoding: .utf8)
-            #expect(actualID == c)
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            let inspectID = try f.inspectContainer(c).configuration.id
+            #expect(actualID == inspectID, "cidfile should contain the stable UUID Id")
+            #expect(actualID != c, "cidfile Id should differ from --name under Name≠Id")
         }
     }
 
@@ -466,15 +469,22 @@ struct TestCLIRunCommand {
             let ip = inspect.networks[0].ipv4Address.address.description
 
             let output = try f.doExec(c, cmd: ["cat", "/etc/hosts"])
-            let lines = output.split(separator: "\n")
-            let expected = [("127.0.0.1", "localhost"), (ip, c)]
-            for (i, line) in lines.enumerated() {
-                guard i < expected.count else { break }
-                let words = line.split(separator: " ").map(String.init)
-                #expect(words.count >= 2)
-                #expect(words[0] == expected[i].0)
-                #expect(words[1] == expected[i].1)
+            let hostLines = output.split(separator: "\n").map(String.init).filter { line in
+                let trimmed = line.trimmingCharacters(in: .whitespaces)
+                return !trimmed.isEmpty && !trimmed.hasPrefix("#")
             }
+            #expect(hostLines.count >= 2, "expected localhost and self entries in /etc/hosts, got:\n\(output)")
+            let localhostLine = try #require(hostLines.first, "expected localhost entry in /etc/hosts")
+            let localhost = localhostLine.split(whereSeparator: { $0 == " " || $0 == "\t" }).map(String.init)
+            #expect(localhost.count >= 2)
+            #expect(localhost[0] == "127.0.0.1")
+            #expect(localhost[1] == "localhost")
+            // Self identity stays immediately after localhost, outside the managed-peers block.
+            let selfLine = try #require(hostLines.dropFirst().first, "expected self entry in /etc/hosts")
+            let selfWords = selfLine.split(whereSeparator: { $0 == " " || $0 == "\t" }).map(String.init)
+            #expect(selfWords.count >= 2)
+            #expect(selfWords[0] == ip)
+            #expect(selfWords[1] == c)
         }
     }
 

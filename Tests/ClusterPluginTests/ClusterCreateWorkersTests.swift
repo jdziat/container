@@ -35,10 +35,13 @@ struct ClusterCreateWorkersFlagTests {
     }
 
     @Test func resourceFlagsAreSeparateFromWorkers() throws {
-        let command = try ClusterCreate.parse(["--cpus", "4", "--memory", "8g", "--workers", "cpus=2"])
-        #expect(command.resourceFlags.cpus == 4)
+        // 1 CPU, not more: validation rejects --cpus above the host's core count, so a larger
+        // value made this test fail on small hosts (a 3-core CI runner). The test is about the
+        // resource flags being kept separate from --workers, not about the number.
+        let command = try ClusterCreate.parse(["--cpus", "1", "--memory", "8g", "--workers", "cpus=1"])
+        #expect(command.resourceFlags.cpus == 1)
         #expect(command.resourceFlags.memory == "8g")
-        #expect(command.workers == [try WorkerGroup(count: 1, cpus: 2, memory: nil)])
+        #expect(command.workers == [try WorkerGroup(count: 1, cpus: 1, memory: nil)])
     }
 
     @Test func totalAtLimitIsAccepted() throws {

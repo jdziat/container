@@ -24,12 +24,20 @@ public enum AliasPolicy {
     /// The most aliases that a single attachment may declare.
     public static let maximumAliasesPerAttachment = 32
 
-    /// The fewest labels that an exact alias, or the base of a subtree alias, may have.
+    /// The fewest labels that an exact alias may have.
     ///
-    /// A name with one label is not under any domain, so the system resolver never sends queries for
-    /// it to the container DNS server, and an alias like that would never resolve. For a subtree it
-    /// also keeps an alias from capturing a whole top-level domain.
-    public static let minimumLabels = 2
+    /// Single-label exact aliases (`api`) are allowed so Compose-style network aliases resolve via
+    /// guest `/etc/hosts` and the in-guest hosts-dns helper without a default DNS domain. Host
+    /// macOS resolution of single-label names still requires `container system dns create`.
+    public static let minimumExactAliasLabels = 1
+
+    /// The fewest labels that the base of a subtree alias may have.
+    ///
+    /// Keeps a subtree alias from capturing a whole top-level domain.
+    public static let minimumSubtreeAliasLabels = 2
+
+    /// Back-compat alias for the exact-alias floor (now 1).
+    public static let minimumLabels = minimumExactAliasLabels
 
     /// A rule that an alias breaks. The description says which alias and why.
     public struct Violation: Error, CustomStringConvertible, Equatable {
@@ -85,18 +93,25 @@ public enum AliasPolicy {
             }
             switch rule {
             case .exact(let name):
-                guard name.labels.count >= Self.minimumLabels else {
+                guard name.labels.count >= Self.minimumExactAliasLabels else {
                     throw Violation(
-                        "alias \"\(alias)\" must be a fully qualified name with at least \(Self.minimumLabels) labels, such as \"api.example.test\". Configure a default DNS domain to have the domain added to a name that has none"
+                        "alias \"\(alias)\" must have at least \(Self.minimumExactAliasLabels) label"
                     )
+                }
+                // Reject loopback/special single-label names that would hijack peer traffic.
+                if name.labels.count == 1 {
+                    let label = name.labels[0].lowercased()
+                    if label == "localhost" || label == "localdomain" {
+                        throw Violation("alias \"\(alias)\" is reserved and cannot be used")
+                    }
                 }
                 guard name != hostname else {
                     throw Violation("alias \"\(alias)\" is already a hostname of the container")
                 }
             case .subtree(let base):
-                guard base.labels.count >= Self.minimumLabels else {
+                guard base.labels.count >= Self.minimumSubtreeAliasLabels else {
                     throw Violation(
-                        "alias \"\(alias)\" must have at least \(Self.minimumLabels) labels after the leading dot. Configure a default DNS domain to have the domain added to a name that has none"
+                        "alias \"\(alias)\" must have at least \(Self.minimumSubtreeAliasLabels) labels after the leading dot. Configure a default DNS domain to have the domain added to a name that has none"
                     )
                 }
                 guard owned.contains(base) else {

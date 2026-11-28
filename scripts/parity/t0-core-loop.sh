@@ -66,25 +66,28 @@ status=0
 [[ "${status}" -eq 3 ]] || fail "run exit status: expected 3, got ${status}"
 pass "run propagates exit status"
 
-# 3. ls: a detached container shows up in `list`, and in `list --all` once stopped
-"${CONTAINER_BIN}" run -d --name "${NAME}" "${IMAGE}" sleep 300 >/dev/null || fail "run -d ${NAME}"
-"${CONTAINER_BIN}" ls --quiet | grep -qx "${NAME}" || fail "ls: ${NAME} not listed while running"
-pass "ls shows running container"
+# 3. ls: a detached container shows up in `list`, and in `list --all` once stopped.
+# `ls --quiet` prints the stable Id (Name≠Id); name-based ops still work via lookup.
+id="$("${CONTAINER_BIN}" run -d --name "${NAME}" "${IMAGE}" sleep 300)" || fail "run -d ${NAME}"
+[[ -n "${id}" ]] || fail "empty id from run -d"
+[[ "${id}" != "${NAME}" ]] || fail "expected UUID Id distinct from Name ${NAME}, got ${id}"
+"${CONTAINER_BIN}" ls --quiet | grep -qx "${id}" || fail "ls: ${id} not listed while running"
+pass "ls shows running container Id (${id})"
 
-"${CONTAINER_BIN}" exec "${NAME}" echo exec-ok >/dev/null || fail "exec in ${NAME}"
-pass "exec"
+"${CONTAINER_BIN}" exec "${NAME}" echo exec-ok >/dev/null || fail "exec by name ${NAME}"
+pass "exec by name"
 
-"${CONTAINER_BIN}" stop --time 1 "${NAME}" >/dev/null || fail "stop ${NAME}"
-if "${CONTAINER_BIN}" ls --quiet | grep -qx "${NAME}"; then
-    fail "ls: ${NAME} still listed after stop without --all"
+"${CONTAINER_BIN}" stop --time 1 "${NAME}" >/dev/null || fail "stop by name ${NAME}"
+if "${CONTAINER_BIN}" ls --quiet | grep -qx "${id}"; then
+    fail "ls: ${id} still listed after stop without --all"
 fi
-"${CONTAINER_BIN}" ls --all --quiet | grep -qx "${NAME}" || fail "ls --all: ${NAME} not listed after stop"
+"${CONTAINER_BIN}" ls --all --quiet | grep -qx "${id}" || fail "ls --all: ${id} not listed after stop"
 pass "ls --all shows stopped container"
 
-# 4. rm
-"${CONTAINER_BIN}" rm "${NAME}" >/dev/null || fail "rm ${NAME}"
-if "${CONTAINER_BIN}" ls --all --quiet | grep -qx "${NAME}"; then
-    fail "rm: ${NAME} still listed after delete"
+# 4. rm (by name)
+"${CONTAINER_BIN}" rm "${NAME}" >/dev/null || fail "rm by name ${NAME}"
+if "${CONTAINER_BIN}" ls --all --quiet | grep -qx "${id}"; then
+    fail "rm: ${id} still listed after delete"
 fi
 pass "rm"
 

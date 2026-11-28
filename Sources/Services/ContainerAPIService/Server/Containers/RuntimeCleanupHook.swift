@@ -19,6 +19,14 @@ import ContainerizationExtras
 import Foundation
 import Logging
 
+#if canImport(Darwin)
+import Darwin
+private let _kill = Darwin.kill
+#elseif canImport(Glibc)
+import Glibc
+private let _kill = Glibc.kill
+#endif
+
 /// Runs a runtime plugin's `cleanup --root <bundle> --uuid <id>` subcommand, which releases
 /// resources the plugin keeps outside the bundle
 enum RuntimeCleanupHook {
@@ -56,6 +64,8 @@ enum RuntimeCleanupHook {
             return false
         }
 
+        let launchIdentity = Self.processIdentity(pid: process.processIdentifier)
+
         let status: Int32
         do {
             status = try await Timeout.run(for: timeout) {
@@ -66,8 +76,7 @@ enum RuntimeCleanupHook {
             }
         } catch {
             log.warning("runtime cleanup hook timed out; sending SIGKILL", metadata: metadata.merging(["timeout": "\(timeout)"]) { $1 })
-            // Terminate the runtime plugin along with any spawned children
-            kill(-process.processIdentifier, SIGKILL)
+            await Self.forceKill(process, launchIdentity: launchIdentity)
             return false
         }
 
@@ -77,4 +86,57 @@ enum RuntimeCleanupHook {
         }
         return true
     }
+
+    /// Kill the hook and any direct children.
+    ///
+    /// `Foundation.Process` does not put the child in its own process group, so
+    /// `kill(-pid, …)` is unreliable. Kill direct children via `pkill -P`, then the
+    /// plugin itself while `process.isRunning` still holds the unreaped child pid.
+    /// When a launch-time start-time fingerprint is still readable and differs, skip
+    /// SIGKILL (pid reuse). If the fingerprint cannot be re-read, fall back to isRunning.
+    private static func forceKill(_ process: Process, launchIdentity: ProcessIdentity?) async {
+        guard process.isRunning else { return }
+        let pid = process.processIdentifier
+        guard pid > 0 else { return }
+
+        let pkill = Process()
+        pkill.executableURL = URL(fileURLWithPath: "/usr/bin/pkill")
+        pkill.arguments = ["-KILL", "-P", String(pid)]
+        try? pkill.run()
+        let deadline = ContinuousClock.now + .seconds(2)
+        while pkill.isRunning && ContinuousClock.now < deadline {
+            try? await Task.sleep(for: .milliseconds(50))
+        }
+        if pkill.isRunning {
+            pkill.terminate()
+        }
+
+        guard process.isRunning else { return }
+        // Skip SIGKILL only when the re-read fingerprint proves a different process.
+        // A nil re-read with isRunning still true means the unreaped child holds the pid.
+        if let launchIdentity, let current = Self.processIdentity(pid: pid), current != launchIdentity {
+            return
+        }
+        _ = _kill(pid, SIGKILL)
+    }
+
+    #if canImport(Darwin)
+    private struct ProcessIdentity: Equatable {
+        let startSec: Int64
+        let startUsec: Int32
+    }
+
+    private static func processIdentity(pid: pid_t) -> ProcessIdentity? {
+        var info = kinfo_proc()
+        var size = MemoryLayout<kinfo_proc>.stride
+        var mib: [Int32] = [CTL_KERN, KERN_PROC, KERN_PROC_PID, pid]
+        guard sysctl(&mib, u_int(mib.count), &info, &size, nil, 0) == 0 else { return nil }
+        guard size >= MemoryLayout<kinfo_proc>.stride else { return nil }
+        let start = info.kp_proc.p_starttime
+        return ProcessIdentity(startSec: Int64(start.tv_sec), startUsec: start.tv_usec)
+    }
+    #else
+    private struct ProcessIdentity: Equatable {}
+    private static func processIdentity(pid: pid_t) -> ProcessIdentity? { nil }
+    #endif
 }

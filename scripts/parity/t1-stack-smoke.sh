@@ -100,9 +100,19 @@ pass "${DB} has address ${db_ip}"
 pass "${APP} reaches ${DB} by IP"
 
 # 4. bare-name resolution: the T1 goal (do not accept qualified names as a substitute).
-if "${CONTAINER_BIN}" exec "${APP}" getent hosts "${DB}" >/dev/null 2>&1 ||
-    "${CONTAINER_BIN}" exec "${APP}" nslookup "${DB}" >/dev/null 2>&1; then
-    pass "${APP} resolves '${DB}'"
+# Prefer nslookup (UDP/53 via in-guest hosts-dns) so we prove DNS, not only NSS hosts.
+resolved_nslookup=0
+resolved_getent=0
+if "${CONTAINER_BIN}" exec "${APP}" nslookup "${DB}" >/dev/null 2>&1; then
+    pass "${APP} nslookup '${DB}'"
+    resolved_nslookup=1
+fi
+if "${CONTAINER_BIN}" exec "${APP}" getent hosts "${DB}" >/dev/null 2>&1; then
+    pass "${APP} getent hosts '${DB}'"
+    resolved_getent=1
+fi
+
+if [[ "${resolved_nslookup}" -eq 1 || "${resolved_getent}" -eq 1 ]]; then
     resolved=1
 fi
 
@@ -112,7 +122,9 @@ if [[ "${resolved:-0}" -ne 1 ]]; then
     fi
     warn "${APP} cannot resolve '${DB}' on ${NETWORK}; bare-name discovery on custom networks is not available yet"
     warn "see https://github.com/apple/container/issues/1809; rerun with PARITY_STRICT_DNS=1 to make this fatal"
+elif [[ "${STRICT_DNS}" == "1" && "${resolved_nslookup}" -ne 1 ]]; then
+    fail "${APP} getent works but nslookup failed for '${DB}' (hosts-dns / #1809 incomplete)"
 fi
 
 # Soft DNS failure falls through here and exits 0 (see PARITY_STRICT_DNS in the header).
-echo "T1 stack smoke: passed (name resolution: $([[ "${resolved:-0}" -eq 1 ]] && echo ok || echo soft-fail))"
+echo "T1 stack smoke: passed (name resolution: $([[ "${resolved:-0}" -eq 1 ]] && echo ok || echo soft-fail); nslookup=$([[ "${resolved_nslookup}" -eq 1 ]] && echo ok || echo miss))"

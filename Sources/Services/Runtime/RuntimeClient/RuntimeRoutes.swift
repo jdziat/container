@@ -29,6 +29,16 @@ public enum RuntimeRoutes: String {
     case bootstrap = "com.apple.container.runtime/bootstrap"
     /// Stop the sandbox and all processes running inside it.
     case stop = "com.apple.container.runtime/stop"
+    /// Pause (suspend) the sandbox virtual machine.
+    case pause = "com.apple.container.runtime/pause"
+    /// Resume a paused sandbox virtual machine.
+    case resume = "com.apple.container.runtime/resume"
+    /// Hotplug a network interface onto a running CR/VZ sandbox (F4/R1).
+    case hotplugNetwork = "com.apple.container.runtime/hotplugNetwork"
+    /// Unplug a previously hotplugged secondary network (R1).
+    case unplugNetwork = "com.apple.container.runtime/unplugNetwork"
+    /// Hotplug a virtio-blk image onto a running CR-backed sandbox (C3).
+    case hotplugBlock = "com.apple.container.runtime/hotplugBlock"
     /// Return the current state of the sandbox.
     case state = "com.apple.container.runtime/state"
     /// Get resource usage statistics for the sandbox.

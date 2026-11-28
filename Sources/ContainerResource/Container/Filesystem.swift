@@ -60,6 +60,8 @@ public struct Filesystem: Sendable, Codable {
         case volume(name: String, format: String, cache: CacheMode, sync: SyncMode)
         case virtiofs
         case tmpfs
+        /// Guest NFS mount (`mount -t nfs`); Docker `--mount type=nfs` shape.
+        case nfs
     }
 
     /// Type of the filesystem.
@@ -134,21 +136,59 @@ public struct Filesystem: Sendable, Codable {
         )
     }
 
+    /// An NFS export mounted inside the guest VM (not via host virtiofs).
+    ///
+    /// `source` is the export path (for example `/export` or `server:/export`).
+    /// Pass Docker-compatible options such as `addr=`, `nfsvers=`, `ro`/`rw` in `options`.
+    public static func nfs(source: String, destination: String, options: MountOptions) -> Filesystem {
+        .init(
+            type: .nfs,
+            source: source,
+            destination: destination,
+            options: options
+        )
+    }
+
     /// Returns true if the Filesystem is backed by a block device.
+    ///
+    /// Directory-backed named volumes (shared virtiofs plane) are not blocks.
     public var isBlock: Bool {
         switch type {
-        case .block(_, _, _): true
-        case .volume(_, _, _, _): true
-        default: false
+        case .block(_, _, _):
+            return true
+        case .volume(_, let format, _, _):
+            // Trust declared format over path heuristics (a block image path must not
+            // flip to shared virtiofs just because a directory exists at `source`).
+            let normalized = format.lowercased()
+            if normalized == "directory" || normalized == "virtiofs" { return false }
+            if normalized == "ext4" || normalized == "xfs" || normalized == "btrfs" || normalized == "block" {
+                return true
+            }
+            // Unknown format: trust the host path. Missing sources are treated as
+            // directory-backed (created on demand), not as exclusive block images.
+            guard FileManager.default.fileExists(atPath: source) else { return false }
+            return !Self.hostPathIsDirectory(source)
+        default:
+            return false
         }
     }
 
     /// Returns true if the Filesystem is a named volume.
     public var isVolume: Bool {
         switch type {
-        case .volume(_, _, _, _): true
-        default: false
+        case .volume(_, _, _, _):
+            return true
+        default:
+            return false
         }
+    }
+
+    /// Named volumes whose host source is a directory use the shared virtiofs plane
+    /// (multi-writer safe across per-container VMs). Block-image volumes remain exclusive.
+    public var isSharedVirtiofsVolume: Bool {
+        guard isVolume else { return false }
+        // Keep in lockstep with `isBlock` (including missing-path → directory default).
+        return !isBlock
     }
 
     /// Returns the volume name if this is a volume filesystem, nil otherwise.
@@ -157,6 +197,12 @@ public struct Filesystem: Sendable, Codable {
         case .volume(let name, _, _, _): name
         default: nil
         }
+    }
+
+    private static func hostPathIsDirectory(_ path: String) -> Bool {
+        var isDir: ObjCBool = false
+        guard FileManager.default.fileExists(atPath: path, isDirectory: &isDir) else { return false }
+        return isDir.boolValue
     }
 
     /// Returns true if the Filesystem is backed by a in-memory mount type.
@@ -171,6 +217,14 @@ public struct Filesystem: Sendable, Codable {
     public var isVirtiofs: Bool {
         switch type {
         case .virtiofs: true
+        default: false
+        }
+    }
+
+    /// Returns true if the Filesystem is a guest NFS mount.
+    public var isNfs: Bool {
+        switch type {
+        case .nfs: true
         default: false
         }
     }

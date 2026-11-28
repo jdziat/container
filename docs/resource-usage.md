@@ -136,11 +136,11 @@ Containers      4       2        890MB     210MB (24%)
 Local Volumes   6       3        4.5GB     2.1GB (47%)
 ```
 
-A named volume's disk image can grow to 512 GiB by default. To set a smaller limit,
-give a size when you create the volume:
+Default named volumes are host directories (shared virtiofs plane). An exclusive
+block-image volume can grow to 512 GiB by default; set a size when creating one:
 
 ```bash
-container volume create -s 10g myvolume
+container volume create --opt backend=block -s 10g myvolume
 ```
 
 ### Reclaim disk space

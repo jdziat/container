@@ -262,6 +262,9 @@ public struct Builder: Sendable {
                     throw Builder.Error.invalidExport(dest, "dest path already exists")
                 }
 
+                // Destination is (or will be) a directory: ensure it exists, then pick out.tar[.N].
+                try fileManager.createDirectory(at: destination, withIntermediateDirectories: true, attributes: nil)
+
                 var finalDestination = destination.appendingPathComponent("out.tar")
                 var index = 1
                 while fileManager.fileExists(atPath: finalDestination.path) {
@@ -272,10 +275,60 @@ public struct Builder: Sendable {
                 return finalDestination
             } else {
                 let parentDirectory = destination.deletingLastPathComponent()
-                try? fileManager.createDirectory(at: parentDirectory, withIntermediateDirectories: true, attributes: nil)
+                try fileManager.createDirectory(at: parentDirectory, withIntermediateDirectories: true, attributes: nil)
             }
 
             return destination
+        }
+
+        /// Wait for a virtiofs-exported build artifact to appear and finish flushing.
+        ///
+        /// Under CR (and occasionally VZ), `performBuild` can complete before the host
+        /// sees a stable `out.tar` in the exports mount. Poll until the path exists;
+        /// for regular files, also require a non-zero size unchanged across one interval.
+        public static func waitForExportFile(
+            at url: URL,
+            timeout: Duration = .seconds(60),
+            pollInterval: Duration = .milliseconds(100)
+        ) async throws {
+            let fileManager = FileManager.default
+            let parent = url.deletingLastPathComponent()
+            if !fileManager.fileExists(atPath: parent.path) {
+                try fileManager.createDirectory(at: parent, withIntermediateDirectories: true, attributes: nil)
+            }
+
+            let deadline = ContinuousClock.now + timeout
+            var lastSize: UInt64?
+            var stablePolls = 0
+            while ContinuousClock.now < deadline {
+                try Task.checkCancellation()
+                var isDir: ObjCBool = false
+                if fileManager.fileExists(atPath: url.path, isDirectory: &isDir) {
+                    if isDir.boolValue {
+                        return
+                    }
+                    let attrs = try fileManager.attributesOfItem(atPath: url.path)
+                    let size = (attrs[.size] as? NSNumber)?.uint64Value ?? 0
+                    if let lastSize, lastSize == size {
+                        stablePolls += 1
+                        // Non-empty: one stable poll. Empty: require a second so a
+                        // just-created 0-byte file is less likely to win before writes.
+                        if size > 0 || stablePolls >= 2 {
+                            return
+                        }
+                    } else {
+                        stablePolls = 0
+                    }
+                    lastSize = size
+                } else {
+                    // Path disappeared (or not yet created). Reset so a recreate with
+                    // the same size cannot look "stable" on the first observation.
+                    lastSize = nil
+                    stablePolls = 0
+                }
+                try await Task.sleep(for: pollInterval)
+            }
+            throw Builder.Error.exportNotReady(url.path)
         }
     }
 
@@ -397,6 +450,7 @@ extension Builder {
         case invalidContinuation
         case buildComplete
         case invalidExport(String, String)
+        case exportNotReady(String)
 
         var description: String {
             switch self {
@@ -406,6 +460,8 @@ extension Builder {
                 return "build completed"
             case .invalidExport(let exp, let reason):
                 return "export entry \(exp) is invalid: \(reason)"
+            case .exportNotReady(let path):
+                return "build export not ready at \(path) after waiting for virtiofs flush"
             }
         }
     }

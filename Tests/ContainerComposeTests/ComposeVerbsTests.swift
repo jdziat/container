@@ -1,0 +1,605 @@
+//===----------------------------------------------------------------------===//
+// Copyright © 2026 Apple Inc. and the container project authors.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//   https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+//===----------------------------------------------------------------------===//
+
+import Foundation
+import Testing
+
+@testable import container_compose
+
+/// `compose ps`, `ls`, `cp` and `down --rmi`: the decisions, on fixed `container list` JSON and a fixed plan.
+struct ComposeVerbsTests {
+    private func row(_ id: String, project: String, service: String, state: String, oneOff: Bool = false, extra: [String: String] = [:]) -> String {
+        var labels = ["com.docker.compose.project": project, "com.docker.compose.service": service]
+        if oneOff { labels["com.docker.compose.oneoff"] = "True" }
+        for (k, v) in extra { labels[k] = v }
+        let l = labels.map { "\"\($0.key)\":\"\($0.value)\"" }.joined(separator: ",")
+        return "{\"status\":\"\(state)\",\"configuration\":{\"id\":\"\(id)\",\"image\":{\"reference\":\"img-\(service)\"},\"labels\":{\(l)}}}"
+    }
+    private func list(_ rows: String...) -> String { "[" + rows.joined(separator: ",") + "]" }
+
+    // MARK: ps
+
+    @Test func psKeepsOnlyThisProjectAndMapsStoppedToExited() throws {
+        let json = list(
+            row("a", project: "p", service: "web", state: "running"),
+            row("b", project: "p", service: "db", state: "stopped"),
+            row("c", project: "other", service: "web", state: "running"))
+        let rows = try ComposePS.rows(listJSON: json, project: "p")
+        #expect(rows.map(\.id) == ["b", "a"])  // sorted by service: db, web
+        #expect(rows.map(\.state) == ["exited", "running"])
+        #expect(rows.first?.image == "img-db")
+    }
+
+    @Test func psDefaultsToRunningWithoutOneOffs() throws {
+        let rows = try ComposePS.rows(
+            listJSON: list(
+                row("a", project: "p", service: "web", state: "running"),
+                row("b", project: "p", service: "db", state: "stopped"),
+                row("c", project: "p", service: "web", state: "running", oneOff: true)), project: "p")
+        #expect(ComposePS.filter(rows, all: false, statuses: []).map(\.id) == ["a"])
+        #expect(Set(ComposePS.filter(rows, all: true, statuses: []).map(\.id)) == ["a", "b", "c"])
+    }
+
+    @Test func psStatusFilterAcceptsDockerSpellingAndImpliesAll() throws {
+        let rows = try ComposePS.rows(
+            listJSON: list(
+                row("a", project: "p", service: "web", state: "running"),
+                row("b", project: "p", service: "db", state: "stopped")), project: "p")
+        #expect(ComposePS.filter(rows, all: false, statuses: ["exited"]).map(\.id) == ["b"])
+        #expect(ComposePS.filter(rows, all: false, statuses: ["stopped"]).map(\.id) == ["b"])
+        #expect(ComposePS.filter(rows, all: false, statuses: ["running"]).map(\.id) == ["a"])
+    }
+
+    @Test func psJSONUsesComposeFieldNames() throws {
+        let rows = try ComposePS.rows(listJSON: list(row("a", project: "p", service: "web", state: "running")), project: "p")
+        let json = try ComposePS.json(rows)
+        #expect(json.contains("\"Service\":\"web\""))
+        #expect(json.contains("\"State\":\"running\""))
+        #expect(json.contains("\"Name\":\"a\""))
+    }
+
+    @Test func psTableAlignsColumns() {
+        let text = ComposePS.table([
+            ComposePSRow(name: "web", id: "web", service: "web", image: "nginx", state: "running", oneOff: false)
+        ])
+        let lines = text.split(separator: "\n").map(String.init)
+        #expect(lines.count == 2)
+        #expect(lines[0].hasPrefix("NAME"))
+        let imageColumn = lines[0].distance(from: lines[0].startIndex, to: lines[0].range(of: "IMAGE")!.lowerBound)
+        let valueColumn = lines[1].distance(from: lines[1].startIndex, to: lines[1].range(of: "nginx")!.lowerBound)
+        #expect(imageColumn == valueColumn)
+    }
+
+    @Test func psRejectsGarbage() {
+        #expect(throws: ComposeError.self) { try ComposePS.rows(listJSON: "nope", project: "p") }
+    }
+
+    // MARK: ls
+
+    @Test func lsGroupsByProjectAndHidesStoppedUnlessAll() throws {
+        let json = list(
+            row("a", project: "one", service: "web", state: "running", extra: ["com.docker.compose.project.config_files": "/x/compose.yaml"]),
+            row("b", project: "one", service: "db", state: "stopped"),
+            row("c", project: "two", service: "web", state: "stopped"))
+        let running = try ComposeProjects.summaries(listJSON: json, all: false)
+        #expect(running.map(\.name) == ["one"])
+        #expect(running[0].status == "running(1), exited(1)")
+        #expect(running[0].configFiles == "/x/compose.yaml")
+        let all = try ComposeProjects.summaries(listJSON: json, all: true)
+        #expect(all.map(\.name) == ["one", "two"])
+        #expect(all[1].status == "exited(1)")
+    }
+
+    @Test func lsIgnoresContainersWithoutAProject() throws {
+        let json = "[{\"status\":\"running\",\"configuration\":{\"id\":\"x\",\"labels\":{}}}]"
+        #expect(try ComposeProjects.summaries(listJSON: json, all: true).isEmpty)
+    }
+
+    // MARK: cp / down --rmi
+
+    private func plan(_ yaml: String) throws -> ComposePlanner.Plan {
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent("compose-verbs-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let file = dir.appendingPathComponent("compose.yaml")
+        try yaml.write(to: file, atomically: true, encoding: .utf8)
+        return try ComposePlanner.plan(fileURL: file, project: "t", profiles: [])
+    }
+    private let yaml = """
+        services:
+          web:
+            image: nginx
+          app:
+            build: .
+          worker:
+            image: busybox
+            deploy:
+              replicas: 2
+        """
+
+    @Test func serviceReferenceNeedsAKnownServiceBeforeTheColon() throws {
+        let p = try plan(yaml)
+        #expect(p.serviceReference("web:/etc/hosts")?.path == "/etc/hosts")
+        #expect(p.serviceReference("nosuch:/x") == nil)
+        #expect(p.serviceReference("./web:/x") == nil)  // a path, not a service
+        #expect(p.serviceReference("/tmp/web:x") == nil)
+        #expect(p.serviceReference("plain") == nil)
+        // A prefix with a slash is a path even if its text matches nothing; and a service-named path is only
+        // a service when there is no slash before the colon.
+        #expect(p.serviceReference("sub/web:/x") == nil)
+        #expect(p.serviceReference("../web:/x") == nil)
+    }
+
+    private func container(_ name: String, service: String, number: Int = 1, state: String = "running", oneOff: Bool = false) -> ComposePSRow {
+        ComposePSRow(name: name, id: name, service: service, image: "i", state: state, oneOff: oneOff, number: number)
+    }
+
+    @Test func copyOutAndIn() throws {
+        let p = try plan(yaml)
+        let rows = [container("web", service: "web")]
+        let out = try p.copyArguments(source: "web:/etc/hosts", destination: "./hosts", index: 1, rows: rows)
+        #expect(out == ("web:/etc/hosts", "./hosts"))
+        let into = try p.copyArguments(source: "./a.txt", destination: "web:/tmp/a.txt", index: 1, rows: rows)
+        #expect(into == ("./a.txt", "web:/tmp/a.txt"))
+    }
+
+    @Test func copyPicksTheReplicaByContainerNumber() throws {
+        let p = try plan(yaml)
+        let rows = [container("worker-1", service: "worker", number: 1), container("worker-2", service: "worker", number: 2)]
+        #expect(try p.copyArguments(source: "worker:/x", destination: "./x", index: 2, rows: rows).0 == "worker-2:/x")
+        #expect(throws: ComposeError.self) { try p.copyArguments(source: "worker:/x", destination: "./x", index: 3, rows: rows) }
+        #expect(throws: ComposeError.self) { try p.copyArguments(source: "worker:/x", destination: "./x", index: 0, rows: rows) }
+    }
+
+    @Test func copyRefusesBadShapes() throws {
+        let p = try plan(yaml)
+        let rows = [container("web", service: "web"), container("app", service: "app")]
+        #expect(throws: ComposeError.self) { try p.copyArguments(source: "./a", destination: "./b", index: 1, rows: rows) }
+        #expect(throws: ComposeError.self) { try p.copyArguments(source: "web:/a", destination: "app:/b", index: 1, rows: rows) }
+        // a service with no container of this project (not up; a foreign same-named container is never in rows)
+        #expect(throws: ComposeError.self) { try p.copyArguments(source: "web:/a", destination: "./b", index: 1, rows: []) }
+    }
+
+    // MARK: replicas come from the running containers, not the file
+
+    /// The live failure: `up --scale g=2` is not in the file (replicas 1 there), so planned names said `g`, but
+    /// the containers are `g-1` and `g-2`. exec/cp/logs/stop all looked for `g` and found nothing.
+    @Test func aScaledServiceIsFoundEvenThoughTheFileSaysOneReplica() throws {
+        let p = try plan("services:\n  g:\n    image: x\n")
+        #expect(p.services.first?.replicas == 1)
+        let rows = [container("g-1", service: "g", number: 1), container("g-2", service: "g", number: 2)]
+        #expect(try p.replicaName(service: "g", index: 1, rows: rows) == "g-1")
+        #expect(try p.replicaName(service: "g", index: 2, rows: rows) == "g-2")
+        #expect(try p.containers(of: ["g"], in: rows).map(\.name) == ["g-1", "g-2"])
+        #expect(try p.copyArguments(source: "g:/f", destination: "./f", index: 2, rows: rows).0 == "g-2:/f")
+    }
+
+    @Test func replicasAreOrderedByNumberNotByName() throws {
+        let p = try plan("services:\n  g:\n    image: x\n")
+        let rows = [container("zzz", service: "g", number: 2), container("aaa", service: "g", number: 1)]
+        #expect(try p.containers(of: [], in: rows).map(\.name) == ["aaa", "zzz"])
+        #expect(try p.replicaName(service: "g", index: 1, rows: rows) == "aaa")
+    }
+
+    @Test func containersFollowThePlansServiceOrderAndSkipOneOffsByDefault() throws {
+        let p = try plan(yaml)
+        let order = p.services.map(\.name)  // the planner's (dependency-sorted) order; the test must not assume file order
+        #expect(Set(order) == ["web", "app", "worker"])
+        // Containers supplied in the opposite order, plus a one-off of web.
+        let rows = order.reversed().map { container($0, service: $0) } + [container("web_run_abc", service: "web", oneOff: true)]
+        #expect(try p.containers(of: [], in: rows).map(\.name) == order)
+        let withOneOff = try p.containers(of: [], in: rows, includeOneOffs: true).map(\.name)
+        #expect(withOneOff == order.flatMap { $0 == "web" ? ["web", "web_run_abc"] : [$0] })
+        #expect(try p.containers(of: ["web"], in: rows).map(\.name) == ["web"])
+        #expect(try p.containers(of: ["web"], in: rows, includeOneOffs: true).map(\.name) == ["web", "web_run_abc"])
+        #expect(throws: ComposeError.self) { try p.containers(of: ["nope"], in: rows) }
+    }
+
+    @Test func aOneOffIsNeverPickedAsAReplica() throws {
+        let p = try plan(yaml)
+        #expect(throws: ComposeError.self) {
+            try p.replicaName(service: "web", index: 1, rows: [container("web_run_abc", service: "web", oneOff: true)])
+        }
+    }
+
+    @Test func psRowsCarryTheContainerNumber() throws {
+        let json =
+            "[{\"status\":\"running\",\"configuration\":{\"id\":\"a\",\"image\":{\"reference\":\"i\"},\"labels\":{\"com.docker.compose.project\":\"p\",\"com.docker.compose.service\":\"w\",\"com.docker.compose.container-number\":\"3\"}}}]"
+        #expect(try ComposePS.rows(listJSON: json, project: "p").first?.number == 3)
+        let none =
+            "[{\"status\":\"running\",\"configuration\":{\"id\":\"a\",\"image\":{\"reference\":\"i\"},\"labels\":{\"com.docker.compose.project\":\"p\",\"com.docker.compose.service\":\"w\"}}}]"
+        #expect(try ComposePS.rows(listJSON: none, project: "p").first?.number == 1)
+    }
+
+    @Test func rmiLocalIsOnlyWhatComposeBuilt() throws {
+        let p = try plan(yaml)
+        #expect(try p.imagesToRemove(policy: "local") == ["t_app:latest"])
+        #expect(try p.imagesToRemove(policy: "all") == ["busybox", "nginx", "t_app:latest"])
+        #expect(throws: ComposeError.self) { try p.imagesToRemove(policy: "everything") }
+    }
+
+    // MARK: run / exec / logs / config
+
+    private let runYaml = """
+        services:
+          db:
+            image: postgres
+          api:
+            image: api
+            depends_on: [db]
+            ports: ["8080:80"]
+            environment:
+              A: "1"
+              KEEP: old
+            user: root
+            working_dir: /srv
+            entrypoint: ["/bin/old"]
+            restart: always
+            deploy:
+              replicas: 2
+        """
+
+    @Test func runDoesNotPublishServicePortsUnlessAsked() throws {
+        let p = try plan(runYaml)
+        let none = try p.oneOffService("api", overrides: RunOverrides(), hostEnvironment: [:])
+        #expect(none.ports.isEmpty)
+        let kept = try p.oneOffService("api", overrides: RunOverrides(servicePorts: true), hostEnvironment: [:])
+        #expect(kept.ports == ["8080:80"])
+        let added = try p.oneOffService("api", overrides: RunOverrides(publish: ["9090:90"]), hostEnvironment: [:])
+        #expect(added.ports == ["9090:90"])
+        let both = try p.oneOffService("api", overrides: RunOverrides(publish: ["9090:90"], servicePorts: true), hostEnvironment: [:])
+        #expect(both.ports == ["8080:80", "9090:90"])
+    }
+
+    @Test func runOverridesEnvUserWorkdirEntrypointName() throws {
+        let p = try plan(runYaml)
+        let svc = try p.oneOffService(
+            "api",
+            overrides: RunOverrides(
+                environment: ["KEEP=new", "ADDED=x=y", "FROMHOST"], user: "nobody", workdir: "/tmp", entrypoint: "/bin/new", name: "mine"),
+            hostEnvironment: ["FROMHOST": "h"])
+        #expect(svc.environment["KEEP"] == "new")
+        #expect(svc.environment["A"] == "1")
+        #expect(svc.environment["ADDED"] == "x=y")  // only the first '=' splits
+        #expect(svc.environment["FROMHOST"] == "h")
+        #expect(svc.user == "nobody")
+        #expect(svc.workingDir == "/tmp")
+        #expect(svc.entrypoint == ["/bin/new"])
+        #expect(svc.containerName == "mine")
+    }
+
+    @Test func runEmptyEntrypointClearsIt() throws {
+        let svc = try plan(runYaml).oneOffService("api", overrides: RunOverrides(entrypoint: ""), hostEnvironment: [:])
+        #expect(svc.entrypoint == nil)
+    }
+
+    @Test func runUnsetHostVariableIsNotInvented() throws {
+        let svc = try plan(runYaml).oneOffService("api", overrides: RunOverrides(environment: ["NOPE"]), hostEnvironment: [:])
+        #expect(svc.environment["NOPE"] == nil)
+    }
+
+    @Test func runIsASingleInstanceWithoutRestartPolicy() throws {
+        let svc = try plan(runYaml).oneOffService("api", overrides: RunOverrides(), hostEnvironment: [:])
+        #expect(svc.replicas == 1)
+        #expect(svc.restart == nil)
+        #expect(throws: ComposeError.self) { try plan(runYaml).oneOffService("nope", overrides: RunOverrides(), hostEnvironment: [:]) }
+    }
+
+    @Test func runDependenciesExcludeTheServiceItself() throws {
+        let deps = try plan(runYaml).dependencies(of: "api")
+        #expect(deps.services.map(\.name) == ["db"])
+        #expect(try plan(runYaml).dependencies(of: "db").services.isEmpty)
+    }
+
+    @Test func oneOffRunsAreLabelledSoPsCanHideThem() throws {
+        let p = try plan(runYaml)
+        let svc = try p.oneOffService("api", overrides: RunOverrides(), hostEnvironment: [:])
+        let oneOff = try p.runArgs(for: svc, detach: false, commandOverride: nil, oneOff: true)
+        #expect(oneOff.contains("com.docker.compose.oneoff=True"))
+        let normal = try p.runArgs(for: svc, detach: true, commandOverride: nil, oneOff: false)
+        #expect(!normal.contains("com.docker.compose.oneoff=True"))
+    }
+
+    @Test func execArguments() {
+        let plain = ComposeExec.arguments(container: "c", command: ["ls", "-l"], detach: false, env: [], user: nil, workdir: nil, tty: false)
+        #expect(plain == ["exec", "c", "ls", "-l"])
+        let full = ComposeExec.arguments(
+            container: "c", command: ["sh"], detach: true, env: ["A=1", "B"], user: "u", workdir: "/w", tty: true)
+        #expect(full == ["exec", "--detach", "--interactive", "--tty", "--env", "A=1", "--env", "B", "--user", "u", "--workdir", "/w", "c", "sh"])
+    }
+
+    @Test func logPrefixPadsToTheWidestName() {
+        #expect(ComposeLogs.prefix("hi", name: "db", width: 5, enabled: true) == "db     | hi")
+        #expect(ComposeLogs.prefix("hi", name: "db", width: 5, enabled: false) == "hi")
+        #expect(ComposeLogs.prefix("x", name: "longname", width: 3, enabled: true) == "longname  | x")
+    }
+
+    @Test func logTargetsAreTheProjectsRealContainersInServiceOrder() throws {
+        let p = try plan(yaml)
+        let rows = [container("worker-2", service: "worker", number: 2), container("web", service: "web"), container("worker-1", service: "worker", number: 1)]
+        #expect(try ComposeLogs.targets(plan: p, services: [], rows: rows) == ["web", "worker-1", "worker-2"])
+        #expect(try ComposeLogs.targets(plan: p, services: ["worker"], rows: rows) == ["worker-1", "worker-2"])
+        #expect(try ComposeLogs.targets(plan: p, services: ["web"], rows: []).isEmpty)
+        #expect(throws: ComposeError.self) { try ComposeLogs.targets(plan: p, services: ["nope"], rows: []) }
+    }
+
+    @Test func configJSONIsParseableAndComplete() throws {
+        let text = try plan(runYaml).summaryJSON()
+        let object = try #require(JSONSerialization.jsonObject(with: Data(text.utf8)) as? [String: Any])
+        #expect(object["name"] as? String == "t")
+        let services = try #require(object["services"] as? [[String: Any]])
+        #expect(Set(services.compactMap { $0["name"] as? String }) == ["db", "api"])
+        let api = try #require(services.first { $0["name"] as? String == "api" })
+        #expect(api["depends_on"] as? [String] == ["db"])
+        #expect(api["replicas"] as? Int == 2)
+    }
+
+    // MARK: --dry-run
+
+    @Test func dryRunClassifiesReadsAndMutations() {
+        for read in [["list", "-a"], ["inspect", "x"], ["logs", "x"], ["network", "list"], ["volume", "inspect", "v"], ["image", "ls"], ["system", "status"], ["--version"]] {
+            #expect(!ComposeDryRun.isMutating(read), "\(read) should run")
+        }
+        for write in [
+            ["run", "-d", "img"], ["stop", "x"], ["delete", "-f", "x"], ["kill", "x"], ["exec", "x", "ls"], ["copy", "a", "b"],
+            ["network", "create", "n"], ["network", "delete", "n"], ["volume", "create", "v"], ["image", "pull", "i"],
+            ["image", "delete", "i"], ["image", "push", "i"], ["builder", "start"], ["system", "start"], ["export", "x"],
+            ["somethingnew"],
+        ] {
+            #expect(ComposeDryRun.isMutating(write), "\(write) must not run")
+        }
+        #expect(!ComposeDryRun.isMutating([]))
+    }
+
+    @Test func dryRunDescribesTheCommandAndQuotesSpaces() {
+        #expect(ComposeDryRun.describe(["stop", "-t", "1", "a"]) == "[dry-run] container stop -t 1 a")
+        #expect(ComposeDryRun.describe(["run", "--label", "a=b c"]) == "[dry-run] container run --label 'a=b c'")
+    }
+
+    @Test func dryRunFlagIsGlobalAndConsumed() throws {
+        ComposeDryRun.enabled = false
+        defer { ComposeDryRun.enabled = false }
+        let args = try ContainerCompose.hoistGlobalOptions(["--dry-run", "-f", "x.yml", "up"])
+        #expect(ComposeDryRun.enabled)
+        #expect(args == ["up", "--file=x.yml"])
+    }
+
+    // MARK: command parsing
+
+    /// The guest command after the service keeps its own flags: `compose exec web sh -c 'x'` must not be read
+    /// as options of `exec`. This once failed live with "Unknown option '-c'".
+    @Test func commandAfterTheServiceKeepsItsOwnFlags() throws {
+        let run = try #require(
+            try ContainerCompose.parseAsRoot(["run", "-e", "A=1", "web", "sh", "-c", "echo hi"]) as? ContainerCompose.Run)
+        #expect(run.service == "web")
+        #expect(run.env == ["A=1"])
+        #expect(run.command == ["sh", "-c", "echo hi"])
+
+        let exec = try #require(
+            try ContainerCompose.parseAsRoot(["exec", "-u", "root", "web", "ls", "-l", "--color=never", "/"]) as? ContainerCompose.Exec)
+        #expect(exec.service == "web")
+        #expect(exec.user == "root")
+        #expect(exec.command == ["ls", "-l", "--color=never", "/"])
+    }
+
+    @Test func optionsBeforeTheServiceStillBelongToTheVerb() throws {
+        let run = try #require(try ContainerCompose.parseAsRoot(["run", "-d", "--no-deps", "-w", "/srv", "web", "sleep", "9"]) as? ContainerCompose.Run)
+        #expect(run.detach && run.noDeps)
+        #expect(run.workdir == "/srv")
+        #expect(run.command == ["sleep", "9"])
+    }
+
+    // MARK: run dependencies
+
+    private func depRows(_ pairs: [(String, String)]) -> [ComposePSRow] {
+        pairs.map { ComposePSRow(name: $0.0, id: $0.0, service: $0.0, image: "i", state: $0.1, oneOff: false) }
+    }
+
+    @Test func runCreatesMissingStartsStoppedAndLeavesRunningDependenciesAlone() throws {
+        let p = try plan(
+            """
+            services:
+              a: {image: x}
+              b: {image: x}
+              c: {image: x}
+              main:
+                image: x
+                depends_on: [a, b, c]
+            """)
+        let deps = try p.dependencies(of: "main").services
+        let todo = ComposeRunDependencies.decide(dependencies: deps, rows: depRows([("b", "exited"), ("c", "running")]))
+        #expect(todo.create == ["a"])
+        #expect(todo.start == ["b"])
+        #expect(todo.running == ["c"])
+    }
+
+    @Test func runWithNothingExistingCreatesEverything() throws {
+        let p = try plan(runYaml)
+        let todo = ComposeRunDependencies.decide(dependencies: try p.dependencies(of: "api").services, rows: [])
+        #expect(todo == ComposeRunDependencies(create: ["db"]))
+    }
+
+    @Test func runIgnoresAnotherProjectsContainerOfTheSameName() throws {
+        // rows are already scoped to this project by ComposePS.rows, so a foreign `db` never appears here.
+        let todo = ComposeRunDependencies.decide(dependencies: try plan(runYaml).dependencies(of: "api").services, rows: depRows([("other", "running")]))
+        #expect(todo.create == ["db"] && todo.start.isEmpty && todo.running.isEmpty)
+    }
+
+    @Test func runWithSomeReplicasPresentStartsThemRatherThanCreatingOverThem() throws {
+        let p = try plan(
+            """
+            services:
+              w:
+                image: x
+                deploy: {replicas: 2}
+              main:
+                image: x
+                depends_on: [w]
+            """)
+        let todo = ComposeRunDependencies.decide(dependencies: try p.dependencies(of: "main").services, rows: depRows([("w-1", "exited")]))
+        // Creating `w` would collide with the existing w-1, so the present replica is started and none created.
+        #expect(todo.create.isEmpty)
+        #expect(todo.start == ["w-1"])
+    }
+
+    // MARK: one-off container names
+
+    private func engineAccepts(_ name: String) -> Bool {
+        guard !name.isEmpty, name.count <= 63, let first = name.unicodeScalars.first,
+            ("a"..."z").contains(first) || ("A"..."Z").contains(first) || ("0"..."9").contains(first)
+        else { return false }
+        return name.unicodeScalars.allSatisfy {
+            ("a"..."z").contains($0) || ("A"..."Z").contains($0) || ("0"..."9").contains($0) || $0 == "_" || $0 == "." || $0 == "-"
+        }
+    }
+
+    @Test func oneOffNameIsKeptWhenItFits() {
+        #expect(ComposeOneOffName.make(project: "p", service: "web", unique: "a0cd6f0d-875f") == "p_web_run_a0cd6f0d")
+    }
+
+    @Test func oneOffNameAlwaysFitsTheEngineLimit() {
+        // The exact names from the live failure, plus extremes on either side.
+        let cases = [
+            ("corpusverbs7952", "vapi7952"), ("a", String(repeating: "s", count: 200)),
+            (String(repeating: "p", count: 200), "s"), (String(repeating: "p", count: 80), String(repeating: "s", count: 80)),
+            ("", "x"),
+        ]
+        for (project, service) in cases where !project.isEmpty {
+            let name = ComposeOneOffName.make(project: project, service: service, unique: "a0cd6f0d-875f-4bf2-9244-0dec7a07dd79")
+            #expect(engineAccepts(name), "\(name) (\(name.count) chars)")
+            #expect(name.hasSuffix("_run_a0cd6f0d"), "the unique suffix must survive: \(name)")
+        }
+    }
+
+    @Test func oneOffNamesStayUniqueWhenTheRestIsTruncated() {
+        let long = String(repeating: "x", count: 100)
+        let a = ComposeOneOffName.make(project: long, service: long, unique: "11111111-aaaa")
+        let b = ComposeOneOffName.make(project: long, service: long, unique: "22222222-bbbb")
+        #expect(a != b)
+    }
+
+    @Test func oneOffNameKeepsBothProjectAndServiceRecognisable() {
+        let name = ComposeOneOffName.make(project: String(repeating: "p", count: 80), service: "web", unique: "a0cd6f0d")
+        #expect(name.contains("_web_run_"), "a long project must not erase the service: \(name)")
+    }
+
+    @Test func whenBothPartsAreLongEachKeepsAShareOfTheName() {
+        let name = ComposeOneOffName.make(project: String(repeating: "p", count: 80), service: String(repeating: "s", count: 80), unique: "a0cd6f0d")
+        let parts = name.split(separator: "_", omittingEmptySubsequences: false).map(String.init)
+        // <project>_<service>_run_<hex>
+        #expect(parts.count == 4)
+        #expect(parts[0].allSatisfy { $0 == "p" } && !parts[0].isEmpty)
+        #expect(parts[1].allSatisfy { $0 == "s" } && !parts[1].isEmpty)
+        #expect(abs(parts[0].count - parts[1].count) <= 2, "neither side should take nearly all of the room: \(name)")
+        #expect(name.count <= 63)
+    }
+
+    // MARK: one-offs and network aliases
+
+    private let aliasYaml = """
+        services:
+          api:
+            image: x
+            hostname: api.internal
+            networks:
+              front:
+                aliases: [api-alias]
+              back: {}
+          plain:
+            image: x
+            hostname: plain.internal
+        networks:
+          front: {}
+          back: {}
+        """
+
+    private func networkSpecs(_ args: [String]) -> [String] {
+        args.indices.filter { args[$0] == "--network" }.map { args[$0 + 1] }
+    }
+
+    @Test func aOneOffPublishesNoAliasesBecauseTheProjectsContainerHoldsThem() throws {
+        let p = try plan(aliasYaml)
+        for name in ["api", "plain"] {
+            var svc = try p.oneOffService(name, overrides: RunOverrides(name: "custom-\(name)"), hostEnvironment: [:])
+            svc.containerName = "custom-\(name)"  // differs from the service name, which normally adds a service alias
+            let args = try p.runArgs(for: svc, detach: false, commandOverride: nil, oneOff: true)
+            let specs = networkSpecs(args)
+            #expect(!specs.isEmpty)
+            #expect(specs.allSatisfy { !$0.contains("alias=") }, "one-off of \(name) must not take aliases: \(specs)")
+        }
+    }
+
+    @Test func aRegularContainerStillPublishesItsAliases() throws {
+        let p = try plan(aliasYaml)
+        var svc = try #require(p.services.first { $0.name == "api" })
+        svc.containerName = "custom-api"
+        let specs = networkSpecs(try p.runArgs(for: svc, detach: true, commandOverride: nil, oneOff: false))
+        #expect(specs.contains { $0.contains("alias=api-alias") })
+        #expect(specs.contains { $0.contains("alias=api.internal") })
+        // Exactly the service name: "alias=api" is a prefix of the other two, so match whole alias tokens.
+        let aliases = Set(specs.flatMap { $0.split(separator: ",").compactMap { $0.hasPrefix("alias=") ? String($0.dropFirst(6)) : nil } })
+        #expect(aliases.contains("api"), "service-name alias missing: \(aliases)")
+    }
+
+    // MARK: push
+
+    @Test func pushDefaultsToHTTPSAndPassesAnExplicitScheme() throws {
+        #expect(try ComposePush.arguments(image: "r/x:1", scheme: nil) == ["image", "push", "r/x:1"])
+        #expect(try ComposePush.arguments(image: "r/x:1", scheme: "http") == ["image", "push", "--scheme", "http", "r/x:1"])
+        #expect(try ComposePush.arguments(image: "r/x:1", scheme: "https") == ["image", "push", "--scheme", "https", "r/x:1"])
+    }
+
+    @Test func pushRejectsAnUnknownSchemeBeforeDoingAnything() {
+        #expect(throws: ComposeError.self) { try ComposePush.arguments(image: "r/x:1", scheme: "ftp") }
+        #expect(throws: ComposeError.self) { try ComposePush.arguments(image: "r/x:1", scheme: "") }
+    }
+
+    /// `--index` is the container NUMBER, not a position: after replica 2 is removed, 3 is still 3.
+    @Test func indexIsTheContainerNumberEvenWithAGap() throws {
+        let p = try plan("services:\n  g:\n    image: x\n")
+        let rows = [container("g-1", service: "g", number: 1), container("g-3", service: "g", number: 3)]
+        #expect(try p.replicaName(service: "g", index: 3, rows: rows) == "g-3")
+        #expect(throws: ComposeError.self) { try p.replicaName(service: "g", index: 2, rows: rows) }
+    }
+
+    @Test func aMissingIndexNamesTheNumbersThatExistInOrder() throws {
+        let p = try plan("services:\n  g:\n    image: x\n")
+        // Names sort a < c but numbers say c(1), a(3): sorting by name would print "3, 1".
+        let rows = [container("a", service: "g", number: 3), container("c", service: "g", number: 1)]
+        do {
+            _ = try p.replicaName(service: "g", index: 2, rows: rows)
+            Issue.record("expected an error")
+        } catch {
+            #expect("\(error)".contains("(1, 3)"), "got: \(error)")
+        }
+    }
+
+    @Test func replicasSortByNumberWhenNamesSortTheOtherWay() throws {
+        let p = try plan("services:\n  g:\n    image: x\n")
+        // Names sort b < c < d but the numbers say d(1), c(2), b(3).
+        let rows = [container("b", service: "g", number: 3), container("c", service: "g", number: 2), container("d", service: "g", number: 1)]
+        #expect(try p.containers(of: [], in: rows).map(\.name) == ["d", "c", "b"])
+    }
+
+    @Test func serviceOrderBeatsNameOrderAcrossServices() throws {
+        // `zeta` has no dependencies and `alpha` depends on it, so the plan orders zeta before alpha even though
+        // alphabetically alpha comes first.
+        let p = try plan("services:\n  alpha:\n    image: x\n    depends_on: [zeta]\n  zeta:\n    image: x\n")
+        #expect(p.services.map(\.name) == ["zeta", "alpha"])
+        let rows = [container("alpha", service: "alpha"), container("zeta", service: "zeta")]
+        #expect(try p.containers(of: [], in: rows).map(\.name) == ["zeta", "alpha"])
+    }
+}

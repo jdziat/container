@@ -69,14 +69,19 @@ extension Application {
             }
             progress.start()
 
-            let id = Utility.createContainerID(name: self.managementFlags.name)
+            let identity = Utility.createContainerIdentity(name: self.managementFlags.name)
 
-            guard ManagedContainer.nameValid(id) else {
-                throw ContainerizationError(.invalidArgument, message: "container ID \(id) is not a valid container ID")
+            // Validate only user-supplied --name. Generated UUID ids always pass nameValid.
+            if self.managementFlags.name != nil {
+                guard ManagedContainer.nameValid(identity.name) else {
+                    throw ContainerizationError(
+                        .invalidArgument,
+                        message: "container name \(identity.name) is not a valid container name")
+                }
             }
 
             let ck = try await Utility.containerConfigFromFlags(
-                id: id,
+                id: identity.id,
                 image: image,
                 arguments: arguments,
                 process: processFlags,
@@ -91,11 +96,32 @@ extension Application {
 
             let options = ContainerCreateOptions(autoRemove: managementFlags.remove)
             let client = ContainerClient()
+            let existing = try await client.list(filters: ContainerListFilters())
+            if let conflict = existing.first(where: {
+                $0.configuration.id == identity.id
+                    || $0.configuration.name == identity.id
+                    || $0.configuration.name == identity.name
+                    || $0.configuration.id == identity.name
+            }) {
+                if conflict.configuration.id == identity.id {
+                    throw ContainerizationError(
+                        .exists,
+                        message: "container with id \(conflict.configuration.id) already exists"
+                    )
+                }
+                let claimed =
+                    conflict.configuration.name == identity.id || conflict.configuration.id == identity.id
+                    ? identity.id : identity.name
+                throw ContainerizationError(
+                    .exists,
+                    message: "container name \(claimed) already in use by \(conflict.configuration.id)"
+                )
+            }
             try await client.create(configuration: ck.0, options: options, kernel: ck.1, initImage: ck.2)
 
             if !self.managementFlags.cidfile.isEmpty {
                 let path = self.managementFlags.cidfile
-                let data = id.data(using: .utf8)
+                let data = identity.id.data(using: .utf8)
                 var attributes = [FileAttributeKey: Any]()
                 attributes[.posixPermissions] = 0o644
                 let success = FileManager.default.createFile(
@@ -110,7 +136,7 @@ extension Application {
             }
             progress.finish()
 
-            print(id)
+            print(identity.id)
         }
     }
 }

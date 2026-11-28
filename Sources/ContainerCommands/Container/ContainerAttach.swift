@@ -62,7 +62,8 @@ extension Application {
         /// live output and an exit code (and for `container start -a` on an already-running
         /// container).
         static func attachToRunning(client: ContainerClient, id: String, log: Logger) async throws -> Int32 {
-            let process = try await client.initProcess(id: id)
+            // initProcess is a sync ClientProcess factory; wait()/kill() are the async edges.
+            let process = client.initProcess(id: id)
             let logHandles = try await client.logs(id: id)
             guard let stdioLog = logHandles.first else {
                 throw ContainerizationError(

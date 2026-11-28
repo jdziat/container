@@ -201,6 +201,82 @@ extension RuntimeClient {
         }
     }
 
+    public func pause() async throws {
+        let request = XPCMessage(route: RuntimeRoutes.pause.rawValue)
+        do {
+            try await self.client.send(request)
+        } catch {
+            throw ContainerizationError(
+                .internalError,
+                message: "failed to pause container \(self.id)",
+                cause: error
+            )
+        }
+    }
+
+    public func resume() async throws {
+        let request = XPCMessage(route: RuntimeRoutes.resume.rawValue)
+        do {
+            try await self.client.send(request)
+        } catch {
+            throw ContainerizationError(
+                .internalError,
+                message: "failed to unpause container \(self.id)",
+                cause: error
+            )
+        }
+    }
+
+    /// Hotplug a network attachment onto a running CR/VZ container (F4/R1).
+    public func hotplugNetwork(
+        attachment: AttachmentConfiguration,
+        plugin: NetworkBootstrapInfo
+    ) async throws {
+        let request = XPCMessage(route: RuntimeRoutes.hotplugNetwork.rawValue)
+        request.set(key: RuntimeKeys.networkAttachment.rawValue, value: try JSONEncoder().encode(attachment))
+        request.set(key: RuntimeKeys.networkBootstrapInfos.rawValue, value: try JSONEncoder().encode([plugin]))
+        do {
+            try await self.client.send(request)
+        } catch {
+            throw ContainerizationError(
+                .internalError,
+                message: "failed to hotplug network on container \(self.id)",
+                cause: error
+            )
+        }
+    }
+
+    /// Unplug a secondary hotplugged network (R1).
+    public func unplugNetwork(networkID: String) async throws {
+        let request = XPCMessage(route: RuntimeRoutes.unplugNetwork.rawValue)
+        request.set(key: RuntimeKeys.unplugNetworkID.rawValue, value: networkID)
+        do {
+            try await self.client.send(request)
+        } catch {
+            throw ContainerizationError(
+                .internalError,
+                message: "failed to unplug network \(networkID) on container \(self.id)",
+                cause: error
+            )
+        }
+    }
+
+    /// Hotplug a virtio-blk image onto a running CR-backed container (C3).
+    public func hotplugBlock(path: String, id: String) async throws {
+        let request = XPCMessage(route: RuntimeRoutes.hotplugBlock.rawValue)
+        request.set(key: RuntimeKeys.hotplugBlockPath.rawValue, value: path)
+        request.set(key: RuntimeKeys.hotplugBlockID.rawValue, value: id)
+        do {
+            try await self.client.send(request)
+        } catch {
+            throw ContainerizationError(
+                .internalError,
+                message: "failed to hotplug block on container \(self.id)",
+                cause: error
+            )
+        }
+    }
+
     public func kill(_ id: String, signal: String) async throws {
         let request = XPCMessage(route: RuntimeRoutes.kill.rawValue)
         request.set(key: RuntimeKeys.id.rawValue, value: id)

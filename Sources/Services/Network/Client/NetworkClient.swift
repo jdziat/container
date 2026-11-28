@@ -53,11 +53,17 @@ extension NetworkClient {
         createClient().openSession()
     }
 
-    public func status() async throws -> NetworkStatus {
+    /// The helper's current status.
+    ///
+    /// Bounded by default. The apiserver calls this while it holds the network service's lock, right after
+    /// starting the helper, so a helper that cannot start (vmnet refusing to create a network, for example,
+    /// makes it exit and launchd restart it, over and over) used to block this call, the lock, and the whole
+    /// apiserver start, with no error, for as long as anyone waited.
+    public func status(timeout: Duration? = XPCClient.xpcRegistrationTimeout) async throws -> NetworkStatus {
         let request = XPCMessage(route: NetworkRoutes.status.rawValue)
         let client = createClient()
 
-        let response = try await client.send(request)
+        let response = try await client.send(request, responseTimeout: timeout)
         let status = try response.status()
         return status
     }

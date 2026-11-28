@@ -1,0 +1,48 @@
+{
+  "pack": "bridge-client-corpus",
+  "status": "aspirational",
+  "notes": "Phase 0 seed: hypothesized routes only. Not a printed-matrix claim until C1 ship checklist + harness go green with observed or explicitly accepted corpus.",
+  "outside_route_still_501": {
+    "method": "POST",
+    "path": "/containers/{id}/attach",
+    "expected_status": 501
+  },
+  "routes": [
+    {
+      "id": "containers-stats-oneshot",
+      "method": "GET",
+      "path": "/containers/{id}/stats",
+      "status": "aspirational",
+      "hypothesis": true,
+      "subset": "one-shot JSON only (stream ignored / not offered)",
+      "sample": {
+        "query": { "stream": "0" },
+        "expected_status": 200
+      }
+    },
+    {
+      "id": "containers-rename",
+      "method": "POST",
+      "path": "/containers/{id}/rename",
+      "status": "aspirational",
+      "hypothesis": true,
+      "subset": "query name= required; 204 on success",
+      "sample": {
+        "query": { "name": "new-name" },
+        "expected_status": 204
+      }
+    },
+    {
+      "id": "containers-top",
+      "method": "GET",
+      "path": "/containers/{id}/top",
+      "status": "aspirational",
+      "hypothesis": true,
+      "subset": "guest ps Titles/Processes; optional ps_args",
+      "sample": {
+        "query": { "ps_args": "-ef" },
+        "expected_status": 200
+      }
+    }
+  ]
+}

@@ -33,13 +33,15 @@ struct TestCLIStatsCommand {
         try await ContainerFixture.with { f in
             let image = WarmupImage.alpine320.rawValue
             try await f.withContainer(image: image) { name in
+                let id = try f.inspectContainer(name).configuration.id
                 let result = try f.run(["stats", "--format", "json", "--no-stream", name]).check()
                 let stats = try JSONDecoder().decode([StatsJSON].self, from: result.outputData)
                 #expect(stats.count == 1, "expected stats for one container")
-                #expect(stats[0].id == name, "container ID should match")
-                let memoryUsageBytes = try #require(stats[0].memoryUsageBytes)
-                let numProcesses = try #require(stats[0].numProcesses)
-                let cpuUtilization = try #require(stats[0].cpuUtilization, "json should include cpuUtilization")
+                let row = try #require(stats.first, "expected stats for one container")
+                #expect(row.id == id, "stats id should be the stable UUID Id")
+                let memoryUsageBytes = try #require(row.memoryUsageBytes)
+                let numProcesses = try #require(row.numProcesses)
+                let cpuUtilization = try #require(row.cpuUtilization, "json should include cpuUtilization")
                 #expect(memoryUsageBytes > 0, "memory usage should be non-zero")
                 #expect(numProcesses >= 1, "should have at least one process")
                 #expect(cpuUtilization >= 0, "cpuUtilization should be non-negative, got \(cpuUtilization)")
@@ -51,10 +53,11 @@ struct TestCLIStatsCommand {
         try await ContainerFixture.with { f in
             let image = WarmupImage.alpine320.rawValue
             try await f.withContainer(image: image, containerArgs: ["sleep", "3600"]) { name in
+                let id = try f.inspectContainer(name).configuration.id
                 let result = try f.run(["stats", "--no-stream", name]).check()
                 let lines = result.output.components(separatedBy: .newlines)
                 #expect(lines.count >= 2, "should have at least header and one data row")
-                let dataLine = try #require(lines.first { $0.contains(name) }, "should find container data row")
+                let dataLine = try #require(lines.first { $0.contains(id) }, "should find container data row")
                 let columns = dataLine.split(separator: " ").filter { !$0.isEmpty }
                 #expect(columns.count >= 2, "should have at least 2 columns")
                 let cpuString = String(columns[1])
@@ -69,10 +72,11 @@ struct TestCLIStatsCommand {
         try await ContainerFixture.with { f in
             let image = WarmupImage.alpine320.rawValue
             try await f.withContainer(image: image, containerArgs: ["sh", "-c", "while true; do :; done"]) { name in
+                let id = try f.inspectContainer(name).configuration.id
                 let result = try f.run(["stats", "--no-stream", name]).check()
                 let lines = result.output.components(separatedBy: .newlines)
                 #expect(lines.count >= 2, "should have at least header and one data row")
-                let dataLine = try #require(lines.first { $0.contains(name) }, "should find container data row")
+                let dataLine = try #require(lines.first { $0.contains(id) }, "should find container data row")
                 let columns = dataLine.split(separator: " ").filter { !$0.isEmpty }
                 #expect(columns.count >= 2, "should have at least 2 columns")
                 let cpuString = String(columns[1])
@@ -88,11 +92,12 @@ struct TestCLIStatsCommand {
         try await ContainerFixture.with { f in
             let image = WarmupImage.alpine320.rawValue
             try await f.withContainer(image: image) { name in
+                let id = try f.inspectContainer(name).configuration.id
                 let result = try f.run(["stats", "--no-stream", name]).check()
                 #expect(result.output.contains("Container ID"), "output should contain table header")
                 #expect(result.output.contains("Cpu %"), "output should contain CPU column")
                 #expect(result.output.contains("Memory Usage"), "output should contain Memory column")
-                #expect(result.output.contains(name), "output should contain container name")
+                #expect(result.output.contains(id), "output should contain container Id")
             }
         }
     }
@@ -103,13 +108,15 @@ struct TestCLIStatsCommand {
             // Run two containers simultaneously so both appear in the global stats snapshot.
             try await f.withContainer(image: image, tag: "c1") { name1 in
                 try await f.withContainer(image: image, tag: "c2") { name2 in
+                    let id1 = try f.inspectContainer(name1).configuration.id
+                    let id2 = try f.inspectContainer(name2).configuration.id
                     let result = try f.run(["stats", "--format", "json", "--no-stream"]).check()
                     let stats = try JSONDecoder().decode([StatsJSON].self, from: result.outputData)
                     try #require(stats.count >= 2, "should have stats for at least 2 containers")
                     let ids = stats.map { $0.id }
-                    #expect(ids.contains(name1), "should include first container")
-                    #expect(ids.contains(name2), "should include second container")
-                    for row in stats where [name1, name2].contains(row.id) {
+                    #expect(ids.contains(id1), "should include first container")
+                    #expect(ids.contains(id2), "should include second container")
+                    for row in stats where [id1, id2].contains(row.id) {
                         let cpuUtilization = try #require(row.cpuUtilization, "json should include cpuUtilization for \(row.id)")
                         #expect(cpuUtilization >= 0, "cpuUtilization should be non-negative, got \(cpuUtilization)")
                     }

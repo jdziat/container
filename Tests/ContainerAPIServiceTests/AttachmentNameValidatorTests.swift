@@ -50,11 +50,19 @@ struct AttachmentNameValidatorTests {
         try validate([attachment("foo.test.")], existing: [attachment("bar.test.")])
     }
 
-    @Test("A hostname that an existing container uses is rejected")
+    @Test("A hostname that an existing container uses on the same network is rejected")
     func hostnameConflict() {
-        expectError(.exists, containing: "hostname(s) already exist") {
+        expectError(.exists, containing: "unique per network") {
             try validate([attachment("foo.test.")], existing: [attachment("foo.test.")])
         }
+    }
+
+    @Test("The same hostname on different networks is accepted")
+    func hostnameOnDifferentNetworks() throws {
+        try validate(
+            [attachment("foo.test.", network: "a")],
+            existing: [attachment("foo.test.", network: "b")]
+        )
     }
 
     @Test("Hostnames are compared without regard to case or a trailing dot")
@@ -64,14 +72,22 @@ struct AttachmentNameValidatorTests {
         }
     }
 
-    @Test("A hostname that an existing container has as an exact alias is rejected")
+    @Test("A hostname that an existing container has as an exact alias on the same network is rejected")
     func hostnameConflictsWithAlias() {
-        expectError(.exists, containing: "hostname(s) already exist") {
+        expectError(.exists, containing: "unique per network") {
             try validate(
                 [attachment("api.test.")],
                 existing: [attachment("foo.test.", aliases: ["api.test"])]
             )
         }
+    }
+
+    @Test("A hostname may match an alias that exists only on another network")
+    func hostnameMatchesAliasOnOtherNetwork() throws {
+        try validate(
+            [attachment("api.test.", network: "a")],
+            existing: [attachment("foo.test.", network: "b", aliases: ["api.test"])]
+        )
     }
 
     @Test("A hostname below an existing subtree alias is accepted")
@@ -80,6 +96,31 @@ struct AttachmentNameValidatorTests {
             [attachment("web.foo.test.")],
             existing: [attachment("foo.test.", aliases: [".foo.test"])]
         )
+    }
+
+    @Test("An invalid hostname with aliases is rejected")
+    func invalidHostnameWithAliases() {
+        expectError(.invalidArgument, containing: "invalid hostname") {
+            try validate([attachment("not a hostname", aliases: ["api.test"])])
+        }
+    }
+
+    @Test("A subtree alias may cover this container's hostname on a different network")
+    func subtreeCoversOwnHostnameOnOtherNetwork() throws {
+        try validate([
+            attachment("web.example.com", network: "a"),
+            attachment("example.com", network: "b", aliases: [".example.com"]),
+        ])
+    }
+
+    @Test("A subtree alias that covers another hostname of the same container on the same network is rejected")
+    func subtreeCoversOwnHostnameSameNetwork() {
+        expectError(.invalidArgument, containing: "covers hostname") {
+            try validate([
+                attachment("web.example.com", network: "edge"),
+                attachment("example.com", network: "edge", aliases: [".example.com"]),
+            ])
+        }
     }
 
     // MARK: - Exact aliases
@@ -92,9 +133,9 @@ struct AttachmentNameValidatorTests {
         )
     }
 
-    @Test("An exact alias that matches an existing hostname is rejected")
+    @Test("An exact alias that matches an existing hostname on the same network is rejected")
     func aliasConflictsWithHostname() {
-        expectError(.exists, containing: "alias(es) already exist") {
+        expectError(.exists, containing: "unique per network") {
             try validate(
                 [attachment("foo.test.", aliases: ["bar.test"])],
                 existing: [attachment("bar.test.")]
@@ -102,9 +143,9 @@ struct AttachmentNameValidatorTests {
         }
     }
 
-    @Test("An exact alias that matches an existing alias is rejected")
+    @Test("An exact alias that matches an existing alias on the same network is rejected")
     func aliasConflictsWithAlias() {
-        expectError(.exists, containing: "alias(es) already exist") {
+        expectError(.exists, containing: "unique per network") {
             try validate(
                 [attachment("foo.test.", aliases: ["API.test."])],
                 existing: [attachment("bar.test.", aliases: ["api.test"])]
@@ -119,29 +160,38 @@ struct AttachmentNameValidatorTests {
         }
     }
 
-    @Test("An exact alias that matches the hostname of another attachment of the container is rejected")
-    func aliasMatchesOtherOwnHostname() {
-        expectError(.invalidArgument, containing: "already a hostname") {
-            try validate([
-                attachment("foo.test.", aliases: ["bar.test"]),
-                attachment("bar.test", network: "other"),
-            ])
-        }
+    @Test("An exact alias may match this container's hostname on a different network")
+    func aliasMatchesOtherOwnHostnameOnOtherNetwork() throws {
+        try validate([
+            attachment("foo.test.", aliases: ["bar.test"]),
+            attachment("bar.test", network: "other"),
+        ])
     }
 
-    @Test("The same exact alias on two networks is rejected")
-    func aliasOnTwoNetworks() {
-        expectError(.invalidArgument, containing: "more than one network") {
-            try validate([
-                attachment("foo.test.", aliases: ["api.test"]),
-                attachment("foo", network: "other", aliases: ["api.test"]),
-            ])
-        }
+    @Test("The same exact alias on two networks is accepted (network-scoped)")
+    func aliasOnTwoNetworks() throws {
+        try validate([
+            attachment("foo.test.", aliases: ["api.test"]),
+            attachment("foo", network: "other", aliases: ["api.test"]),
+        ])
     }
 
-    @Test("An exact alias with a single label is rejected", arguments: ["api", "API.", "localhost"])
-    func unqualifiedExactAlias(alias: String) {
-        expectError(.invalidArgument, containing: "fully qualified") {
+    @Test("The same exact alias reused by another container on a different network is accepted")
+    func aliasReuseAcrossNetworks() throws {
+        try validate(
+            [attachment("foo.test.", network: "a", aliases: ["redis"])],
+            existing: [attachment("bar.test.", network: "b", aliases: ["redis"])]
+        )
+    }
+
+    @Test("An exact alias with a single label is accepted", arguments: ["api", "API.", "redis"])
+    func unqualifiedExactAlias(alias: String) throws {
+        try validate([attachment("foo.test.", aliases: [alias])])
+    }
+
+    @Test("Reserved single-label aliases are rejected", arguments: ["localhost", "LOCALHOST.", "localdomain"])
+    func reservedExactAlias(alias: String) {
+        expectError(.invalidArgument, containing: "reserved") {
             try validate([attachment("foo.test.", aliases: [alias])])
         }
     }
@@ -236,9 +286,9 @@ struct AttachmentNameValidatorTests {
         try validate([attachment("Gateway.Test.", aliases: [".GATEWAY.test."])])
     }
 
-    @Test("Two containers cannot both own the same base, so they cannot share a subtree")
+    @Test("Two containers on the same network cannot both own the same subtree base")
     func subtreeCannotBeShared() {
-        expectError(.exists, containing: "hostname(s) already exist") {
+        expectError(.exists, containing: "unique per network") {
             try validate(
                 [attachment("gateway.test.", aliases: [".gateway.test"])],
                 existing: [attachment("gateway.test.", aliases: [".gateway.test"])]
@@ -307,14 +357,25 @@ struct AttachmentNameValidatorTests {
         }
     }
 
-    @Test("A stored alias that is also a hostname of the container is rejected")
-    func storedAliasIsHostname() {
+    @Test("A stored alias may match this container's hostname on a different network")
+    func storedAliasIsHostnameOnOtherNetwork() throws {
+        try AttachmentNameValidator.validateStored(
+            id: "victim",
+            networks: [
+                attachment("victim.test.", aliases: ["db.test"]),
+                attachment("db.test", network: "other"),
+            ]
+        )
+    }
+
+    @Test("A stored alias that matches a hostname on the same network is rejected")
+    func storedAliasIsHostnameSameNetwork() {
         expectError(.invalidState, containing: "already a hostname") {
             try AttachmentNameValidator.validateStored(
                 id: "victim",
                 networks: [
-                    attachment("victim.test.", aliases: ["db.test"]),
-                    attachment("db.test", network: "other"),
+                    attachment("victim.test.", network: "edge", aliases: ["db.test"]),
+                    attachment("db.test", network: "edge"),
                 ]
             )
         }

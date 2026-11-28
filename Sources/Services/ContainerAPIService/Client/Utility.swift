@@ -34,11 +34,13 @@ public struct Utility {
     static let publishedPortCountLimit = 64
     private static let runtimePrefix = "container-runtime-"
 
-    public static func createContainerID(name: String?) -> String {
-        guard let name else {
-            return UUID().uuidString.lowercased()
-        }
-        return name
+    /// Stable Docker-style Id (UUID) plus user-facing Name (`--name` or the Id).
+    /// Id is always a fresh UUID; Name is the optional `--name`, else the Id string.
+    /// Empty / whitespace `--name` falls back to the Id so unnamed creates never share "".
+    public static func createContainerIdentity(name: String?) -> (id: String, name: String) {
+        let id = UUID().uuidString.lowercased()
+        let trimmed = name?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        return (id, trimmed.isEmpty ? id : trimmed)
     }
 
     public static func isInfraImage(name: String, builderImage: String, initImage: String) -> Bool {
@@ -157,7 +159,9 @@ public struct Utility {
             config: imageConfig
         )
 
-        var config = ContainerConfiguration(id: id, image: description, process: pc)
+        let trimmedName = management.name?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        var config = ContainerConfiguration(
+            id: id, image: description, process: pc, name: trimmedName.isEmpty ? id : trimmedName)
         config.platform = requestedPlatform
 
         config.resources = try Parser.resources(
@@ -212,8 +216,9 @@ public struct Utility {
         } else {
             let networkClient = NetworkClient()
             let builtinNetworkId = try await networkClient.builtin?.id
+            // Hostname / DNS labels follow the mutable Name (Docker-style Name≠Id), not the UUID Id.
             config.networks = try getAttachmentConfigurations(
-                containerId: config.id,
+                containerId: config.name,
                 builtinNetworkId: builtinNetworkId,
                 networks: parsedNetworks,
                 dnsDomain: containerSystemConfig.dns.domain,
@@ -260,9 +265,48 @@ public struct Utility {
         let caps = try Parser.capabilities(capAdd: management.capAdd, capDrop: management.capDrop)
         config.capAdd = caps.capAdd
         config.capDrop = caps.capDrop
+        // R2: unrestricted host devices (opt-out allowlist via CONTAINER_DEVICE_ALLOWLIST_ONLY=1).
+        // Runtime maps char→virtiofs file mount and block→virtio-blk.
+        config.devices = try Parser.devices(management.devices)
+        if let hostname = management.hostname?.trimmingCharacters(in: .whitespacesAndNewlines), !hostname.isEmpty {
+            config.hostname = hostname
+        }
+        if let domainname = management.domainname?.trimmingCharacters(in: .whitespacesAndNewlines), !domainname.isEmpty {
+            config.domainname = domainname
+            // Mirror into DNS so resolv.conf domain/search survives hosts-dns install.
+            // Never resurrect DNS after `--no-dns` cleared it.
+            if !management.dnsDisabled {
+                if let existing = config.dns {
+                    config.dns = .init(
+                        nameservers: existing.nameservers,
+                        domain: existing.domain ?? domainname,
+                        searchDomains: existing.searchDomains.isEmpty ? [domainname] : existing.searchDomains,
+                        options: existing.options
+                    )
+                } else {
+                    config.dns = .init(
+                        nameservers: ContainerConfiguration.DNSConfiguration.defaultNameservers,
+                        domain: domainname,
+                        searchDomains: [domainname]
+                    )
+                }
+            }
+        }
+        if let stopTimeout = management.stopTimeout {
+            guard stopTimeout >= 0 else {
+                throw ContainerizationError(.invalidArgument, message: "--stop-timeout must be >= 0")
+            }
+            config.stopTimeoutSeconds = stopTimeout
+        }
         config.maskedPaths = try Parser.maskedPaths(management.maskedPaths)
         config.readonlyPaths = try Parser.readonlyPaths(management.readonlyPaths)
         config.stopSignal = imageConfig?.stopSignal
+        if let override = management.stopSignal?.trimmingCharacters(in: .whitespaces), !override.isEmpty {
+            config.stopSignal = try Parser.stopSignal(override)
+        }
+        config.extraHosts = try Parser.extraHosts(management.addHosts)
+        for (key, value) in try Parser.sysctls(management.sysctls) { config.sysctls[key] = value }
+        Parser.warnUnsupportedDockerFlags(management)
 
         if let restart = management.restart {
             config.restartPolicy = restart.policy
@@ -355,8 +399,8 @@ public struct Utility {
     /// This follows the rule that makes `--name foo` the hostname `foo.test.` when the default domain
     /// is `test`: a name without a dot gets the domain, and a name with a dot is taken to be
     /// qualified already. For a name with a leading dot, which matches every name below it, the rule
-    /// applies to the name after the dot. Without a default domain the aliases are left as they are,
-    /// and the server rejects any that is not fully qualified.
+    /// applies to the name after the dot. Without a default domain the aliases are left as they are;
+    /// single-label exact aliases remain valid for guest hosts/DNS discovery.
     ///
     /// - Parameters:
     ///   - aliases: The aliases of an attachment, in their normalized form.

@@ -59,17 +59,17 @@ extension Builder {
 
         let builderImage: String = containerSystemConfig.build.image
         let systemHealth = try await ClientHealthCheck.ping(timeout: .seconds(10))
+        // Host side of the builder virtiofs exports mount. Guests write out.tar here;
+        // BuildExport.waitForExportFile polls after build so CR flush races do not miss it.
         let exportsMount: String = systemHealth.appRoot
             .appendingPathComponent(Builder.builderResourceDir)
             .absolutePath()
 
-        if !FileManager.default.fileExists(atPath: exportsMount) {
-            try FileManager.default.createDirectory(
-                atPath: exportsMount,
-                withIntermediateDirectories: true,
-                attributes: nil
-            )
-        }
+        try FileManager.default.createDirectory(
+            atPath: exportsMount,
+            withIntermediateDirectories: true,
+            attributes: nil
+        )
 
         let builderPlatform = ContainerizationOCI.Platform(arch: "arm64", os: "linux", variant: "v8")
 
@@ -147,6 +147,14 @@ extension Builder {
                     .invalidState,
                     message: "builder is stopping, please wait until it is fully stopped before proceeding"
                 )
+            case .paused:
+                // Mirror .running: keep a matching paused builder (unpause); recreate on drift.
+                guard imageChanged || cpuChanged || memChanged || envChanged || dnsChanged || sshChanged else {
+                    try await client.unpause(id: existingContainer.id)
+                    return
+                }
+                try await client.stop(id: existingContainer.id)
+                try? await client.delete(id: existingContainer.id)
             case .unknown:
                 break
             }

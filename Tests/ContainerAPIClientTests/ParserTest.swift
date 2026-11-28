@@ -473,6 +473,30 @@ struct ParserTest {
     }
 
     @Test
+    func testMountNfsDockerShape() throws {
+        let result = try Parser.mount(
+            "type=nfs,source=/export,destination=/mnt,addr=192.0.2.10,nfsvers=4,ro")
+        switch result {
+        case .filesystem(let fs):
+            #expect(fs.isNfs)
+            #expect(fs.source == "/export")
+            #expect(fs.destination == "/mnt")
+            #expect(fs.options.contains("addr=192.0.2.10"))
+            #expect(fs.options.contains("nfsvers=4"))
+            #expect(fs.options.contains("ro"))
+        case .volume:
+            #expect(Bool(false), "Expected nfs filesystem mount, got volume")
+        }
+    }
+
+    @Test
+    func testMountNfsRejectsUnknownOnBind() throws {
+        #expect(throws: ContainerizationError.self) {
+            _ = try Parser.mount("type=bind,source=/tmp,destination=/mnt,addr=1.2.3.4")
+        }
+    }
+
+    @Test
     func testMountTmpfsSource() throws {
         let result = try Parser.mount("type=tmpfs,target=/tmpfsmount1,size=512M")
         switch result {
@@ -531,20 +555,19 @@ struct ParserTest {
     }
 
     @Test
-    func testMountBindFileInsteadOfDirectory() throws {
+    func testMountBindFileAllowed() throws {
         let tempFile = FileManager.default.temporaryDirectory.appendingPathComponent("test-file-\(UUID().uuidString)")
         try "test content".write(to: tempFile, atomically: true, encoding: .utf8)
         defer {
             try? FileManager.default.removeItem(at: tempFile)
         }
-
-        #expect {
-            _ = try Parser.mount("type=bind,src=\(tempFile.path),dst=/foo")
-        } throws: { error in
-            guard let error = error as? ContainerizationError else {
-                return false
-            }
-            return error.description.contains("path") && error.description.contains("is not a directory")
+        let result = try Parser.mount("type=bind,src=\(tempFile.path),dst=/foo/bar.txt")
+        switch result {
+        case .filesystem(let fs):
+            #expect(fs.source == tempFile.path)
+            #expect(fs.destination == "/foo/bar.txt")
+        case .volume:
+            #expect(Bool(false), "Expected filesystem mount")
         }
     }
 
@@ -1233,6 +1256,17 @@ struct ParserTest {
         let result = try Parser.capabilities(capAdd: [], capDrop: [])
         #expect(result.capAdd.isEmpty)
         #expect(result.capDrop.isEmpty)
+    }
+
+    @Test
+    func testDevicesAllowlist() throws {
+        let devices = try Parser.devices(["/dev/null", "/dev/zero:/dev/zero"])
+        #expect(devices.count == 2)
+        #expect(devices[0].hostPath == "/dev/null")
+        #expect(devices[0].containerPath == "/dev/null")
+        #expect(throws: (any Error).self) {
+            _ = try Parser.devices(["/dev/sda"])
+        }
     }
 
     @Test

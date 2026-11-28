@@ -36,6 +36,10 @@ import SystemPackage
 import struct ContainerizationOCI.Mount
 import struct ContainerizationOCI.Process
 
+#if CONTAINER_VMM_CR
+import CRContainerization
+#endif
+
 /// An XPC service that manages the lifecycle of a single VM-backed container.
 public actor RuntimeService {
     private let connection: xpc_connection_t
@@ -45,6 +49,9 @@ public actor RuntimeService {
     private let monitor: ExitMonitor
     private let eventLoopGroup: any EventLoopGroup
     private var waiters: [String: ExitWaiter] = [:]
+    /// Exit status retained so `wait` after teardown still returns the real code
+    /// instead of inventing -1 when the waiter map entry is already gone.
+    private var exitStatuses: [String: ExitStatus] = [:]
     private let lock: AsyncLock = AsyncLock()
     private let log: Logging.Logger
     private var state: State = .created
@@ -191,13 +198,12 @@ public actor RuntimeService {
                 }
                 kernel.commandLine.kernelArgs.append("\(key)=\(value)")
             }
-            let vmm = VZVirtualMachineManager(
+            let vmm: any VirtualMachineManager = Self.makeVirtualMachineManager(
                 kernel: kernel,
                 initialFilesystem: bundle.initialFilesystem.asMount,
                 rosetta: config.rosetta,
                 logger: self.log
             )
-
 
             var sessions: [XPCClientSession] = []
             var attachments: [Attachment] = []
@@ -289,20 +295,62 @@ public actor RuntimeService {
                 memoryInBytes: config.resources.memoryInBytes + VMResources.guestMemoryOverhead
             )
             let container = try LinuxContainer(id, rootfs: rootfs, vmm: vmm, vm: vmResources, logger: self.log) { czConfig in
-                try Self.configureContainer(czConfig: &czConfig, config: config, dynamicEnv: dynamicEnv, log: self.log)
+                try Self.configureContainer(
+                    czConfig: &czConfig,
+                    config: config,
+                    dynamicEnv: dynamicEnv,
+                    log: self.log
+                )
                 czConfig.interfaces = interfaces
                 czConfig.process.stdout = stdout
                 czConfig.process.stderr = stderr
                 czConfig.process.stdin = stdin
+                // Point guests at an in-guest hosts-dns helper so nslookup and getaddrinfo
+                // both see peer names from /etc/hosts (#1809), forwarding other queries.
+                Self.installHostsDNSIfAvailable(czConfig: &czConfig, config: config, log: self.log)
                 // Craft a default /etc/hosts, then inject peers already running on shared
                 // networks so Compose-ordered stacks can resolve bare service names (#1809).
                 var hostsEntries = [Hosts.Entry.localHostIPV4()]
                 if !interfaces.isEmpty {
                     let primaryIfaceAddr = interfaces[0].ipv4Address
+                    var selfHostnames: [String] = []
+                    func appendSelfHostname(_ raw: String?) {
+                        guard let raw, !raw.isEmpty else { return }
+                        let short =
+                            raw.split(separator: ".", maxSplits: 1, omittingEmptySubsequences: true)
+                            .first.map(String.init) ?? raw
+                        guard !selfHostnames.contains(where: { $0.caseInsensitiveCompare(short) == .orderedSame })
+                        else { return }
+                        selfHostnames.append(short)
+                    }
+                    appendSelfHostname(czConfig.hostname)
+                    appendSelfHostname(config.name)
+                    appendSelfHostname(attachments.first?.hostname)
+                    appendSelfHostname(id)
+                    if let domain = config.domainname?.trimmingCharacters(in: .whitespacesAndNewlines),
+                        !domain.isEmpty,
+                        let short = czConfig.hostname, !short.isEmpty, !short.contains(".")
+                    {
+                        let fqdn = "\(short).\(domain)"
+                        if !selfHostnames.contains(where: { $0.caseInsensitiveCompare(fqdn) == .orderedSame }) {
+                            selfHostnames.append(fqdn)
+                        }
+                    }
                     hostsEntries.append(
                         Hosts.Entry(
                             ipAddress: primaryIfaceAddr.address.description,
-                            hostnames: [czConfig.hostname ?? id],
+                            hostnames: selfHostnames.isEmpty ? [id] : selfHostnames,
+                        ))
+                }
+                // `--add-host`: explicit entries must win over discovered peers. /etc/hosts resolves
+                // first-match, so they go in BEFORE the peers (and are then "claimed", so a peer
+                // with the same name is skipped rather than shadowing them).
+                for spec in config.extraHosts {
+                    guard let split = spec.firstIndex(of: ":") else { continue }
+                    hostsEntries.append(
+                        Hosts.Entry(
+                            ipAddress: String(spec[spec.index(after: split)...]),
+                            hostnames: [String(spec[..<split])]
                         ))
                 }
                 // Skip peer hostnames already claimed by localhost/self so a peer
@@ -358,7 +406,7 @@ public actor RuntimeService {
                 } catch {
                     self.log.error("failed to clean up container", metadata: ["error": "\(error)"])
                 }
-                throw error
+                throw Self.annotateMountErrors(error, mounts: config.mounts)
             }
             return message.reply()
         }
@@ -487,19 +535,19 @@ public actor RuntimeService {
                         id: id,
                         onExit: { id, exitStatus in
                             await self.releaseWaiters(for: id, status: exitStatus)
-
-                            guard let process = await self.processes[id]?.process else {
+                            // Remove first so a delete() failure cannot leak the map entry.
+                            guard let process = await self.takeProcess(id) else {
                                 throw ContainerizationError(
                                     .invalidState,
                                     message: "ProcessInfo missing for process \(id)"
                                 )
                             }
                             try await process.delete()
-                            try await self.setProcessState(id: id, state: .stopped)
                         }
                     )
                 } catch {
                     await self.releaseWaiters(for: id, status: ExitStatus(exitCode: -1))
+                    await self.dropProcessClosingIO(id)
                     throw error
                 }
 
@@ -535,6 +583,15 @@ public actor RuntimeService {
             status = .stopped
         case .stopping:
             status = .stopping
+        case .paused:
+            let ctr = try getContainer()
+            status = .paused
+            networks = ctr.attachments
+            cs = ContainerSnapshot(
+                configuration: ctr.config,
+                status: RuntimeStatus.paused,
+                networks: networks
+            )
         case .running:
             let ctr = try getContainer()
 
@@ -575,31 +632,369 @@ public actor RuntimeService {
         let stopOptions = try message.stopOptions()
         let signal = try Signal(stopOptions.signal ?? "SIGTERM")
         let timeout: Duration = .seconds(stopOptions.timeoutInSeconds)
+        let crBackend = Self.isCRBackend()
+
+        // Prefer cooperative CR STOP under the lock. If dials wedge the lock,
+        // a parallel watchdog SIGKILLs helpers after 2s so stop can proceed —
+        // without pre-killing (which skipped cooperative STOP entirely).
+        return try await withThrowingTaskGroup(of: XPCMessage.self) { group in
+            group.addTask {
+                try await self.lock.withLock { _ in
+                    switch await self.state {
+                    case .running, .booted, .paused:
+                        var skipGraceful = false
+                        if case .paused = await self.state {
+                            do {
+                                let ctr = try await self.getContainer()
+                                try await ctr.container.withVirtualMachineInstance { vm in
+                                    try await vm.resume()
+                                }
+                                await self.setState(.running)
+                            } catch {
+                                self.log.error(
+                                    "failed to resume paused VM before stop; forcing cleanup",
+                                    metadata: ["error": "\(error)"]
+                                )
+                                skipGraceful = true
+                                await self.setState(.stopping)
+                            }
+                        }
+                        if await self.state != .stopping {
+                            await self.setState(.stopping)
+                        }
+
+                        let ctr = try await self.getContainer()
+                        let exitStatus: ExitStatus
+                        if skipGraceful {
+                            exitStatus = ExitStatus(exitCode: 255)
+                            if crBackend {
+                                Self.killCRGuestHelperChildren()
+                            }
+                        } else {
+                            exitStatus = try await self.gracefulStopContainer(
+                                ctr.container,
+                                signal: signal,
+                                timeout: timeout
+                            )
+                        }
+
+                        do {
+                            if case .stopped = await self.state {
+                                return message.reply()
+                            }
+                            try await self.cleanUpContainer(containerInfo: ctr, exitStatus: exitStatus)
+                        } catch {
+                            self.log.error("failed to clean up container", metadata: ["error": "\(error)"])
+                        }
+                        await self.setState(.stopped)
+                    default:
+                        break
+                    }
+                    return message.reply()
+                }
+            }
+            if crBackend {
+                group.addTask {
+                    try await Task.sleep(for: .seconds(2))
+                    Self.killCRGuestHelperChildren()
+                    // Park until the lock task finishes (or group cancels).
+                    try await Task.sleep(for: .seconds(600))
+                    throw CancellationError()
+                }
+            }
+            guard let reply = try await group.next() else {
+                throw ContainerizationError(.internalError, message: "stop returned no reply")
+            }
+            group.cancelAll()
+            return reply
+        }
+    }
+
+    /// Pause (suspend) the container's virtual machine.
+    @Sendable
+    public func pause(_ message: XPCMessage) async throws -> XPCMessage {
+        self.log.debug("enter", metadata: ["func": "\(#function)"])
+        defer { self.log.debug("exit", metadata: ["func": "\(#function)"]) }
 
         return try await self.lock.withLock { _ in
             switch await self.state {
-            case .running, .booted:
-                await self.setState(.stopping)
-
+            case .running:
                 let ctr = try await self.getContainer()
-                let exitStatus = try await self.gracefulStopContainer(
-                    ctr.container,
-                    signal: signal,
-                    timeout: timeout
-                )
-
-                do {
-                    if case .stopped = await self.state {
-                        return message.reply()
-                    }
-                    try await self.cleanUpContainer(containerInfo: ctr, exitStatus: exitStatus)
-                } catch {
-                    self.log.error("failed to clean up container", metadata: ["error": "\(error)"])
+                try await ctr.container.withVirtualMachineInstance { vm in
+                    try await vm.pause()
                 }
-                await self.setState(.stopped)
+                await self.setState(.paused)
+                return message.reply()
+            case .paused:
+                return message.reply()
             default:
-                break
+                throw ContainerizationError(
+                    .invalidState,
+                    message: "cannot pause: container is not running"
+                )
             }
+        }
+    }
+
+    /// Resume a paused container's virtual machine.
+    @Sendable
+    public func resume(_ message: XPCMessage) async throws -> XPCMessage {
+        self.log.debug("enter", metadata: ["func": "\(#function)"])
+        defer { self.log.debug("exit", metadata: ["func": "\(#function)"]) }
+
+        return try await self.lock.withLock { _ in
+            switch await self.state {
+            case .paused:
+                let ctr = try await self.getContainer()
+                try await ctr.container.withVirtualMachineInstance { vm in
+                    try await vm.resume()
+                }
+                await self.setState(.running)
+                return message.reply()
+            case .running:
+                return message.reply()
+            default:
+                throw ContainerizationError(
+                    .invalidState,
+                    message: "cannot unpause: container is not paused"
+                )
+            }
+        }
+    }
+
+    /// Hotplug a virtio-blk image onto a running CR-backed container (C3).
+    ///
+    /// Calls ``CRVirtualMachineInstance/hotplug(_:id:)``. VZ / non-CR backends return unsupported.
+    @Sendable
+    public func hotplugBlock(_ message: XPCMessage) async throws -> XPCMessage {
+        self.log.debug("enter", metadata: ["func": "\(#function)"])
+        defer { self.log.debug("exit", metadata: ["func": "\(#function)"]) }
+
+        return try await self.lock.withLock { _ in
+            guard case .running = await self.state else {
+                throw ContainerizationError(
+                    .invalidState,
+                    message: "cannot hotplug block: container is not running"
+                )
+            }
+            guard Self.isCRBackend() else {
+                throw ContainerizationError(
+                    .unsupported,
+                    message: "block hotplug requires CR VMM backend"
+                )
+            }
+            guard let path = message.string(key: RuntimeKeys.hotplugBlockPath.rawValue), !path.isEmpty else {
+                throw ContainerizationError(.invalidArgument, message: "missing hotplugBlockPath")
+            }
+            let id = message.string(key: RuntimeKeys.hotplugBlockID.rawValue) ?? UUID().uuidString
+            let mount = Containerization.Mount.block(
+                format: "ext4",
+                source: path,
+                destination: "/mnt/hotplug-\(id)",
+                options: []
+            )
+            #if CONTAINER_VMM_CR
+            let ctr = try await self.getContainer()
+            try await ctr.container.withVirtualMachineInstance { vm in
+                guard let cr = vm as? CRVirtualMachineInstance else {
+                    throw ContainerizationError(
+                        .unsupported,
+                        message: "block hotplug requires CRVirtualMachineInstance"
+                    )
+                }
+                _ = try await cr.hotplug(mount, id: id)
+            }
+            self.log.info("hotplugBlock ok", metadata: ["id": "\(id)", "path": "\(path)"])
+            return message.reply()
+            #else
+            throw ContainerizationError(
+                .unsupported,
+                message: "runtime was not built with CONTAINER_VMM_CR"
+            )
+            #endif
+        }
+    }
+
+    /// Hotplug a network interface onto a running container (R1 / F4).
+    ///
+    /// Allocates an attachment, calls CR or VZ ``hotplugNetwork``, then configures
+    /// `ethN` via the guest agent.
+    @Sendable
+    public func hotplugNetwork(_ message: XPCMessage) async throws -> XPCMessage {
+        self.log.debug("enter", metadata: ["func": "\(#function)"])
+        defer { self.log.debug("exit", metadata: ["func": "\(#function)"]) }
+
+        return try await self.lock.withLock { _ in
+            guard case .running = await self.state else {
+                throw ContainerizationError(
+                    .invalidState,
+                    message: "cannot hotplug network: container is not running"
+                )
+            }
+
+            guard let attachmentData = message.dataNoCopy(key: RuntimeKeys.networkAttachment.rawValue) else {
+                throw ContainerizationError(.invalidArgument, message: "missing networkAttachment")
+            }
+            let attachmentConfig = try JSONDecoder().decode(AttachmentConfiguration.self, from: attachmentData)
+            let infos = try message.networkBootstrapInfos()
+            guard let info = infos.first else {
+                throw ContainerizationError(.invalidArgument, message: "missing networkBootstrapInfos")
+            }
+
+            var ctr = try await self.getContainer()
+            let index = ctr.attachments.count
+            let client = ContainerNetworkClient.NetworkClient(id: attachmentConfig.network, plugin: info.plugin)
+            let session = client.connect()
+            var (attachment, additionalData): (Attachment, XPCMessage?)
+            do {
+                (attachment, additionalData) = try await client.allocate(
+                    hostname: attachmentConfig.options.hostname,
+                    macAddress: attachmentConfig.options.macAddress,
+                    aliases: attachmentConfig.options.aliases,
+                    on: session
+                )
+                if let mtu = attachmentConfig.options.mtu {
+                    attachment = Attachment(
+                        network: attachment.network,
+                        hostname: attachment.hostname,
+                        ipv4Address: attachment.ipv4Address,
+                        ipv4Gateway: attachment.ipv4Gateway,
+                        ipv6Address: attachment.ipv6Address,
+                        macAddress: attachment.macAddress,
+                        mtu: mtu,
+                        variant: attachment.variant
+                    )
+                }
+            } catch {
+                session.close()
+                throw error
+            }
+
+            guard let iStrategy = self.interfaceStrategies[NetworkInterfaceKey(plugin: info.plugin, variant: attachment.variant)] else {
+                session.close()
+                throw ContainerizationError(
+                    .internalError,
+                    message: "no available interface strategy for network \(attachment.network)"
+                )
+            }
+            let interface = try iStrategy.toInterface(
+                attachment: attachment,
+                interfaceIndex: index,
+                additionalData: additionalData
+            )
+
+            do {
+                try await ctr.container.withVirtualMachineInstance { vm in
+                    #if CONTAINER_VMM_CR
+                    if let cr = vm as? CRVirtualMachineInstance {
+                        try await cr.hotplugNetwork(interface: interface)
+                        return
+                    }
+                    #endif
+                    // VZ spare-NIC hotplug exists only in the CRVirtualization containerization
+                    // fork; stock containerization has no such API, so stock builds fall through
+                    // to the "unsupported" error and callers restart the container instead.
+                    #if CONTAINER_VMM_CR
+                    if let vz = vm as? VZVirtualMachineInstance {
+                        try await vz.hotplugNetwork(interface: interface)
+                        return
+                    }
+                    #endif
+                    throw ContainerizationError(
+                        .unsupported,
+                        message: "network hotplug unsupported for this VMM instance"
+                    )
+                }
+            } catch {
+                session.close()
+                throw error
+            }
+
+            let ifaceName = "eth\(index)"
+            try await ctr.container.withVirtualMachineInstance { vm in
+                let agent = try await vm.dialAgent()
+                do {
+                    try await agent.addressAdd(
+                        name: ifaceName,
+                        address: .init(ipv4Address: interface.ipv4Address, ipv6Address: interface.ipv6Address)
+                    )
+                    try await agent.up(name: ifaceName, mtu: interface.mtu)
+                    // Secondary NICs do not steal the default route.
+                    try await agent.close()
+                } catch {
+                    try? await agent.close()
+                    throw error
+                }
+            }
+
+            ctr.attachments.append(attachment)
+            await self.appendNetworkSession(session)
+            await self.setContainer(ctr)
+            self.log.info("hotplugNetwork ok", metadata: ["iface": "\(ifaceName)", "network": "\(attachment.network)"])
+            return message.reply()
+        }
+    }
+
+    /// Unplug a secondary hotplugged network (R1). Brings the guest iface down and
+    /// clears the VZ spare attachment (CR leaves the MMIO device; guest iface is downed).
+    @Sendable
+    public func unplugNetwork(_ message: XPCMessage) async throws -> XPCMessage {
+        self.log.debug("enter", metadata: ["func": "\(#function)"])
+        defer { self.log.debug("exit", metadata: ["func": "\(#function)"]) }
+
+        return try await self.lock.withLock { _ in
+            guard case .running = await self.state else {
+                throw ContainerizationError(
+                    .invalidState,
+                    message: "cannot unplug network: container is not running"
+                )
+            }
+            guard let networkID = message.string(key: RuntimeKeys.unplugNetworkID.rawValue), !networkID.isEmpty else {
+                throw ContainerizationError(.invalidArgument, message: "missing unplugNetworkID")
+            }
+
+            var ctr = try await self.getContainer()
+            guard let index = ctr.attachments.firstIndex(where: { $0.network == networkID }) else {
+                throw ContainerizationError(
+                    .notFound,
+                    message: "attachment for network \(networkID) not found in runtime"
+                )
+            }
+            if index == 0 {
+                throw ContainerizationError(
+                    .invalidState,
+                    message: "cannot unplug primary network \(networkID) via hotplug path"
+                )
+            }
+            let ifaceName = "eth\(index)"
+            let slotOffset = index - 1
+
+            try await ctr.container.withVirtualMachineInstance { vm in
+                let agent = try await vm.dialAgent()
+                do {
+                    try await agent.down(name: ifaceName)
+                    try await agent.close()
+                } catch {
+                    try? await agent.close()
+                    // Best-effort: still clear host attachment even if guest down fails.
+                    self.log.warning(
+                        "unplugNetwork guest down failed",
+                        metadata: ["iface": "\(ifaceName)", "error": "\(error)"]
+                    )
+                }
+                #if CONTAINER_VMM_CR
+                if let vz = vm as? VZVirtualMachineInstance {
+                    try await vz.unplugNetwork(slotOffset: slotOffset)
+                }
+                if let cr = vm as? CRVirtualMachineInstance {
+                    try await cr.unplugNetwork(slotOffset: slotOffset)
+                }
+                #endif
+            }
+
+            ctr.attachments.remove(at: index)
+            await self.setContainer(ctr)
+            self.log.info("unplugNetwork ok", metadata: ["iface": "\(ifaceName)", "network": "\(networkID)"])
             return message.reply()
         }
     }
@@ -692,12 +1087,24 @@ public actor RuntimeService {
                     )
                 }
 
+                guard width <= UInt64(UInt16.max), height <= UInt64(UInt16.max) else {
+                    throw ContainerizationError(
+                        .invalidArgument,
+                        message: "terminal size \(width)x\(height) exceeds UInt16"
+                    )
+                }
                 try await proc.resize(
                     to: .init(
                         width: UInt16(width),
                         height: UInt16(height))
                 )
             } else {
+                guard width <= UInt64(UInt16.max), height <= UInt64(UInt16.max) else {
+                    throw ContainerizationError(
+                        .invalidArgument,
+                        message: "terminal size \(width)x\(height) exceeds UInt16"
+                    )
+                }
                 try await ctr.container.resize(
                     to: .init(
                         width: UInt16(width),
@@ -867,24 +1274,44 @@ public actor RuntimeService {
             }
 
             do {
-                try FileManager.default.copyItem(atPath: imagePath, toPath: destinationPath)
+                // Copy off the actor so large rootfs snapshots do not stall other XPC handlers.
+                try await Task.detached(priority: .utility) {
+                    try FileManager.default.copyItem(atPath: imagePath, toPath: destinationPath)
+                }.value
             } catch {
                 if shouldFreeze {
                     do {
                         try await ctr.container.filesystemOperation(operation: .thaw, path: "/")
-                    } catch {
+                    } catch let thawError {
                         self.log.error(
                             "failed to thaw filesystem after snapshotDisk error",
                             metadata: [
-                                "error": "\(error)"
+                                "copyError": "\(error)",
+                                "thawError": "\(thawError)",
                             ])
+                        throw ContainerizationError(
+                            .internalError,
+                            message: "snapshotDisk failed (\(error)) and thaw failed (\(thawError))"
+                        )
                     }
                 }
                 throw error
             }
 
             if shouldFreeze {
-                try await ctr.container.filesystemOperation(operation: .thaw, path: "/")
+                do {
+                    try await ctr.container.filesystemOperation(operation: .thaw, path: "/")
+                } catch {
+                    // Snapshot already landed; thaw failure must not leave the FS frozen silently.
+                    self.log.error(
+                        "failed to thaw filesystem after successful snapshotDisk",
+                        metadata: ["error": "\(error)"]
+                    )
+                    throw ContainerizationError(
+                        .internalError,
+                        message: "snapshot written but thaw failed: \(error)"
+                    )
+                }
             }
 
             return message.reply()
@@ -1005,14 +1432,13 @@ public actor RuntimeService {
 
             try await container.start()
             let waitFunc: ExitMonitor.WaitHandler = {
-                let code = try await container.wait()
-                if let out = io.out {
-                    try out.close()
+                // Match exec waitFunc: always close writers even when wait throws.
+                defer {
+                    try? io.out?.close()
+                    try? io.err?.close()
+                    try? io.in?.close()
                 }
-                if let err = io.err {
-                    try err.close()
-                }
-                return code
+                return try await container.wait()
             }
             try await self.monitor.track(id: id, waitingOn: waitFunc)
         } catch {
@@ -1035,22 +1461,27 @@ public actor RuntimeService {
             containerConfig: containerInfo.config,
         )
 
-        let process = try await container.exec(id, configuration: czConfig)
-        try self.setUnderlyingProcess(id, process)
+        do {
+            let process = try await container.exec(id, configuration: czConfig)
+            try self.setUnderlyingProcess(id, process)
 
-        try await process.start()
+            try await process.start()
 
-        let waitFunc: ExitMonitor.WaitHandler = {
-            let code = try await process.wait()
-            if let out = processInfo.io[1] {
-                try self.closeHandle(out.fileDescriptor)
+            let waitFunc: ExitMonitor.WaitHandler = {
+                // Always close stdio ends so ProcessIO.wait observes EOF even if
+                // process.wait throws (otherwise CLI hits CancellationError after 3s).
+                defer {
+                    for handle in processInfo.io { try? handle?.close() }
+                }
+                return try await process.wait()
             }
-            if let err = processInfo.io[2] {
-                try self.closeHandle(err.fileDescriptor)
-            }
-            return code
+            try await self.monitor.track(id: id, waitingOn: waitFunc)
+        } catch {
+            // Resume any waiters, drop the orphaned exec entry, and close stdio.
+            self.releaseWaiters(for: id, status: ExitStatus(exitCode: -1))
+            self.dropProcessClosingIO(id)
+            throw error
         }
-        try await self.monitor.track(id: id, waitingOn: waitFunc)
     }
 
     private func startSocketForwarders(attachment: Attachment, publishedPorts: [PublishPort]) async throws {
@@ -1064,63 +1495,84 @@ public actor RuntimeService {
             throw ContainerizationError(.invalidArgument, message: "host ports for different publish port specs may not overlap")
         }
 
-        try await withThrowingTaskGroup(of: SocketForwarderResult.self) { group in
-            for publishedPort in publishedPorts {
-                for index in 0..<publishedPort.count {
-                    let proxyAddress = try SocketAddress(ipAddress: publishedPort.hostAddress.description, port: Int(publishedPort.hostPort + index))
-                    let containerIPAddress: String
-                    switch publishedPort.hostAddress {
-                    case .v4(_):
-                        containerIPAddress = attachment.ipv4Address.address.description
-                    case .v6(_):
-                        guard let ipv6Address = attachment.ipv6Address else {
-                            throw ContainerizationError(.invalidState, message: "cannot configure IPv6 port forwarding for container with unknown IPv6 address")
+        do {
+            try await withThrowingTaskGroup(of: SocketForwarderResult.self) { group in
+                for publishedPort in publishedPorts {
+                    for index in 0..<publishedPort.count {
+                        let proxyAddress = try SocketAddress(ipAddress: publishedPort.hostAddress.description, port: Int(publishedPort.hostPort + index))
+                        let containerIPAddress: String
+                        switch publishedPort.hostAddress {
+                        case .v4(_):
+                            containerIPAddress = attachment.ipv4Address.address.description
+                        case .v6(_):
+                            guard let ipv6Address = attachment.ipv6Address else {
+                                throw ContainerizationError(.invalidState, message: "cannot configure IPv6 port forwarding for container with unknown IPv6 address")
+                            }
+                            containerIPAddress = ipv6Address.address.description
                         }
-                        containerIPAddress = ipv6Address.address.description
-                    }
-                    let serverAddress = try SocketAddress(ipAddress: containerIPAddress, port: Int(publishedPort.containerPort + index))
-                    log.info(
-                        "creating forwarder for",
-                        metadata: [
-                            "proxy": "\(proxyAddress)",
-                            "server": "\(serverAddress)",
-                            "protocol": "\(publishedPort.proto)",
-                        ])
-                    group.addTask {
-                        let forwarder: SocketForwarder
-                        switch publishedPort.proto {
-                        case .tcp:
-                            forwarder = try TCPForwarder(
-                                proxyAddress: proxyAddress,
-                                serverAddress: serverAddress,
-                                eventLoopGroup: self.eventLoopGroup,
-                                log: self.log
-                            )
-                        case .udp:
-                            forwarder = try UDPForwarder(
-                                proxyAddress: proxyAddress,
-                                serverAddress: serverAddress,
-                                eventLoopGroup: self.eventLoopGroup,
-                                log: self.log
-                            )
-                        }
-                        do {
-                            return try await forwarder.run().get()
-                        } catch let error as IOError where error.errnoCode == EACCES {
-                            if let port = proxyAddress.port, port < 1024 {
-                                throw ContainerizationError(
-                                    .invalidArgument,
-                                    message: "Permission denied while binding to host port \(port). Binding to ports below 1024 requires root privileges."
+                        let serverAddress = try SocketAddress(ipAddress: containerIPAddress, port: Int(publishedPort.containerPort + index))
+                        log.info(
+                            "creating forwarder for",
+                            metadata: [
+                                "proxy": "\(proxyAddress)",
+                                "server": "\(serverAddress)",
+                                "protocol": "\(publishedPort.proto)",
+                            ])
+                        group.addTask {
+                            let forwarder: SocketForwarder
+                            switch publishedPort.proto {
+                            case .tcp:
+                                forwarder = try TCPForwarder(
+                                    proxyAddress: proxyAddress,
+                                    serverAddress: serverAddress,
+                                    eventLoopGroup: self.eventLoopGroup,
+                                    log: self.log
+                                )
+                            case .udp:
+                                forwarder = try UDPForwarder(
+                                    proxyAddress: proxyAddress,
+                                    serverAddress: serverAddress,
+                                    eventLoopGroup: self.eventLoopGroup,
+                                    log: self.log
                                 )
                             }
-                            throw error
+                            do {
+                                return try await forwarder.run().get()
+                            } catch let error as IOError where error.errnoCode == EACCES {
+                                if let port = proxyAddress.port, port < 1024 {
+                                    throw ContainerizationError(
+                                        .invalidArgument,
+                                        message: "Permission denied while binding to host port \(port). Binding to ports below 1024 requires root privileges."
+                                    )
+                                }
+                                throw error
+                            }
                         }
                     }
                 }
+                do {
+                    for try await result in group {
+                        forwarders.append(result)
+                    }
+                } catch {
+                    // Cancel siblings, then drain already-finished results so the
+                    // outer catch can close every bound forwarder.
+                    group.cancelAll()
+                    while let next = await group.nextResult() {
+                        if case .success(let forwarder) = next {
+                            forwarders.append(forwarder)
+                        }
+                    }
+                    throw error
+                }
             }
-            for try await result in group {
-                forwarders.append(result)
+        } catch {
+            // Close any forwarders that bound before a sibling task failed.
+            for forwarder in forwarders {
+                forwarder.close()
+                try? await forwarder.wait()
             }
+            throw error
         }
 
         self.socketForwarders = forwarders
@@ -1192,6 +1644,97 @@ public actor RuntimeService {
             }
         }
 
+        // R2: unrestricted host devices → guest.
+        // Char: virtiofs file mount (FileMount bind preserves host rdev → guest device node).
+        // Block: virtio-blk. USB mass-storage-shaped block images (.img/.raw/.iso) also get a
+        // VZ USB controller attachment when the VMM is Virtualization.framework.
+        for device in config.devices {
+            var st = stat()
+            guard lstat(device.hostPath, &st) == 0 else {
+                throw ContainerizationError(
+                    .invalidArgument, message: "device host path '\(device.hostPath)' does not exist")
+            }
+            let kind = st.st_mode & S_IFMT
+            let major = Int(st.st_rdev >> 24) & 0xff  // informational; FileMount carries rdev
+            let minor = Int(st.st_rdev) & 0xffffff
+            log?.info(
+                "R2 device map",
+                metadata: [
+                    "host": "\(device.hostPath)",
+                    "guest": "\(device.containerPath)",
+                    "major": "\(major)",
+                    "minor": "\(minor)",
+                ]
+            )
+            let readOnly: Bool = {
+                guard let mode = device.mode?.lowercased() else { return false }
+                return mode == "r" || mode == "ro" || mode == "rx"
+            }()
+            if kind == S_IFBLK {
+                czConfig.mounts.append(
+                    .block(
+                        format: "raw",
+                        source: device.hostPath,
+                        destination: device.containerPath,
+                        options: readOnly ? ["ro"] : []
+                    )
+                )
+                // USB mass-storage-shaped disk images (.img/.raw/.iso) are noted for VZ USB attach.
+                let lower = device.hostPath.lowercased()
+                if lower.hasSuffix(".img") || lower.hasSuffix(".raw") || lower.hasSuffix(".iso") {
+                    log?.info(
+                        "R2 USB mass-storage candidate",
+                        metadata: ["host": "\(device.hostPath)", "guest": "\(device.containerPath)"]
+                    )
+                }
+            } else if kind == S_IFCHR {
+                // Guest mknod via OCI linux.devices. Prefer Linux-standard majors for
+                // well-known nodes (macOS rdev ≠ Linux); otherwise use host rdev.
+                let (devType, maj, min): (String, Int64, Int64) = {
+                    switch device.hostPath {
+                    case "/dev/null": return ("c", 1, 3)
+                    case "/dev/zero": return ("c", 1, 5)
+                    case "/dev/urandom": return ("c", 1, 9)
+                    case "/dev/random": return ("c", 1, 8)
+                    case "/dev/tty": return ("c", 5, 0)
+                    case "/dev/console": return ("c", 5, 1)
+                    case "/dev/full": return ("c", 1, 7)
+                    default:
+                        return ("c", Int64(major), Int64(minor))
+                    }
+                }()
+                #if CONTAINER_VMM_CR
+                // OCI linux.devices on the container config is a fork-only field.
+                czConfig.devices.append(
+                    LinuxDevice(
+                        path: device.containerPath,
+                        type: devType,
+                        major: maj,
+                        minor: min,
+                        fileMode: 0o666,
+                        uid: 0,
+                        gid: 0
+                    )
+                )
+                #else
+                _ = (devType, maj, min)
+                #endif
+                // Default vmexec path ignores OCI devices; virtiofs file mount still surfaces the node.
+                czConfig.mounts.append(
+                    .share(
+                        source: device.hostPath,
+                        destination: device.containerPath,
+                        options: readOnly ? ["ro"] : []
+                    )
+                )
+            } else {
+                throw ContainerizationError(
+                    .invalidArgument,
+                    message: "device host path '\(device.hostPath)' must be a character or block device"
+                )
+            }
+        }
+
         for mount in config.mounts {
             if try mount.isSocket() {
                 let attrs = try? FileManager.default.attributesOfItem(atPath: mount.source)
@@ -1234,26 +1777,160 @@ public actor RuntimeService {
             czConfig.sockets.append(socketConfig)
         }
 
-        let hostnameSource = config.networks.first?.options.hostname ?? config.id
-        czConfig.hostname =
+        // Prefer explicit UTS hostname (--hostname / Compose hostname). Network
+        // attachment hostnames stay tied to --name for peer DNS / hosts injection.
+        let hostnameSource =
+            config.hostname
+            ?? config.networks.first?.options.hostname
+            ?? config.id
+        let shortHostname =
             hostnameSource.split(separator: ".", maxSplits: 1, omittingEmptySubsequences: true)
             .first
             .map { String($0) } ?? config.id
+        czConfig.hostname = shortHostname
+
+        // Docker `--domainname` / Compose `domainname:`: Containerization does not
+        // expose OCI Spec.domainname yet, and `kernel.domainname` sysctl is not
+        // reliably applied. Wire the practical surface: resolv.conf domain +
+        // FQDN on the hosts entry for this container.
+        let domainname = config.domainname?.trimmingCharacters(in: .whitespacesAndNewlines)
+        let resolvedDomain = (domainname?.isEmpty == false) ? domainname : nil
 
         if let dns = config.dns {
             czConfig.dns = DNS(
-                nameservers: dns.nameservers, domain: dns.domain,
-                searchDomains: dns.searchDomains, options: dns.options)
+                nameservers: dns.nameservers,
+                domain: dns.domain ?? resolvedDomain,
+                searchDomains: dns.searchDomains.isEmpty && resolvedDomain != nil
+                    ? [resolvedDomain!] : dns.searchDomains,
+                options: dns.options)
+        } else if let resolvedDomain {
+            czConfig.dns = DNS(
+                nameservers: ContainerConfiguration.DNSConfiguration.defaultNameservers,
+                domain: resolvedDomain,
+                searchDomains: [resolvedDomain]
+            )
         }
 
         try Self.configureInitialProcess(czConfig: &czConfig, config: config)
     }
 
-    private nonisolated func getDefaultNameservers(from attachments: [Attachment]) -> [String] {
-        for attachment in attachments {
-            return [attachment.ipv4Gateway.description]
+    /// Guest path for the mounted hosts-dns helper directory.
+    private static let hostsDNSGuestDir = "/run/container-helpers"
+    private static let hostsDNSGuestBinary = "/run/container-helpers/hosts-dns"
+
+    /// Locate the static Linux `hosts-dns` helper shipped next to the runtime plugin.
+    private static func hostsDNSHelperDirectory() -> URL? {
+        if let env = Foundation.ProcessInfo.processInfo.environment["CONTAINER_HOSTS_DNS_DIR"] {
+            let url = URL(fileURLWithPath: env, isDirectory: true)
+            let binary = url.appendingPathComponent("hosts-dns")
+            if FileManager.default.isExecutableFile(atPath: binary.path) {
+                return url
+            }
         }
-        return []
+        let exe = URL(fileURLWithPath: CommandLine.arguments[0]).resolvingSymlinksInPath()
+        // .../libexec/container/plugins/container-runtime-linux/bin/<exe>
+        // → .../libexec/container/helpers
+        let candidates = [
+            exe.deletingLastPathComponent()  // bin
+                .deletingLastPathComponent()  // container-runtime-linux
+                .deletingLastPathComponent()  // plugins
+                .deletingLastPathComponent()  // container
+                .appendingPathComponent("helpers", isDirectory: true),
+            // Dev tree: repo/resources/network-dns next to a checked-out binary.
+            URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
+                .appendingPathComponent("resources/network-dns", isDirectory: true),
+        ]
+        for dir in candidates {
+            let binary = dir.appendingPathComponent("hosts-dns")
+            if FileManager.default.isExecutableFile(atPath: binary.path) {
+                return dir
+            }
+        }
+        return nil
+    }
+
+    /// Mount hosts-dns, wrap the init process, and prefer 127.0.0.1 as the guest resolver.
+    private static func installHostsDNSIfAvailable(
+        czConfig: inout LinuxContainer.Configuration,
+        config: ContainerConfiguration,
+        log: Logger?
+    ) {
+        guard config.dns != nil else { return }
+        guard let helperDir = Self.hostsDNSHelperDirectory() else {
+            log?.debug("hosts-dns helper not found; relying on /etc/hosts injection only")
+            return
+        }
+        let forward =
+            czConfig.dns?.nameservers.first
+            ?? config.dns?.nameservers.first
+            ?? "1.1.1.1"
+
+        czConfig.mounts.append(
+            Filesystem.virtiofs(
+                source: helperDir.path,
+                destination: Self.hostsDNSGuestDir,
+                options: ["ro"]
+            ).asMount
+        )
+
+        let userArgs = czConfig.process.arguments
+        guard let executable = userArgs.first else { return }
+        var wrapped = [
+            Self.hostsDNSGuestBinary,
+            "--hosts", "/etc/hosts",
+            "--listen", "127.0.0.1",
+            "--forward", forward,
+            "--",
+            executable,
+        ]
+        wrapped.append(contentsOf: userArgs.dropFirst())
+        czConfig.process.arguments = wrapped
+
+        let domainFromConfig: String? = {
+            guard let raw = config.domainname?.trimmingCharacters(in: .whitespacesAndNewlines), !raw.isEmpty else {
+                return nil
+            }
+            return raw
+        }()
+        if let dns = config.dns {
+            let domain = dns.domain ?? domainFromConfig
+            let search =
+                dns.searchDomains.isEmpty && domain != nil
+                ? [domain!] : dns.searchDomains
+            czConfig.dns = DNS(
+                nameservers: ["127.0.0.1"],
+                domain: domain,
+                searchDomains: search,
+                options: dns.options
+            )
+        } else if let domainFromConfig {
+            czConfig.dns = DNS(
+                nameservers: ["127.0.0.1"],
+                domain: domainFromConfig,
+                searchDomains: [domainFromConfig]
+            )
+        } else {
+            czConfig.dns = DNS(nameservers: ["127.0.0.1"])
+        }
+        log?.info(
+            "installed in-guest hosts-dns helper",
+            metadata: [
+                "forward": "\(forward)",
+                "helper": "\(helperDir.path)",
+            ]
+        )
+    }
+
+    private nonisolated func getDefaultNameservers(from attachments: [Attachment]) -> [String] {
+        var nameservers: [String] = []
+        var seen = Set<String>()
+        for attachment in attachments {
+            let gateway = attachment.ipv4Gateway.description
+            if seen.insert(gateway).inserted {
+                nameservers.append(gateway)
+            }
+        }
+        return nameservers
     }
 
     private static func configureInitialProcess(
@@ -1389,10 +2066,7 @@ public actor RuntimeService {
 
     private nonisolated func closeHandle(_ handle: Int32) throws {
         guard close(handle) == 0 else {
-            guard let errCode = POSIXErrorCode(rawValue: errno) else {
-                fatalError("failed to convert errno to POSIXErrorCode")
-            }
-            throw POSIXError(errCode)
+            throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
         }
     }
 
@@ -1406,9 +2080,76 @@ public actor RuntimeService {
         return container
     }
 
+    /// CR must not call `LinuxContainer.stop()` — that path dials the guest agent
+    /// (`withAgent` → kill/umount) before `vm.stop()`, and a wedged vsock dial parks
+    /// delete forever. Tear down HVF via the VM instance only.
+    private func stopCRVirtualMachine(_ lc: LinuxContainer) async throws {
+        try await lc.withVirtualMachineInstance { vm in
+            try await vm.stop()
+        }
+    }
+
+    private static func isCRBackend() -> Bool {
+        #if CONTAINER_VMM_CR
+        let backend = Self.resolveVMMBackend()
+        return backend == "cr" || backend == "crvirtualization" || backend == "cleanroom"
+        #else
+        return false
+        #endif
+    }
+
+    /// SIGKILL out-of-process CRGuestHelper children. Safe to call without locks;
+    /// unblocks stop when actor/AsyncLock paths are wedged on vsock dial.
+    private static func killCRGuestHelperChildren() {
+        #if os(macOS)
+        let myPid = getpid()
+        var buffer = [pid_t](repeating: 0, count: 256)
+        let nbytes = proc_listchildpids(myPid, &buffer, Int32(buffer.count * MemoryLayout<pid_t>.stride))
+        guard nbytes > 0 else { return }
+        let n = Int(nbytes) / MemoryLayout<pid_t>.stride
+        for i in 0..<n {
+            let pid = buffer[i]
+            guard pid > 1 else { continue }
+            var path = [CChar](repeating: 0, count: 4 * 1024)
+            guard proc_pidpath(pid, &path, UInt32(path.count)) > 0 else { continue }
+            let s = String(decoding: path.map { UInt8(bitPattern: $0) }.prefix { $0 != 0 }, as: UTF8.self)
+            if s.contains("CRGuestHelper") {
+                _ = Darwin.kill(pid, SIGKILL)
+            }
+        }
+        #endif
+    }
+
     private func gracefulStopContainer(_ lc: LinuxContainer, signal: Signal, timeout: Duration) async throws -> ExitStatus {
-        // Try and gracefully shut down the process. Even if this succeeds we need to power off
-        // the vm, but we should try this first always.
+        if Self.isCRBackend() {
+            // Cooperative STOP via helper (flushes blk, Darwin.exit) under a hard
+            // budget, then SIGKILL survivors. Never call LinuxContainer.stop()
+            // (agent dial) or NIO ELG close on borrowed vsock FDs.
+            self.log.info("CR backend: cooperative helper STOP then SIGKILL survivors")
+            do {
+                try await withThrowingTaskGroup(of: Void.self) { group in
+                    group.addTask {
+                        try await self.stopCRVirtualMachine(lc)
+                    }
+                    group.addTask {
+                        try await Task.sleep(for: .seconds(1))
+                    }
+                    _ = try await group.next()
+                    group.cancelAll()
+                }
+            } catch {
+                self.log.error(
+                    "CR cooperative stop failed; falling back to SIGKILL",
+                    metadata: ["error": "\(error)"]
+                )
+            }
+            Self.killCRGuestHelperChildren()
+            try? await Task.sleep(for: .milliseconds(100))
+            Self.killCRGuestHelperChildren()
+            return ExitStatus(exitCode: 137)
+        }
+
+        // VZ path: try graceful shut down, then always power off the vm.
         var code = ExitStatus(exitCode: 255)
         do {
             code = try await withThrowingTaskGroup(of: ExitStatus.self) { group in
@@ -1447,7 +2188,13 @@ public actor RuntimeService {
         let id = container.id
 
         do {
-            try await container.stop()
+            if Self.isCRBackend() {
+                // Helper already SIGKILL'd in gracefulStop; do not re-enter VM stop
+                // (can hang on AsyncLock / NIO). Just ensure children are dead.
+                Self.killCRGuestHelperChildren()
+            } else {
+                try await container.stop()
+            }
         } catch {
             self.log.error("failed to stop container during cleanup", metadata: ["error": "\(error)"])
         }
@@ -1457,8 +2204,91 @@ public actor RuntimeService {
         for session in networkSessions { session.close() }
         networkSessions = []
 
+        // Always close bootstrap stdio writers (including on create failure) so the
+        // container log FD is not leaked for the life of the runtime process.
+        try? containerInfo.io.out?.close()
+        try? containerInfo.io.err?.close()
+        try? containerInfo.io.in?.close()
+
         let status = exitStatus ?? ExitStatus(exitCode: 255)
         self.releaseWaiters(for: id, status: status)
+    }
+
+    /// Select CRVirtualization (default, F6) or VZ via `CONTAINER_VMM_BACKEND=vz|cr`.
+    private static func makeVirtualMachineManager(
+        kernel: Kernel,
+        initialFilesystem: Containerization.Mount,
+        rosetta: Bool,
+        logger: Logger
+    ) -> any VirtualMachineManager {
+        let backend = Self.resolveVMMBackend()
+        switch backend {
+        case "vz", "virtualization", "apple":
+            logger.info("using VZVirtualMachineManager (CONTAINER_VMM_BACKEND=\(backend))")
+            return VZVirtualMachineManager(
+                kernel: kernel,
+                initialFilesystem: initialFilesystem,
+                rosetta: rosetta,
+                logger: logger
+            )
+        case "cr", "crvirtualization", "cleanroom":
+            #if CONTAINER_VMM_CR
+            logger.info("using CRVirtualMachineManager (CONTAINER_VMM_BACKEND=\(backend))")
+            return CRVirtualMachineManager(
+                kernel: kernel,
+                initialFilesystem: initialFilesystem,
+                rosetta: rosetta,
+                logger: logger
+            )
+            #else
+            logger.warning(
+                "CONTAINER_VMM_BACKEND=\(backend) requested but runtime was not built with CONTAINER_VMM_CR; falling back to VZ"
+            )
+            return VZVirtualMachineManager(
+                kernel: kernel,
+                initialFilesystem: initialFilesystem,
+                rosetta: rosetta,
+                logger: logger
+            )
+            #endif
+        default:
+            #if CONTAINER_VMM_CR
+            logger.info("using CRVirtualMachineManager (default backend=\(backend))")
+            return CRVirtualMachineManager(
+                kernel: kernel,
+                initialFilesystem: initialFilesystem,
+                rosetta: rosetta,
+                logger: logger
+            )
+            #else
+            logger.warning(
+                "default VMM backend '\(backend)' but runtime was not built with CONTAINER_VMM_CR; using VZ"
+            )
+            return VZVirtualMachineManager(
+                kernel: kernel,
+                initialFilesystem: initialFilesystem,
+                rosetta: rosetta,
+                logger: logger
+            )
+            #endif
+        }
+    }
+
+    /// F6: default is `cr`. Override with `CONTAINER_VMM_BACKEND=vz`, else sidecar
+    /// file `vmm-backend` next to the runtime binary (install writes `cr`).
+    private static func resolveVMMBackend() -> String {
+        if let env = Foundation.ProcessInfo.processInfo.environment["CONTAINER_VMM_BACKEND"],
+            !env.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        {
+            return env.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        }
+        let exe = URL(fileURLWithPath: CommandLine.arguments[0])
+        let sidecar = exe.deletingLastPathComponent().appendingPathComponent("vmm-backend")
+        if let raw = try? String(contentsOf: sidecar, encoding: .utf8) {
+            let value = raw.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+            if !value.isEmpty { return value }
+        }
+        return "cr"
     }
 }
 
@@ -1517,13 +2347,76 @@ extension XPCMessage {
 
 extension ContainerResource.Bundle {
     func createLogFile() throws {
-        // Create the log file we'll write stdio to.
-        // O_TRUNC resolves a log delay issue on restarted containers by force-updating internal state
-        let fd = Darwin.open(self.containerLog.path, O_CREAT | O_RDONLY | O_TRUNC, 0o644)
-        guard fd > 0 else {
-            throw POSIXError(.init(rawValue: errno)!)
+        // Intentionally create-or-truncate: restarted containers must not append to a
+        // stale log (O_TRUNC also force-updates kernel state that otherwise delayed writes).
+        // Writers open this path separately after create.
+        let fd = Darwin.open(self.containerLog.path, O_CREAT | O_WRONLY | O_TRUNC, 0o644)
+        guard fd >= 0 else {
+            throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
         }
         close(fd)
+    }
+}
+
+extension RuntimeService {
+    /// Annotate mount failures with actionable install / model-limit hints.
+    fileprivate static func annotateMountErrors(_ error: Error, mounts: [Filesystem]) -> Error {
+        if let nfs = annotateNFSKernelError(error, mounts: mounts) {
+            return nfs
+        }
+        if let shared = annotateSharedVolumeError(error, mounts: mounts) {
+            return shared
+        }
+        return error
+    }
+
+    /// When guest NFS mounts fail because the kernel lacks NFS, surface an actionable install hint.
+    fileprivate static func annotateNFSKernelError(_ error: Error, mounts: [Filesystem]) -> Error? {
+        let hasNFS = mounts.contains { $0.type == .nfs }
+        guard hasNFS else { return nil }
+        let text = "\(error)".lowercased()
+        let looksLikeMissingFS =
+            text.contains("enodev")
+            || text.contains("no such device")
+            || text.contains("unknown filesystem type")
+            || text.contains("filesystem type nfs")
+            || text.contains("wrong fs type")
+            || (text.contains("nfs") && (text.contains("invalid argument") || text.contains("einval")))
+        guard looksLikeMissingFS else { return nil }
+        return ContainerizationError(
+            .invalidArgument,
+            message:
+                "NFS mount failed: guest kernel lacks NFS client support (\(error)). "
+                + "Preferred path: `container system kernel set --recommended` "
+                + "(CONTAINER_PREFERRED_KERNEL=nfs, default) or `make install-recommended-kernel` / "
+                + "`make install-nfs-kernel`. CONTAINER_PREFERRED_KERNEL=kata uses the historic Kata "
+                + "tarball (often omits nfs). Or set `--binary path/to/vmlinux-arm64 --force`. "
+                + "See docs/volumes.md#nfs-mounts."
+        )
+    }
+
+    /// Block-image named volumes remain single-writer. Directory (virtiofs) volumes share.
+    fileprivate static func annotateSharedVolumeError(_ error: Error, mounts: [Filesystem]) -> Error? {
+        let blockNamed = mounts.filter { $0.isVolume && !$0.options.readonly && $0.isBlock }
+        guard !blockNamed.isEmpty else { return nil }
+        let text = "\(error)".lowercased()
+        let looksLikeAttach =
+            text.contains("invalid storage")
+            || text.contains("storage attachment")
+            || text.contains("vzerror")
+            || text.contains("already attached")
+            || (text.contains("volume") && text.contains("attach"))
+        guard looksLikeAttach else { return nil }
+        let names = blockNamed.compactMap(\.volumeName)
+        let listed = names.isEmpty ? "a block named volume" : names.joined(separator: ", ")
+        return ContainerizationError(
+            .invalidArgument,
+            message:
+                "named volume attach failed (\(error)): block-image volume \(listed) is exclusive "
+                + "virtio-blk (single-writer per VM). Recreate with the default directory/virtiofs "
+                + "plane for multi-writer sharing, or use separate volumes / NFS / one writer. "
+                + "See docs/volumes.md."
+        )
     }
 }
 
@@ -1536,6 +2429,34 @@ extension Filesystem {
                 source: self.source,
                 destination: self.destination,
                 options: self.options
+            )
+        case .nfs:
+            // Guest NFS client: mount(2) type "nfs".
+            // Docker shape is `--mount type=nfs,source=<export>,addr=<server>,…`.
+            // Linux expects the mount source as `server:/export` (and usually `nolock`
+            // when rpc.statd is not running in the guest).
+            var source = self.source
+            var options = self.options
+            let addr = options.first(where: { $0.hasPrefix("addr=") })
+                .map { String($0.dropFirst("addr=".count)) }
+            if let addr, !addr.isEmpty, !source.contains(":") {
+                source = "\(addr):\(source)"
+            }
+            // Prefer kernel `vers=` spelling; accept Docker `nfsvers=` as an alias.
+            options = options.map { opt in
+                if opt.hasPrefix("nfsvers=") {
+                    return "vers=" + opt.dropFirst("nfsvers=".count)
+                }
+                return opt
+            }
+            if !options.contains(where: { $0 == "nolock" || $0 == "lock" || $0.hasPrefix("lock=") }) {
+                options.append("nolock")
+            }
+            return .any(
+                type: "nfs",
+                source: source,
+                destination: self.destination,
+                options: options
             )
         case .virtiofs:
             return .share(
@@ -1555,6 +2476,15 @@ extension Filesystem {
                 ],
             )
         case .volume(_, let format, let cacheMode, let syncMode):
+            // Directory / virtiofs-format named volumes share a host directory via
+            // virtiofs (multi-writer). Block-image volumes stay exclusive virtio-blk.
+            if self.isSharedVirtiofsVolume {
+                return .share(
+                    source: self.source,
+                    destination: self.destination,
+                    options: self.options
+                )
+            }
             return .block(
                 format: format,
                 source: self.source,
@@ -1609,15 +2539,27 @@ struct MultiWriter: Writer {
     }
 
     func close() throws {
+        var firstError: Error?
         for handle in handles {
-            try handle.close()
+            do {
+                try handle.close()
+            } catch {
+                if firstError == nil { firstError = error }
+            }
         }
+        if let firstError { throw firstError }
     }
 
     func write(_ data: Data) throws {
+        var firstError: Error?
         for handle in handles {
-            try handle.write(contentsOf: data)
+            do {
+                try handle.write(contentsOf: data)
+            } catch {
+                if firstError == nil { firstError = error }
+            }
         }
+        if let firstError { throw firstError }
     }
 }
 
@@ -1652,17 +2594,39 @@ extension RuntimeService {
     }
 
     private func waitForExit(id: String, cont: CheckedContinuation<ExitStatus, Never>) {
-        guard let waiter = waiters[id] else {
-            // No waiter was initialized at all, resume immediately
-            cont.resume(returning: ExitStatus(exitCode: -1))
+        if let status = exitStatuses[id] {
+            cont.resume(returning: status)
             return
         }
-
+        if let waiter = waiters[id] {
+            waiter.wait(cont)
+            return
+        }
+        // Late wait: register a waiter, then re-check exitStatuses in case release
+        // landed between the first lookup and this insert.
+        let waiter = ExitWaiter()
+        waiters[id] = waiter
+        if let status = exitStatuses[id] {
+            waiter.doExit(exitStatus: status)
+        }
         waiter.wait(cont)
     }
 
     private func releaseWaiters(for id: String, status: ExitStatus) {
-        waiters[id]?.doExit(exitStatus: status)
+        exitStatuses[id] = status
+        if let waiter = waiters.removeValue(forKey: id) {
+            waiter.doExit(exitStatus: status)
+        }
+    }
+
+    private func takeProcess(_ id: String) -> LinuxProcess? {
+        self.processes.removeValue(forKey: id)?.process
+    }
+
+    private func dropProcessClosingIO(_ id: String) {
+        if let orphan = self.processes.removeValue(forKey: id) {
+            for handle in orphan.io { try? handle?.close() }
+        }
     }
 
     private func setUnderlyingProcess(_ id: String, _ process: LinuxProcess) throws {
@@ -1689,6 +2653,10 @@ extension RuntimeService {
         self.networkSessions = sessions
     }
 
+    private func appendNetworkSession(_ session: XPCClientSession) {
+        self.networkSessions.append(session)
+    }
+
     private func addNewProcess(_ id: String, _ config: ProcessConfiguration, _ io: [FileHandle?]) throws {
         guard self.processes[id] == nil else {
             throw ContainerizationError(.invalidArgument, message: "process \(id) already exists")
@@ -1706,7 +2674,7 @@ extension RuntimeService {
     private struct ContainerInfo {
         let container: LinuxContainer
         let config: ContainerConfiguration
-        let attachments: [Attachment]
+        var attachments: [Attachment]
         let bundle: ContainerResource.Bundle
         let io: (in: FileHandle?, out: MultiWriter?, err: MultiWriter?)
     }
@@ -1719,6 +2687,8 @@ extension RuntimeService {
         case booted
         /// startProcess on the init process will transition .booted to .running.
         case running
+        /// pause() transitions .running to .paused (VM suspended).
+        case paused
         /// At the beginning of stop() .running will be transitioned to .stopping.
         case stopping
         /// Once a stop is successful, .stopping will transition to .stopped.
@@ -1741,6 +2711,7 @@ extension RuntimeService {
         let bundle = ContainerResource.Bundle(path: path)
         do {
             _ = try bundle.configuration
+            _ = try bundle.kernel
             return true
         } catch {
             return false
@@ -1751,15 +2722,17 @@ extension RuntimeService {
     private func createBundle() throws {
         do {
             let runtimeConfig = try RuntimeConfiguration.readRuntimeConfiguration(from: self.root)
+            // Always materialize under self.root — runtimeConfig.path can deserialize to a
+            // different absolute URL after XPC/JSON round-trip and leave kernel.json missing.
             _ = try ContainerResource.Bundle.create(
-                path: runtimeConfig.path,
+                path: self.root,
                 initialFilesystem: runtimeConfig.initialFilesystem,
                 kernel: runtimeConfig.kernel,
                 containerConfiguration: runtimeConfig.containerConfiguration,
                 containerRootFilesystem: runtimeConfig.containerRootFilesystem,
                 options: runtimeConfig.options
             )
-            self.log.info("created bundle", metadata: ["configPath": "\(runtimeConfig.path)"])
+            self.log.info("created bundle", metadata: ["configPath": "\(self.root.path)"])
         } catch {
             self.log.error("failed to create bundle", metadata: ["error": "\(error)"])
             throw error

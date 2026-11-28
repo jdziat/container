@@ -46,6 +46,7 @@ container run [<options>] <image> [<arguments> ...]
 *   `-a, --arch <arch>`: Set arch if image can target multiple architectures (default: from image, else host architecture)
 *   `--cap-add <cap>`: Add a Linux capability (e.g. `CAP_NET_RAW`, `NET_RAW`, or `ALL`)
 *   `--cap-drop <cap>`: Drop a Linux capability (e.g. `CAP_NET_RAW`, `NET_RAW`, or `ALL`)
+*   `--hostname <name>`: Container UTS hostname (does not change the network DNS name from `--name`)
 *   `--cidfile <cidfile>`: Write the container ID to the path provided
 *   `-d, --detach`: Run the container and detach from the process
 *   `--dns <ip>`: DNS nameserver IP address
@@ -61,7 +62,7 @@ container run [<options>] <image> [<arguments> ...]
 *   `--masked-path <path>`: **Experimental.** Hide a path inside the container, in addition to the runtime defaults (or `NONE` to clear prior values and the defaults)
 *   `--mount <mount>`: Add a mount to the container (format: type=<>,source=<>,target=<>,readonly)
 *   `--name <name>`: Use the specified name as the container ID
-*   `--network <network>`: Attach the container to a network (format: `<name>[,mac=XX:XX:XX:XX:XX:XX][,mtu=VALUE][,alias=NAME]...`). Use `alias` to give the container additional DNS names; see [Give a container additional DNS names](networking.md#give-a-container-additional-dns-names)
+*   `--network <network>`, `--net <network>`: Attach the container to a network (format: `<name>[,mac=XX:XX:XX:XX:XX:XX][,mtu=VALUE][,alias=NAME]...`). Use `alias` to give the container additional DNS names; see [Give a container additional DNS names](networking.md#give-a-container-additional-dns-names)
 *   `--no-dns`: Do not configure DNS in the container
 *   `--os <os>`: Set OS if image can target multiple operating systems (default: from image, else linux)
 *   `-p, --publish <spec>`: Publish a port from container to host (format: [host-ip:]host-port:container-port[/protocol])
@@ -74,6 +75,7 @@ container run [<options>] <image> [<arguments> ...]
 *   `--runtime`: Set the runtime handler for the container (default: container-runtime-<os>)
 *   `--ssh`: Forward SSH agent socket to container
 *   `--shm-size <shm-size>`: Size of `/dev/shm` (e.g. 64M, 1G)
+*   `--stop-timeout <seconds>`: Default seconds to wait on stop before killing (Compose `stop_grace_period`)
 *   `--tmpfs <tmpfs>`: Add a tmpfs mount to the container at the given path
 *   `-v, --volume <volume>`: Bind mount a volume into the container
 *   `--virtualization`: Expose virtualization capabilities to the container (requires host and guest support)
@@ -220,6 +222,7 @@ container create [<options>] <image> [<arguments> ...]
 *   `-a, --arch <arch>`: Set arch if image can target multiple architectures (default: from image, else host architecture)
 *   `--cap-add <cap>`: Add a Linux capability (e.g. `CAP_NET_RAW`, `NET_RAW`, or `ALL`)
 *   `--cap-drop <cap>`: Drop a Linux capability (e.g. `CAP_NET_RAW`, `NET_RAW`, or `ALL`)
+*   `--hostname <name>`: Container UTS hostname (does not change the network DNS name from `--name`)
 *   `--cidfile <cidfile>`: Write the container ID to the path provided
 *   `-d, --detach`: Run the container and detach from the process
 *   `--dns <ip>`: DNS nameserver IP address
@@ -235,7 +238,7 @@ container create [<options>] <image> [<arguments> ...]
 *   `--masked-path <path>`: **Experimental.** Hide a path inside the container, in addition to the runtime defaults (or `NONE` to clear prior values and the defaults)
 *   `--mount <mount>`: Add a mount to the container (format: type=<>,source=<>,target=<>,readonly)
 *   `--name <name>`: Use the specified name as the container ID
-*   `--network <network>`: Attach the container to a network (format: `<name>[,mac=XX:XX:XX:XX:XX:XX][,mtu=VALUE][,alias=NAME]...`). Use `alias` to give the container additional DNS names; see [Give a container additional DNS names](networking.md#give-a-container-additional-dns-names)
+*   `--network <network>`, `--net <network>`: Attach the container to a network (format: `<name>[,mac=XX:XX:XX:XX:XX:XX][,mtu=VALUE][,alias=NAME]...`). Use `alias` to give the container additional DNS names; see [Give a container additional DNS names](networking.md#give-a-container-additional-dns-names)
 *   `--no-dns`: Do not configure DNS in the container
 *   `--os <os>`: Set OS if image can target multiple operating systems (default: from image, else linux)
 *   `-p, --publish <spec>`: Publish a port from container to host (format: [host-ip:]host-port:container-port[/protocol])
@@ -248,6 +251,7 @@ container create [<options>] <image> [<arguments> ...]
 *   `--runtime`: Set the runtime handler for the container (default: container-runtime-<os>)  
 *   `--ssh`: Forward SSH agent socket to container
 *   `--shm-size <shm-size>`: Size of `/dev/shm` (e.g. 64M, 1G)
+*   `--stop-timeout <seconds>`: Default seconds to wait on stop before killing (Compose `stop_grace_period`)
 *   `--tmpfs <tmpfs>`: Add a tmpfs mount to the container at the given path
 *   `-v, --volume <volume>`: Bind mount a volume into the container
 *   `--virtualization`: Expose virtualization capabilities to the container (requires host and guest support)
@@ -409,9 +413,9 @@ container delete [--all] [--force] [--debug] [<container-ids> ...]
 *   `-a, --all`: Delete all containers
 *   `-f, --force`: Delete containers even if they are running
 
-### `container list (ls)`
+### `container list (ls, ps)`
 
-Lists containers. By default only running containers are shown. Output can be formatted as a table, JSON, YAML, or TOML.
+Lists containers. By default only running containers are shown. Output can be formatted as a table, JSON, YAML, or TOML. `container ps` is an alias for `container list`.
 
 **Usage**
 
@@ -656,9 +660,9 @@ No options.
 
 ## Image Management
 
-### `container image list (ls)`
+### `container image list (ls)` / `container images`
 
-Lists local images. Verbose output provides additional details such as image ID, creation time and full size; formatted output provides the same data in machine-readable form.
+Lists local images. Verbose output provides additional details such as image ID, creation time and full size; formatted output provides the same data in machine-readable form. `container images` is a top-level alias for `container image list`.
 
 **Usage**
 
@@ -804,6 +808,66 @@ container image prune [--all] [--debug]
 **Options**
 
 *   `-a, --all`: Remove all unused images, not just dangling ones
+
+### `container events`
+
+Streams container lifecycle events as JSON lines (`create`, `start`, `die`, `destroy`, `rename`, `pause`, `unpause`, `update`, `connect`, `disconnect`).
+
+**Usage**
+
+```bash
+container events [--debug]
+```
+
+### `container rename`
+
+Renames a container. The Id stays fixed; only the user-facing Name changes. Arguments accept Id or Name.
+
+**Usage**
+
+```bash
+container rename [--debug] <container> <new-name>
+```
+
+### `container pause` / `container unpause`
+
+Suspends or resumes the per-container virtual machine.
+
+**Usage**
+
+```bash
+container pause [--debug] <containers>...
+container unpause [--debug] <containers>...
+```
+
+### `container diff`
+
+Shows filesystem changes versus the image snapshot as `A`/`C`/`D` lines (added/changed/deleted).
+
+**Usage**
+
+```bash
+container diff [--debug] <container>
+```
+
+### `container image history`
+
+Shows the OCI layer history for an image (newest first), similar to `docker history`.
+
+**Usage**
+
+```bash
+container image history [--format <format>] [--human/--no-human] [--debug] <image>
+```
+
+**Arguments**
+
+*   `<image>`: Image reference
+
+**Options**
+
+*   `--format <format>`: Format of the output (values: json, table, yaml, toml; default: table)
+*   `-H, --human / --no-human`: Print sizes and dates in human-readable form (default: human)
 
 ### `container image inspect`
 
@@ -1605,6 +1669,21 @@ container system df [--format <format>] [--debug]
 **Options**
 
 *   `--format <format>`: Format of the output (values: json, table, yaml, toml; default: table)
+
+### `container system prune`
+
+Removes unused data in one pass: stopped containers, unused networks, and dangling images. Pass `--all` to remove all unused images, and `--volumes` to also prune unused volumes.
+
+**Usage**
+
+```bash
+container system prune [--all] [--volumes] [--debug]
+```
+
+**Options**
+
+*   `-a, --all`: Remove all unused images, not just dangling ones
+*   `--volumes`: Also prune unused volumes
 
 ### `container system dns create`
 
