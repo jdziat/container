@@ -80,3 +80,39 @@ It took four live runs to get there. Each failure hid the next, and none could h
 
 **Still not verified:** the CR build (`CONTAINER_VMM_CR=1`), NFS (06), the production fixtures (08-10),
 `internal: true` networks, `push`, `down --rmi`, and the `exec`/`run` flags listed above.
+
+## T3 gap: what is verified and what is blocked (2026-11-27)
+
+**Verified live** (dedicated runner, full gate): the docker corpus, 111 of 111; T3 fixtures 01, 02, 04, 05 and 07; the
+bridge streams, hostconfig and lifecycle suites.
+
+**Not verified: T3 fixtures 03-traefik, 06-nfs, 08-wordpress, 09-nextcloud, 10-immich.** They failed in the one full
+run that reached them, for reasons the logs only partly explained, and every later run died earlier, at
+`container system start`. No run shows them passing.
+
+**Why the later runs died.** The default network's `container-network-vmnet` helper failed on every start with
+`vmnet_return_t 1001` (VMNET_FAILURE), 297 times in one run, restarted by launchd every ~10 s, never once succeeding.
+On the same host, the developer's own container system shows the same failure for a network another session is
+creating. The host showed 9 vmnet interfaces, with 8 `container-network-vmnet` helpers all belonging to the
+developer's user and none to the runner's. **That a host-wide vmnet limit causes this is a hypothesis**, supported by
+those numbers and not proven: nothing here confirmed a limit exists, and deleting the developer's stale networks, the
+test that would settle it, could not be done because a stuck `network create` held the developer system's network
+lock.
+
+**Product defects found while chasing it, and fixed:**
+
+- `XPCClient.send(_:responseTimeout:)` never delivered its timeout when the peer did not reply (a task group waiting
+  on an uncancellable continuation). Every XPC timeout in the product had this hole. Fixed, with tests that fail on
+  the old code.
+- `NetworkClient.status()` had no timeout, so one helper that could not start blocked the apiserver's start, and the
+  network service's global lock, indefinitely. It now fails in 60 s, and `NetworksService.create` deregisters the
+  helper so launchd stops restarting it. Verified live: the runner now fails in about a minute with the helper's error.
+- `container system stop` never removed the apiserver's own launchd job when the apiserver did not answer, so a
+  wedged one survived a cancelled run and blocked the next. Fixed; the gate also cleans up first.
+- `compose run` had never worked (its container name was 79 characters against a 63-character limit), and several
+  verbs found replicas from the file instead of the running containers. Fixed; see the four live-run table above.
+
+**To close the T3 gap:** the host needs to be able to create vmnet networks for the runner. Either free the networks
+held by the developer's container system (including the long-running CR e2e run that currently holds the lock and is
+itself failing with 1001), or run the gate on a host that has nothing else using vmnet. Then re-run the five fixtures
+with `COMPOSE_ONLY="03-traefik-whoami 06-nfs 08-wordpress 09-nextcloud 10-immich"`.
